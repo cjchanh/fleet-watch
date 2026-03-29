@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Run test suite
+        run: python -m pytest tests -q
+
+      - name: CLI install smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/fleet-home"
+          mkdir -p "$HOME"
+
+          fleet --help >/dev/null
+          fleet guard --json > "$RUNNER_TEMP/guard.json"
+          fleet report >/dev/null
+          fleet install-launchd --output "$RUNNER_TEMP/com.cds.fleet-watch.plist" --no-load >/dev/null
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          guard = json.loads((runner_temp / "guard.json").read_text())
+          assert set(guard.keys()) == {"allowed", "request", "checks", "state"}
+          assert set(guard["state"].keys()) == {
+              "process_count",
+              "occupied_ports",
+              "safe_ports",
+              "locked_repos",
+              "gpu_budget",
+          }
+
+          state = json.loads((Path(os.environ["HOME"]) / ".fleet-watch" / "state.json").read_text())
+          assert state["agent_interface"] == "fleet guard --json"
+          assert "gpu_budget" in state
+
+          plist = (runner_temp / "com.cds.fleet-watch.plist").read_text()
+          assert "fleet" in plist
+          PY
