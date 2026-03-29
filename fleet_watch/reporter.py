@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import events, registry
+from fleet_watch import discover, events, referee, registry
 
 
 def _now_iso() -> str:
@@ -30,16 +30,22 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     repos = registry.get_locked_repos(conn)
     stale = registry.get_stale_processes(conn)
     recent = events.get_events(conn, hours=1, limit=20)
+    config = discover.load_config()
+    preferred = discover.preferred_ports(config)
+    safe_ports = referee.suggest_ports(conn, preferred_ports=preferred)
 
     # Count conflicts prevented in last 24h
     conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
 
     return {
+        "agent_interface": "fleet guard --json",
         "generated_utc": _now_iso(),
         "processes": processes,
         "process_count": len(processes),
         "gpu_budget": budget,
         "ports_claimed": ports,
+        "preferred_ports": preferred,
+        "safe_ports": safe_ports,
         "repos_locked": repos,
         "stale_processes": stale,
         "recent_events": recent,
@@ -82,6 +88,10 @@ def generate_markdown(state: dict[str, Any]) -> str:
         lines.append(f"- Ports claimed: {', '.join(str(p) for p in sorted(ports.keys()))}")
     else:
         lines.append("- Ports claimed: none")
+
+    safe_ports = state.get("safe_ports", [])
+    if safe_ports:
+        lines.append(f"- Suggested open ports: {', '.join(str(p) for p in safe_ports)}")
 
     repos = state["repos_locked"]
     if repos:

@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import events, registry
-
-CONFIG_PATH = registry.FLEET_DIR / "config.json"
+from fleet_watch import events, referee, registry
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "gpu_total_mb": 131072,
-    "gpu_reserve_mb": 16384,
+    "gpu_total_mb": registry.DEFAULT_GPU_TOTAL_MB,
+    "gpu_reserve_mb": registry.DEFAULT_GPU_RESERVE_MB,
+    "preferred_ports": [8000, 8001, 8100, 8899, 4242, 9700, 9743, 11434, 18789],
     "patterns": [
         {
             "name_template": "{model_short} MLX",
@@ -93,23 +93,39 @@ class DiscoveredProcess:
     command: str
 
 
+def config_path() -> Path:
+    return registry.FLEET_DIR / "config.json"
+
+
 def load_config() -> dict[str, Any]:
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
+    path = config_path()
+    if path.exists():
+        with open(path) as f:
             user = json.load(f)
         # Merge: user overrides defaults
         merged = {**DEFAULT_CONFIG, **user}
         if "patterns" not in user:
             merged["patterns"] = DEFAULT_CONFIG["patterns"]
+        if "preferred_ports" not in user:
+            merged["preferred_ports"] = DEFAULT_CONFIG["preferred_ports"]
         return merged
-    return DEFAULT_CONFIG
+
+    save_default_config()
+    return dict(DEFAULT_CONFIG)
 
 
 def save_default_config() -> Path:
     registry.ensure_dir()
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
-    return CONFIG_PATH
+    path = config_path()
+    if not path.exists():
+        path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    return path
+
+
+def preferred_ports(config: dict[str, Any] | None = None) -> list[int]:
+    loaded = config or load_config()
+    ports = loaded.get("preferred_ports", DEFAULT_CONFIG["preferred_ports"])
+    return [int(port) for port in ports]
 
 
 def _get_listeners() -> dict[int, int]:
@@ -191,15 +207,15 @@ def _estimate_gpu(pattern: dict[str, Any], model: str | None) -> int:
     return pattern.get("gpu_mb_default", 0)
 
 
-def discover() -> list[DiscoveredProcess]:
+def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
     """Scan the system for processes matching known patterns."""
-    config = load_config()
+    loaded = config or load_config()
     listeners = _get_listeners()
     commands = _get_process_commands()
     found: list[DiscoveredProcess] = []
 
     for pid, cmd in commands.items():
-        for pattern in config["patterns"]:
+        for pattern in loaded["patterns"]:
             regex = pattern["process_match"]
             if re.search(regex, cmd):
                 port = listeners.get(pid)
@@ -216,17 +232,19 @@ def discover() -> list[DiscoveredProcess]:
                     model=model or "unknown",
                 )
 
-                found.append(DiscoveredProcess(
-                    pid=pid,
-                    port=port,
-                    name=name,
-                    workstream=pattern["workstream"],
-                    model=model,
-                    gpu_mb=gpu_mb,
-                    priority=pattern["priority"],
-                    restart_policy=pattern["restart_policy"],
-                    command=cmd,
-                ))
+                found.append(
+                    DiscoveredProcess(
+                        pid=pid,
+                        port=port,
+                        name=name,
+                        workstream=pattern["workstream"],
+                        model=model,
+                        gpu_mb=gpu_mb,
+                        priority=pattern["priority"],
+                        restart_policy=pattern["restart_policy"],
+                        command=cmd,
+                    )
+                )
                 break  # First match wins
 
     return found
@@ -239,16 +257,46 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
         conn = registry.connect()
         close_conn = True
 
-    discovered = discover()
+    config = load_config()
+    discovered = discover(config=config)
     registered_pids = {p["pid"] for p in registry.get_all_processes(conn)}
-    discovered_pids = {p.pid for p in discovered}
 
     added: list[dict[str, Any]] = []
     cleaned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
 
     # Register new discoveries
     for proc in discovered:
         if proc.pid not in registered_pids:
+            failures = referee.preflight_register(
+                conn,
+                port=proc.port,
+                gpu_mb=proc.gpu_mb,
+                repo_dir=None,
+            )
+            if failures:
+                reason = "; ".join(f.reason for f in failures)
+                event_type = (
+                    "GPU_BUDGET_DENY"
+                    if any("GPU budget exceeded" in f.reason for f in failures)
+                    else "CONFLICT"
+                )
+                events.log_event(
+                    conn,
+                    event_type,
+                    pid=proc.pid,
+                    workstream=proc.workstream,
+                    detail={
+                        "name": proc.name,
+                        "source": "discover",
+                        "port": proc.port,
+                        "gpu_mb": proc.gpu_mb,
+                        "reason": reason,
+                    },
+                )
+                skipped.append({"pid": proc.pid, "name": proc.name, "reason": reason})
+                continue
+
             try:
                 registry.register_process(
                     conn,
@@ -262,12 +310,31 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
                     restart_policy=proc.restart_policy,
                     start_cmd=proc.command,
                 )
-                events.log_event(conn, "REGISTER", pid=proc.pid, workstream=proc.workstream,
-                                 detail={"name": proc.name, "source": "discover",
-                                         "port": proc.port, "gpu_mb": proc.gpu_mb})
-                added.append({"pid": proc.pid, "name": proc.name})
-            except Exception:
-                pass  # Skip conflicts (e.g., port already claimed by another PID)
+            except sqlite3.IntegrityError as exc:
+                reason = str(exc)
+                events.log_event(
+                    conn,
+                    "CONFLICT",
+                    pid=proc.pid,
+                    workstream=proc.workstream,
+                    detail={"name": proc.name, "source": "discover", "reason": reason},
+                )
+                skipped.append({"pid": proc.pid, "name": proc.name, "reason": reason})
+                continue
+
+            events.log_event(
+                conn,
+                "REGISTER",
+                pid=proc.pid,
+                workstream=proc.workstream,
+                detail={
+                    "name": proc.name,
+                    "source": "discover",
+                    "port": proc.port,
+                    "gpu_mb": proc.gpu_mb,
+                },
+            )
+            added.append({"pid": proc.pid, "name": proc.name})
         else:
             # Update heartbeat for already-registered processes
             registry.heartbeat(conn, proc.pid)
@@ -282,4 +349,4 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
     if close_conn:
         conn.close()
 
-    return {"added": added, "cleaned": cleaned}
+    return {"added": added, "cleaned": cleaned, "skipped": skipped}

@@ -115,3 +115,20 @@ def test_preempt_empty_port():
     d = referee.preempt_port(conn, 8100, new_priority=5, reason="test")
     assert d.allowed is True
     assert "free" in d.reason
+
+
+def test_suggest_ports_skips_taken_and_requested():
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=1, name="held", workstream="ws", port=8000)
+    registry.register_process(conn, pid=2, name="held2", workstream="ws", port=8100)
+
+    ports = referee.suggest_ports(
+        conn,
+        preferred_ports=[8000, 8001, 8100, 8899],
+        requested_port=8899,
+    )
+
+    assert 8000 not in ports
+    assert 8100 not in ports
+    assert 8899 not in ports
+    assert ports[0] == 8001

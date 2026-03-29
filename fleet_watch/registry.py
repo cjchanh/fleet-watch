@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from typing import Any
 
 FLEET_DIR = Path.home() / ".fleet-watch"
 DB_PATH = FLEET_DIR / "registry.db"
+DEFAULT_GPU_TOTAL_MB = 131072
+DEFAULT_GPU_RESERVE_MB = 16384
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS processes (
@@ -67,9 +70,35 @@ def ensure_dir() -> Path:
     return FLEET_DIR
 
 
+def _configured_budget_defaults() -> tuple[int, int]:
+    config_path = FLEET_DIR / "config.json"
+    total_mb = DEFAULT_GPU_TOTAL_MB
+    reserve_mb = DEFAULT_GPU_RESERVE_MB
+
+    if not config_path.exists():
+        return total_mb, reserve_mb
+
+    try:
+        config = json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return total_mb, reserve_mb
+
+    try:
+        total_mb = int(config.get("gpu_total_mb", total_mb))
+        reserve_mb = int(config.get("gpu_reserve_mb", reserve_mb))
+    except (TypeError, ValueError):
+        return DEFAULT_GPU_TOTAL_MB, DEFAULT_GPU_RESERVE_MB
+
+    if total_mb <= 0 or reserve_mb < 0 or reserve_mb >= total_mb:
+        return DEFAULT_GPU_TOTAL_MB, DEFAULT_GPU_RESERVE_MB
+
+    return total_mb, reserve_mb
+
+
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or DB_PATH
     ensure_dir()
+    total_mb, reserve_mb = _configured_budget_defaults()
     conn = sqlite3.connect(str(path), timeout=10)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -78,7 +107,12 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     # Ensure gpu_budget singleton exists
     conn.execute(
         "INSERT OR IGNORE INTO gpu_budget (id, total_mb, reserve_mb, allocated_mb) "
-        "VALUES (1, 131072, 16384, 0)"
+        "VALUES (1, ?, ?, 0)",
+        (total_mb, reserve_mb),
+    )
+    conn.execute(
+        "UPDATE gpu_budget SET total_mb = ?, reserve_mb = ? WHERE id = 1",
+        (total_mb, reserve_mb),
     )
     conn.commit()
     return conn

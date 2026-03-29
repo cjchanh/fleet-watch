@@ -1,5 +1,6 @@
 """Tests for the process registry."""
 
+import json
 import os
 import sqlite3
 
@@ -136,3 +137,17 @@ def test_invalid_restart_policy():
         assert False, "Should have raised ValueError"
     except ValueError:
         pass
+
+
+def test_connect_applies_configured_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "registry.db")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"gpu_total_mb": 65536, "gpu_reserve_mb": 8192})
+    )
+
+    conn = registry.connect()
+    budget = registry.get_gpu_budget(conn)
+
+    assert budget["total_mb"] == 65536
+    assert budget["reserve_mb"] == 8192

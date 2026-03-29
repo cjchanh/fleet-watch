@@ -71,6 +71,51 @@ def check_gpu_budget(conn: sqlite3.Connection, gpu_mb: int) -> Decision:
     )
 
 
+def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
+    if holder is None:
+        return None
+    return {
+        "pid": holder["pid"],
+        "name": holder["name"],
+        "workstream": holder["workstream"],
+        "priority": holder["priority"],
+        "port": holder["port"],
+        "repo_dir": holder["repo_dir"],
+        "gpu_mb": holder["gpu_mb"],
+    }
+
+
+def suggest_ports(
+    conn: sqlite3.Connection,
+    preferred_ports: list[int],
+    requested_port: int | None = None,
+    limit: int = 5,
+) -> list[int]:
+    occupied = set(registry.get_claimed_ports(conn).keys())
+    suggestions: list[int] = []
+
+    for port in preferred_ports:
+        if port == requested_port or port in occupied or port in suggestions:
+            continue
+        suggestions.append(port)
+        if len(suggestions) >= limit:
+            return suggestions
+
+    if requested_port is None:
+        start = 8000
+    else:
+        start = max(1024, requested_port - 5)
+
+    for port in range(start, start + 200):
+        if port == requested_port or port in occupied or port in suggestions:
+            continue
+        suggestions.append(port)
+        if len(suggestions) >= limit:
+            break
+
+    return suggestions
+
+
 def preflight_register(
     conn: sqlite3.Connection,
     port: int | None = None,

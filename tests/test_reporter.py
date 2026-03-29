@@ -20,8 +20,10 @@ def _fresh_conn() -> sqlite3.Connection:
 def test_build_state_empty():
     conn = _fresh_conn()
     state = reporter.build_state(conn)
+    assert state["agent_interface"] == "fleet guard --json"
     assert state["process_count"] == 0
     assert state["gpu_budget"]["allocated_mb"] == 0
+    assert "safe_ports" in state
 
 
 def test_build_state_with_process():
@@ -41,6 +43,7 @@ def test_markdown_report_structure():
     assert "Active Processes (1)" in md
     assert "mlx" in md
     assert "Resource Budget" in md
+    assert "Suggested open ports" in md
 
 
 def test_markdown_empty():

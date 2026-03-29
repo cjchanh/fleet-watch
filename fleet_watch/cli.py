@@ -3,16 +3,169 @@
 from __future__ import annotations
 
 import json
-import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
 import click
 
+from fleet_watch import discover as discover_mod
 from fleet_watch import events, referee, registry, reporter
 
 
 def _get_conn():
     return registry.connect()
+
+
+def _holder_text(holder: dict[str, Any] | None) -> str:
+    if holder is None:
+        return "none"
+    return f"PID {holder['pid']} ({holder['name']})"
+
+
+def _build_guard_payload(
+    conn,
+    port: int | None = None,
+    repo_dir: str | None = None,
+    gpu_mb: int | None = None,
+) -> dict[str, Any]:
+    state = reporter.build_state(conn)
+    budget = state["gpu_budget"]
+    payload: dict[str, Any] = {
+        "allowed": True,
+        "request": {
+            "port": port,
+            "repo_dir": str(Path(repo_dir).resolve()) if repo_dir else None,
+            "gpu_mb": gpu_mb,
+        },
+        "checks": {},
+        "state": {
+            "process_count": state["process_count"],
+            "occupied_ports": sorted(state["ports_claimed"].keys()),
+            "safe_ports": state.get("safe_ports", []),
+            "locked_repos": sorted(state["repos_locked"].keys()),
+            "gpu_budget": budget,
+        },
+    }
+
+    if port is not None:
+        decision = referee.check_port(conn, port)
+        payload["checks"]["port"] = {
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "holder": referee.summarize_holder(decision.holder),
+            "suggested_ports": referee.suggest_ports(
+                conn,
+                preferred_ports=state.get("preferred_ports", []),
+                requested_port=port,
+            ),
+        }
+        payload["allowed"] = payload["allowed"] and decision.allowed
+
+    if repo_dir is not None:
+        decision = referee.check_repo(conn, repo_dir)
+        payload["checks"]["repo"] = {
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "holder": referee.summarize_holder(decision.holder),
+        }
+        payload["allowed"] = payload["allowed"] and decision.allowed
+
+    if gpu_mb is not None:
+        decision = referee.check_gpu_budget(conn, gpu_mb)
+        payload["checks"]["gpu"] = {
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "requested_mb": gpu_mb,
+            "available_mb": max(0, budget["available_mb"]),
+            "suggested_max_mb": max(0, budget["available_mb"]),
+        }
+        payload["allowed"] = payload["allowed"] and decision.allowed
+
+    return payload
+
+
+def _render_guard(payload: dict[str, Any]) -> list[str]:
+    lines = ["ALLOW" if payload["allowed"] else "DENY"]
+    checks = payload["checks"]
+
+    if "port" in checks:
+        port = payload["request"]["port"]
+        port_check = checks["port"]
+        if port_check["allowed"]:
+            lines.append(f"Port {port}: available")
+        else:
+            lines.append(f"Port {port}: taken by {_holder_text(port_check['holder'])}")
+            suggested = port_check.get("suggested_ports", [])
+            if suggested:
+                lines.append(f"Suggested ports: {', '.join(str(p) for p in suggested)}")
+
+    if "repo" in checks:
+        repo_dir = payload["request"]["repo_dir"]
+        repo_check = checks["repo"]
+        if repo_check["allowed"]:
+            lines.append(f"Repo {repo_dir}: available")
+        else:
+            lines.append(f"Repo {repo_dir}: locked by {_holder_text(repo_check['holder'])}")
+
+    if "gpu" in checks:
+        gpu_check = checks["gpu"]
+        requested_mb = gpu_check["requested_mb"]
+        if gpu_check["allowed"]:
+            lines.append(
+                f"GPU {requested_mb}MB: available "
+                f"({gpu_check['available_mb']}MB free)"
+            )
+        else:
+            lines.append(f"GPU {requested_mb}MB: {gpu_check['reason']}")
+
+    state = payload["state"]
+    lines.append(
+        f"GPU available: {max(0, state['gpu_budget']['available_mb'])}MB "
+        f"({state['gpu_budget']['allocated_mb']}MB allocated)"
+    )
+    if state["safe_ports"]:
+        lines.append(
+            "Open ports: " + ", ".join(str(port) for port in state["safe_ports"])
+        )
+    if state["locked_repos"]:
+        lines.append("Locked repos: " + ", ".join(state["locked_repos"]))
+
+    return lines
+
+
+def _render_launchd_plist(executable: str, interval: int) -> str:
+    log_path = Path.home() / "Library/Logs/fleet-watch.log"
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n"
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        "    <string>com.cds.fleet-watch</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"        <string>{executable}</string>\n"
+        "        <string>discover</string>\n"
+        "    </array>\n"
+        "    <key>StartInterval</key>\n"
+        f"    <integer>{interval}</integer>\n"
+        "    <key>RunAtLoad</key>\n"
+        "    <true/>\n"
+        "    <key>Nice</key>\n"
+        "    <integer>19</integer>\n"
+        "    <key>ProcessType</key>\n"
+        "    <string>Background</string>\n"
+        "    <key>StandardOutPath</key>\n"
+        f"    <string>{log_path}</string>\n"
+        "    <key>StandardErrorPath</key>\n"
+        f"    <string>{log_path}</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
 
 
 @click.group()
@@ -149,14 +302,49 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None):
     sys.exit(1 if failed else 0)
 
 
+@cli.command()
+@click.option("--port", type=int, default=None, help="Port to guard")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory to guard")
+@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to guard")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def guard(
+    port: int | None,
+    repo_dir: str | None,
+    gpu_mb: int | None,
+    as_json: bool,
+):
+    """Canonical pre-flight interface for agents and operators."""
+    conn = _get_conn()
+    for cleaned in registry.clean_dead_pids(conn):
+        events.log_event(
+            conn,
+            "CLEAN",
+            pid=cleaned["pid"],
+            workstream=cleaned["workstream"],
+            detail={"reason": "dead_pid", "name": cleaned["name"]},
+        )
+
+    payload = _build_guard_payload(conn, port=port, repo_dir=repo_dir, gpu_mb=gpu_mb)
+    conn.close()
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+    else:
+        for line in _render_guard(payload):
+            click.echo(line)
+
+    sys.exit(0 if payload["allowed"] else 1)
+
+
 # Keep 'claim' as alias for backward compat
 @cli.command(hidden=True)
 @click.option("--port", type=int, default=None)
 @click.option("--repo", "repo_dir", default=None)
+@click.option("--gpu", "gpu_mb", type=int, default=None)
 @click.pass_context
-def claim(ctx, port, repo_dir):
+def claim(ctx, port, repo_dir, gpu_mb):
     """Alias for 'check' (deprecated)."""
-    ctx.invoke(check, port=port, repo_dir=repo_dir)
+    ctx.invoke(check, port=port, repo_dir=repo_dir, gpu_mb=gpu_mb)
 
 
 @cli.command()
@@ -286,51 +474,26 @@ def clean():
 
 
 @cli.command()
-def context():
-    """Compact pre-flight for agents: what's running, what's safe."""
-    conn = _get_conn()
-    registry.clean_dead_pids(conn)
-
-    procs = registry.get_all_processes(conn)
-    budget = registry.get_gpu_budget(conn)
-    ports = registry.get_claimed_ports(conn)
-    repos = registry.get_locked_repos(conn)
-
-    # Known service ports to suggest safe alternatives
-    known_ports = {8000, 8001, 8100, 8899, 4242, 9700, 9743, 11434, 18789}
-    occupied = set(ports.keys())
-    safe_ports = sorted(known_ports - occupied)[:5]
-
-    ctx = {
-        "occupied_ports": sorted(ports.keys()),
-        "safe_ports": safe_ports,
-        "gpu_allocated_mb": budget["allocated_mb"],
-        "gpu_available_mb": budget["available_mb"],
-        "gpu_budget_pct": int(budget["allocated_mb"] / max(budget["total_mb"] - budget["reserve_mb"], 1) * 100),
-        "locked_repos": list(repos.keys()),
-        "process_count": len(procs),
-        "processes": [
-            {"pid": p["pid"], "name": p["name"], "port": p["port"], "gpu_mb": p["gpu_mb"]}
-            for p in procs
-        ],
-    }
-    click.echo(json.dumps(ctx, indent=2))
-    conn.close()
+@click.pass_context
+def context(ctx):
+    """Backward-compatible alias for `fleet guard --json`."""
+    ctx.invoke(guard, port=None, repo_dir=None, gpu_mb=None, as_json=True)
 
 
 @cli.command()
 def discover():
     """Auto-discover running processes and sync registry + state.json."""
-    from fleet_watch import discover as disc
     conn = _get_conn()
-    result = disc.sync(conn)
+    result = discover_mod.sync(conn)
     reporter.write_report(conn)
     conn.close()
     for a in result["added"]:
         click.echo(f"+ PID {a['pid']} ({a['name']})")
     for c in result["cleaned"]:
         click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
-    if not result["added"] and not result["cleaned"]:
+    for skipped in result.get("skipped", []):
+        click.echo(f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}")
+    if not result["added"] and not result["cleaned"] and not result.get("skipped"):
         click.echo("No changes. Registry is current.")
 
 
@@ -340,8 +503,6 @@ def watch(interval: int):
     """Run continuous discovery loop (foreground daemon)."""
     import signal
     import time
-
-    from fleet_watch import discover as disc
 
     click.echo(f"Fleet Watch running. Scanning every {interval}s. Ctrl-C to stop.")
 
@@ -358,7 +519,7 @@ def watch(interval: int):
     while running:
         try:
             conn = _get_conn()
-            result = disc.sync(conn)
+            result = discover_mod.sync(conn)
             reporter.write_report(conn)
             conn.close()
 
@@ -366,6 +527,10 @@ def watch(interval: int):
                 click.echo(f"+ PID {a['pid']} ({a['name']})")
             for c in result["cleaned"]:
                 click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
+            for skipped in result.get("skipped", []):
+                click.echo(
+                    f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
+                )
         except Exception as e:
             click.echo(f"Error: {e}", err=True)
 
@@ -376,6 +541,49 @@ def watch(interval: int):
             time.sleep(1)
 
     click.echo("Fleet Watch stopped.")
+
+
+@cli.command("install-launchd")
+@click.option("--interval", type=int, default=60, help="Seconds between scans")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=Path.home() / "Library/LaunchAgents/com.cds.fleet-watch.plist",
+    help="Where to write the plist",
+)
+@click.option("--load/--no-load", default=True, help="Load the agent after writing")
+def install_launchd(interval: int, output_path: Path, load: bool):
+    """Write a launchd plist with the real fleet executable path."""
+    executable = shutil.which("fleet")
+    if executable is None:
+        click.echo("fleet executable not found in PATH", err=True)
+        sys.exit(1)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_render_launchd_plist(executable, interval))
+    click.echo(f"Written: {output_path}")
+
+    if not load:
+        return
+
+    subprocess.run(
+        ["launchctl", "unload", str(output_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        ["launchctl", "load", str(output_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        click.echo(result.stderr.strip() or result.stdout.strip(), err=True)
+        sys.exit(result.returncode)
+
+    click.echo("Loaded: com.cds.fleet-watch")
 
 
 def main():
