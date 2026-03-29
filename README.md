@@ -242,4 +242,4 @@ MIT
 
 ## Author
 
-CJ Chanhnourack — [Centennial Defense Systems](https://centennialdefense.com)
+Christopher Chanhnourack — Centennial Defense Systems
