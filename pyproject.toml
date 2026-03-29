@@ -5,14 +5,37 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fleet-watch"
 version = "0.1.0"
-description = "Process governance daemon for CDS workstream coordination"
+description = "Process governance for AI workloads on a single machine"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "CJ Chanhnourack", email = "cj@centennialdefense.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "click>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/centennial-defense/fleet-watch"
+Repository = "https://github.com/centennial-defense/fleet-watch"
 
 [tool.setuptools.packages.find]
 include = ["fleet_watch*"]
 
 [project.scripts]
 fleet = "fleet_watch.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
