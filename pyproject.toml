@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleet-watch"
+version = "0.1.0"
+description = "Process governance daemon for CDS workstream coordination"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["fleet_watch*"]
+
+[project.scripts]
+fleet = "fleet_watch.cli:main"
