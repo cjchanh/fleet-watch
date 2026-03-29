@@ -266,6 +266,63 @@ def clean():
     conn.close()
 
 
+@cli.command()
+def discover():
+    """Auto-discover running processes and register them."""
+    from fleet_watch import discover as disc
+    result = disc.sync()
+    for a in result["added"]:
+        click.echo(f"+ PID {a['pid']} ({a['name']})")
+    for c in result["cleaned"]:
+        click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
+    if not result["added"] and not result["cleaned"]:
+        click.echo("No changes. Registry is current.")
+
+
+@cli.command()
+@click.option("--interval", type=int, default=60, help="Seconds between scans")
+def watch(interval: int):
+    """Run continuous discovery loop (foreground daemon)."""
+    import signal
+    import time
+
+    from fleet_watch import discover as disc
+
+    click.echo(f"Fleet Watch running. Scanning every {interval}s. Ctrl-C to stop.")
+
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+        click.echo("\nStopping.")
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    while running:
+        try:
+            conn = _get_conn()
+            result = disc.sync(conn)
+            reporter.write_report(conn)
+            conn.close()
+
+            for a in result["added"]:
+                click.echo(f"+ PID {a['pid']} ({a['name']})")
+            for c in result["cleaned"]:
+                click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
+        except Exception as e:
+            click.echo(f"Error: {e}", err=True)
+
+        # Interruptible sleep
+        for _ in range(interval):
+            if not running:
+                break
+            time.sleep(1)
+
+    click.echo("Fleet Watch stopped.")
+
+
 def main():
     cli()
 
