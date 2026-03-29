@@ -109,35 +109,54 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
 
 
 @cli.command()
-@click.option("--port", type=int, default=None, help="Port to claim")
-@click.option("--repo", "repo_dir", default=None, help="Repo directory to claim")
-def claim(port: int | None, repo_dir: str | None):
-    """Check and claim a resource (port or repo lock)."""
-    if port is None and repo_dir is None:
-        click.echo("Specify --port or --repo", err=True)
+@click.option("--port", type=int, default=None, help="Port to check")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory to check")
+@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to check")
+def check(port: int | None, repo_dir: str | None, gpu_mb: int | None):
+    """Check if a resource is available. Exit 0=available, 1=taken."""
+    if port is None and repo_dir is None and gpu_mb is None:
+        click.echo("Specify --port, --repo, or --gpu", err=True)
         sys.exit(2)
 
     conn = _get_conn()
+    failed = False
 
     if port is not None:
-        decision = referee.claim_port(conn, port)
+        decision = referee.check_port(conn, port)
         if decision.allowed:
-            click.echo(f"Port {port} available")
+            click.echo(f"Port {port}: available")
         else:
-            click.echo(f"DENY: {decision.reason}", err=True)
-            conn.close()
-            sys.exit(1)
+            click.echo(f"Port {port}: TAKEN by PID {decision.holder['pid']} ({decision.holder['name']})", err=True)
+            failed = True
 
     if repo_dir is not None:
-        decision = referee.claim_repo(conn, repo_dir)
+        decision = referee.check_repo(conn, repo_dir)
         if decision.allowed:
-            click.echo(f"Repo {repo_dir} available")
+            click.echo(f"Repo {repo_dir}: available")
         else:
-            click.echo(f"DENY: {decision.reason}", err=True)
-            conn.close()
-            sys.exit(1)
+            click.echo(f"Repo {repo_dir}: LOCKED by PID {decision.holder['pid']} ({decision.holder['name']})", err=True)
+            failed = True
+
+    if gpu_mb is not None:
+        decision = referee.check_gpu_budget(conn, gpu_mb)
+        if decision.allowed:
+            click.echo(f"GPU {gpu_mb}MB: available")
+        else:
+            click.echo(f"GPU {gpu_mb}MB: {decision.reason}", err=True)
+            failed = True
 
     conn.close()
+    sys.exit(1 if failed else 0)
+
+
+# Keep 'claim' as alias for backward compat
+@cli.command(hidden=True)
+@click.option("--port", type=int, default=None)
+@click.option("--repo", "repo_dir", default=None)
+@click.pass_context
+def claim(ctx, port, repo_dir):
+    """Alias for 'check' (deprecated)."""
+    ctx.invoke(check, port=port, repo_dir=repo_dir)
 
 
 @cli.command()
@@ -267,10 +286,46 @@ def clean():
 
 
 @cli.command()
+def context():
+    """Compact pre-flight for agents: what's running, what's safe."""
+    conn = _get_conn()
+    registry.clean_dead_pids(conn)
+
+    procs = registry.get_all_processes(conn)
+    budget = registry.get_gpu_budget(conn)
+    ports = registry.get_claimed_ports(conn)
+    repos = registry.get_locked_repos(conn)
+
+    # Known service ports to suggest safe alternatives
+    known_ports = {8000, 8001, 8100, 8899, 4242, 9700, 9743, 11434, 18789}
+    occupied = set(ports.keys())
+    safe_ports = sorted(known_ports - occupied)[:5]
+
+    ctx = {
+        "occupied_ports": sorted(ports.keys()),
+        "safe_ports": safe_ports,
+        "gpu_allocated_mb": budget["allocated_mb"],
+        "gpu_available_mb": budget["available_mb"],
+        "gpu_budget_pct": int(budget["allocated_mb"] / max(budget["total_mb"] - budget["reserve_mb"], 1) * 100),
+        "locked_repos": list(repos.keys()),
+        "process_count": len(procs),
+        "processes": [
+            {"pid": p["pid"], "name": p["name"], "port": p["port"], "gpu_mb": p["gpu_mb"]}
+            for p in procs
+        ],
+    }
+    click.echo(json.dumps(ctx, indent=2))
+    conn.close()
+
+
+@cli.command()
 def discover():
-    """Auto-discover running processes and register them."""
+    """Auto-discover running processes and sync registry + state.json."""
     from fleet_watch import discover as disc
-    result = disc.sync()
+    conn = _get_conn()
+    result = disc.sync(conn)
+    reporter.write_report(conn)
+    conn.close()
     for a in result["added"]:
         click.echo(f"+ PID {a['pid']} ({a['name']})")
     for c in result["cleaned"]:
