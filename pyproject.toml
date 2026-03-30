@@ -23,13 +23,14 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: System :: Systems Administration",
 ]
+keywords = ["process-management", "gpu", "ai", "mlx", "ollama", "apple-silicon", "developer-tools"]
 dependencies = [
     "click>=8.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/centennial-defense/fleet-watch"
-Repository = "https://github.com/centennial-defense/fleet-watch"
+Homepage = "https://github.com/cjchanh/fleet-watch"
+Repository = "https://github.com/cjchanh/fleet-watch"
 
 [tool.setuptools.packages.find]
 include = ["fleet_watch*"]

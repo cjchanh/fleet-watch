@@ -145,7 +145,7 @@ def _render_launchd_plist(executable: str, interval: int) -> str:
         "<plist version=\"1.0\">\n"
         "<dict>\n"
         "    <key>Label</key>\n"
-        "    <string>com.cds.fleet-watch</string>\n"
+        "    <string>io.fleet-watch</string>\n"
         "    <key>ProgramArguments</key>\n"
         "    <array>\n"
         f"        <string>{executable}</string>\n"
@@ -170,7 +170,7 @@ def _render_launchd_plist(executable: str, interval: int) -> str:
 
 @click.group()
 def cli():
-    """Fleet Watch — Process governance for CDS workstreams."""
+    """Fleet Watch — Process governance for AI workloads."""
     pass
 
 
@@ -217,7 +217,7 @@ def status(as_json: bool):
 @cli.command()
 @click.option("--pid", type=int, required=True, help="Process ID")
 @click.option("--name", required=True, help="Human-readable name")
-@click.option("--workstream", required=True, help="Workstream name (e.g. sovereign-stack)")
+@click.option("--workstream", required=True, help="Workstream name (e.g. inference, training)")
 @click.option("--session-id", default=None, help="Session identifier")
 @click.option("--port", type=int, default=None, help="Port to claim")
 @click.option("--gpu", "gpu_mb", type=int, default=0, help="GPU memory claim in MB")
@@ -549,7 +549,7 @@ def watch(interval: int):
     "--output",
     "output_path",
     type=click.Path(path_type=Path),
-    default=Path.home() / "Library/LaunchAgents/com.cds.fleet-watch.plist",
+    default=Path.home() / "Library/LaunchAgents/io.fleet-watch.plist",
     help="Where to write the plist",
 )
 @click.option("--load/--no-load", default=True, help="Load the agent after writing")
@@ -583,7 +583,7 @@ def install_launchd(interval: int, output_path: Path, load: bool):
         click.echo(result.stderr.strip() or result.stdout.strip(), err=True)
         sys.exit(result.returncode)
 
-    click.echo("Loaded: com.cds.fleet-watch")
+    click.echo("Loaded: io.fleet-watch")
 
 
 def main():

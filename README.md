@@ -49,7 +49,7 @@ fleet discover
 fleet guard --port 8899 --gpu 8192 --json
 
 # Human shorthand availability check
-fleet check --repo ~/Workspace/active/archivist
+fleet check --repo ~/projects/my-app
 
 # See the audit trail
 fleet history
@@ -225,6 +225,7 @@ print(f"Chain valid: {valid}, events: {count}")
 
 - Discovery is heuristic and pattern-based. Unknown workloads are invisible until they are discovered or registered.
 - GPU numbers are claims and estimates, not kernel-level Metal accounting.
+- Auto-discovery uses macOS lsof. On Linux, discovery is not yet implemented — use manual registration via `fleet register`. Linux ss integration is planned.
 - Fleet Watch is advisory. It will not stop unrelated processes from starting.
 - Repo coordination only works for sessions that consult Fleet Watch or are auto-discovered.
 - The project is single-machine by design. No distributed coordination is attempted.

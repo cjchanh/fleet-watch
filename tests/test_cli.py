@@ -53,7 +53,7 @@ def test_context_alias_returns_guard_json(tmp_path, monkeypatch):
 
 
 def test_install_launchd_writes_real_executable_path(tmp_path, monkeypatch):
-    output_path = tmp_path / "com.cds.fleet-watch.plist"
+    output_path = tmp_path / "io.fleet-watch.plist"
     monkeypatch.setattr(cli_module.shutil, "which", lambda name: "/tmp/fleet")
     runner = CliRunner()
 

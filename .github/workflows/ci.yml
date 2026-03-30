@@ -14,14 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11"]
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -44,7 +44,7 @@ jobs:
           fleet --help >/dev/null
           fleet guard --json > "$RUNNER_TEMP/guard.json"
           fleet report >/dev/null
-          fleet install-launchd --output "$RUNNER_TEMP/com.cds.fleet-watch.plist" --no-load >/dev/null
+          fleet install-launchd --output "$RUNNER_TEMP/io.fleet-watch.plist" --no-load >/dev/null
 
           python - <<'PY'
           import json
@@ -66,6 +66,6 @@ jobs:
           assert state["agent_interface"] == "fleet guard --json"
           assert "gpu_budget" in state
 
-          plist = (runner_temp / "com.cds.fleet-watch.plist").read_text()
+          plist = (runner_temp / "io.fleet-watch.plist").read_text()
           assert "fleet" in plist
           PY
