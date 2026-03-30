@@ -15,12 +15,12 @@ from fleet_watch import events, referee, registry
 DEFAULT_CONFIG: dict[str, Any] = {
     "gpu_total_mb": registry.DEFAULT_GPU_TOTAL_MB,
     "gpu_reserve_mb": registry.DEFAULT_GPU_RESERVE_MB,
-    "preferred_ports": [8000, 8001, 8100, 8899, 4242, 9700, 9743, 11434, 18789],
+    "preferred_ports": [8000, 8001, 8080, 8100, 8888, 8899, 11434],
     "patterns": [
         {
             "name_template": "{model_short} MLX",
             "process_match": "mlx_lm.*server|mlx_worker",
-            "workstream": "sovereign-stack",
+            "workstream": "inference",
             "priority": 3,
             "restart_policy": "RESTART_ON_FAILURE",
             "gpu_mb_default": 8192,
@@ -38,26 +38,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {
             "name_template": "Ollama",
             "process_match": "ollama serve",
-            "workstream": "sovereign-stack",
+            "workstream": "inference",
             "priority": 2,
             "restart_policy": "RESTART_ALWAYS",
             "gpu_mb_default": 1024,
             "port_default": 11434,
         },
         {
-            "name_template": "Sovereign router",
-            "process_match": "sovereign_stack.*router|uvicorn.*sovereign",
-            "workstream": "sovereign-stack",
+            "name_template": "Router",
+            "process_match": "uvicorn.*router|fastapi.*router",
+            "workstream": "routing",
             "priority": 3,
             "restart_policy": "RESTART_ON_FAILURE",
-            "gpu_mb_default": 0,
-        },
-        {
-            "name_template": "Archivist HTTP",
-            "process_match": "archivist.*http|archivist.*server",
-            "workstream": "archivist",
-            "priority": 2,
-            "restart_policy": "RESTART_ALWAYS",
             "gpu_mb_default": 0,
         },
         {
@@ -67,14 +59,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "priority": 3,
             "restart_policy": "RESTART_ON_FAILURE",
             "gpu_mb_default": 20480,
-        },
-        {
-            "name_template": "Sovereign proxy",
-            "process_match": "socat.*TCP-LISTEN.*8000",
-            "workstream": "sovereign-stack",
-            "priority": 2,
-            "restart_policy": "RESTART_ALWAYS",
-            "gpu_mb_default": 0,
         },
     ],
 }
