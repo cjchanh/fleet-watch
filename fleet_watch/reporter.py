@@ -22,32 +22,16 @@ def _seconds_ago(iso_ts: str) -> int:
     return int((datetime.now(timezone.utc) - ts).total_seconds())
 
 
-def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Build the full state dict used by both reporters."""
+def build_guard_state(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build the minimal state needed for guard decisions. Fast path — no subprocess calls."""
     processes = registry.get_all_processes(conn)
     external_resources = registry.get_all_external_resources(conn)
     budget = registry.get_gpu_budget(conn)
     ports = registry.get_claimed_ports(conn)
     repos = registry.get_locked_repos(conn)
-    stale = registry.get_stale_processes(conn)
-    recent = events.get_events(conn, hours=1, limit=20)
     config = discover.load_config()
     preferred = discover.preferred_ports(config)
     safe_ports = referee.suggest_ports(conn, preferred_ports=preferred)
-
-    # Count conflicts prevented in last 24h
-    conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
-
-    # System health (config-driven patterns)
-    health_config = syshealth.load_health_config(config)
-    memory = syshealth.get_memory_state()
-    sessions = syshealth.get_session_processes(
-        patterns=health_config["session_patterns"],
-    )
-    idle = syshealth.get_idle_processes(
-        patterns=health_config["idle_patterns"],
-        threshold_cpu=health_config["idle_cpu_threshold"],
-    )
 
     return {
         "agent_interface": "fleet guard --json",
@@ -60,6 +44,29 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "preferred_ports": preferred,
         "safe_ports": safe_ports,
         "repos_locked": repos,
+    }
+
+
+def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Build the full observability state. Includes system health (subprocess calls)."""
+    state = build_guard_state(conn)
+
+    stale = registry.get_stale_processes(conn)
+    recent = events.get_events(conn, hours=1, limit=20)
+    conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
+
+    config = discover.load_config()
+    health_config = syshealth.load_health_config(config)
+    memory = syshealth.get_memory_state()
+    sessions = syshealth.get_session_processes(
+        patterns=health_config["session_patterns"],
+    )
+    idle = syshealth.get_idle_processes(
+        patterns=health_config["idle_patterns"],
+        threshold_cpu=health_config["idle_cpu_threshold"],
+    )
+
+    state.update({
         "stale_processes": stale,
         "recent_events": recent,
         "conflicts_prevented_24h": len(conflicts_24h),
@@ -77,7 +84,8 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
             for s in sessions
         ],
         "idle_processes": idle,
-    }
+    })
+    return state
 
 
 def _human_duration(seconds: int) -> str:
@@ -182,23 +190,29 @@ def generate_markdown(state: dict[str, Any]) -> str:
     # --- System health ---
     mem = state.get("system_memory", {})
     if mem:
-        pressure = mem.get("pressure_pct", 0)
+        pressure = mem.get("pressure_pct", -1)
         indicator = syshealth.pressure_label(pressure)
-        lines.append(f"## System Memory — {indicator} ({pressure}% pressure)")
-        lines.append(f"- Total: {mem['total_mb']:,} MB")
-        lines.append(f"- Active: {mem['active_mb']:,} MB | Wired: {mem['wired_mb']:,} MB | "
-                     f"Compressed: {mem['compressed_mb']:,} MB")
-        lines.append(f"- Free: {mem['free_mb']:,} MB | Inactive: {mem['inactive_mb']:,} MB | "
-                     f"Available: {mem['available_mb']:,} MB")
+        if not mem.get("available", True) or pressure < 0:
+            lines.append("## System Memory — UNAVAILABLE")
+            lines.append("Memory telemetry not supported on this platform.")
+        else:
+            lines.append(f"## System Memory — {indicator} ({pressure}% pressure)")
+            lines.append(f"- Total: {mem['total_mb']:,} MB")
+            lines.append(f"- Active: {mem['active_mb']:,} MB | Wired: {mem['wired_mb']:,} MB | "
+                         f"Compressed: {mem['compressed_mb']:,} MB")
+            lines.append(f"- Free: {mem['free_mb']:,} MB | Inactive: {mem['inactive_mb']:,} MB | "
+                         f"Available: {mem['available_mb']:,} MB")
         lines.append("")
 
     # --- Sessions ---
     sess_list = state.get("sessions", [])
     if sess_list:
         total_rss = sum(s["rss_mb"] for s in sess_list)
-        cc = [s for s in sess_list if s["kind"] == "claude-code"]
-        cx = [s for s in sess_list if s["kind"] == "codex"]
-        lines.append(f"## Sessions ({len(cc)} Claude Code, {len(cx)} Codex — {total_rss:,} MB total)")
+        by_kind: dict[str, int] = {}
+        for s in sess_list:
+            by_kind[s["kind"]] = by_kind.get(s["kind"], 0) + 1
+        kind_summary = ", ".join(f"{count} {kind}" for kind, count in sorted(by_kind.items()))
+        lines.append(f"## Sessions ({kind_summary} — {total_rss:,} MB total)")
         lines.append("")
         lines.append("| PID | Type | RSS | CPU | TTY | Started |")
         lines.append("|-----|------|-----|-----|-----|---------|")

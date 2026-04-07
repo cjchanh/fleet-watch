@@ -20,14 +20,19 @@ def test_memory_state_dict():
     assert d["available_mb"] == mem.free_mb + mem.inactive_mb
 
 
-def test_memory_state_zero_on_failure(monkeypatch):
-    """Returns zeroed state when sysctl fails."""
+def test_memory_state_unavailable_on_failure(monkeypatch):
+    """Returns unavailable state when sysctl fails."""
     monkeypatch.setattr(
         syshealth.subprocess, "run",
         lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError),
     )
     mem = syshealth.get_memory_state()
     assert mem.total_mb == 0
+    assert not mem.is_available
+    assert mem.pressure_pct == -1
+    assert syshealth.pressure_label(mem.pressure_pct) == "UNAVAILABLE"
+    d = mem.to_dict()
+    assert d["available"] is False
 
 
 def test_session_processes_returns_list():
@@ -116,6 +121,7 @@ def test_pressure_critical():
 
 
 def test_pressure_label():
+    assert syshealth.pressure_label(-1) == "UNAVAILABLE"
     assert syshealth.pressure_label(50) == "OK"
     assert syshealth.pressure_label(75) == "ELEVATED"
     assert syshealth.pressure_label(90) == "CRITICAL"

@@ -91,7 +91,7 @@ def _build_guard_payload(
     gpu_mb: int | None = None,
     current_session_id: str | None = None,
 ) -> dict[str, Any]:
-    state = reporter.build_state(conn)
+    state = reporter.build_guard_state(conn)
     budget = state["gpu_budget"]
     payload: dict[str, Any] = {
         "allowed": True,
@@ -717,9 +717,12 @@ def health(as_json: bool):
 
     pressure = mem.pressure_pct
     indicator = syshealth.pressure_label(pressure, health_config["pressure_thresholds"])
-    click.echo(f"Memory: {indicator} ({pressure}% pressure)")
-    click.echo(f"  Total: {mem.total_mb:,} MB | Active: {mem.active_mb:,} MB | "
-               f"Compressed: {mem.compressed_mb:,} MB | Free: {mem.free_mb:,} MB")
+    if not mem.is_available:
+        click.echo("Memory: UNAVAILABLE (telemetry not supported on this platform)")
+    else:
+        click.echo(f"Memory: {indicator} ({pressure}% pressure)")
+        click.echo(f"  Total: {mem.total_mb:,} MB | Active: {mem.active_mb:,} MB | "
+                   f"Compressed: {mem.compressed_mb:,} MB | Free: {mem.free_mb:,} MB")
     click.echo("")
 
     if sessions:

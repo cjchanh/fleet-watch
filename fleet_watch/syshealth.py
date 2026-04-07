@@ -62,13 +62,21 @@ class MemoryState:
         return self.free_mb + self.inactive_mb
 
     @property
+    def is_available(self) -> bool:
+        """True if memory telemetry was successfully collected."""
+        return self.total_mb > 0
+
+    @property
     def pressure_pct(self) -> int:
-        """Memory pressure as percentage."""
+        """Memory pressure as percentage. -1 if telemetry unavailable."""
+        if not self.is_available:
+            return -1
         used = self.active_mb + self.wired_mb + self.compressed_mb
         return int(used / max(self.total_mb, 1) * 100)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "available": self.is_available,
             "total_mb": self.total_mb,
             "active_mb": self.active_mb,
             "inactive_mb": self.inactive_mb,
@@ -313,7 +321,9 @@ def load_health_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def pressure_label(pressure_pct: int, thresholds: dict[str, int] | None = None) -> str:
-    """Return OK / ELEVATED / CRITICAL based on pressure percentage."""
+    """Return OK / ELEVATED / CRITICAL / UNAVAILABLE based on pressure percentage."""
+    if pressure_pct < 0:
+        return "UNAVAILABLE"
     t = thresholds or DEFAULT_PRESSURE_THRESHOLDS
     if pressure_pct >= t.get("critical", 85):
         return "CRITICAL"

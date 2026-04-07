@@ -63,6 +63,29 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
     }
 
 
+def test_guard_state_contract_shape(tmp_path, monkeypatch):
+    """Guard state has no syshealth keys — fast path only."""
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    state = reporter.build_guard_state(conn)
+    assert set(state.keys()) == {
+        "agent_interface",
+        "generated_utc",
+        "processes",
+        "external_resources",
+        "process_count",
+        "gpu_budget",
+        "ports_claimed",
+        "preferred_ports",
+        "safe_ports",
+        "repos_locked",
+    }
+    # No syshealth keys
+    assert "system_memory" not in state
+    assert "sessions" not in state
+    assert "idle_processes" not in state
+
+
 def test_state_json_contract_shape(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()
