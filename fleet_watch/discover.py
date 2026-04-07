@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -181,8 +182,35 @@ def _model_short(model: str | None) -> str:
     return parts[-1][:30]
 
 
+def _query_ollama_vram(port: int = 11434) -> int:
+    """Query Ollama /api/ps for actual loaded model VRAM in MB.
+
+    Returns real GPU residency instead of hardcoded estimates.
+    Falls back to 0 if Ollama is unreachable.
+    """
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/ps",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            total_vram = sum(
+                m.get("size_vram", 0) for m in data.get("models", [])
+            )
+            return total_vram // (1024 * 1024)  # bytes → MB
+    except Exception:
+        return 0
+
+
 def _estimate_gpu(pattern: dict[str, Any], model: str | None) -> int:
     """Estimate GPU memory from pattern config and model size."""
+    # Special case: Ollama — query real VRAM if available
+    if pattern.get("name_template") == "Ollama":
+        real_vram = _query_ollama_vram(pattern.get("port_default", 11434))
+        if real_vram > 0:
+            return real_vram
+
     if "gpu_mb_models" in pattern and model:
         short = _model_short(model)
         for key, mb in pattern["gpu_mb_models"].items():
