@@ -62,18 +62,18 @@ def test_markdown_report_structure():
         status="RUNNING",
     )
     md = reporter.generate_markdown(reporter.build_state(conn))
-    assert "# Fleet Watch State Report" in md
-    assert "Active Processes (1)" in md
-    assert "External Resources (1)" in md
+    assert "# Fleet Watch" in md
+    assert "### sov" in md
+    assert "### paper" in md
     assert "mlx" in md
     assert "Resource Budget" in md
-    assert "Suggested open ports" in md
+    assert "Ownership" in md
 
 
 def test_markdown_empty():
     conn = _fresh_conn()
     md = reporter.generate_markdown(reporter.build_state(conn))
-    assert "No active processes." in md
+    assert "No active workstreams." in md
 
 
 def test_json_report_parseable():
