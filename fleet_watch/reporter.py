@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import discover, events, referee, registry
+from fleet_watch import discover, events, referee, registry, syshealth
 
 
 def _now_iso() -> str:
@@ -38,6 +38,11 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     # Count conflicts prevented in last 24h
     conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
 
+    # System health
+    memory = syshealth.get_memory_state()
+    sessions = syshealth.get_session_processes()
+    idle = syshealth.get_idle_processes()
+
     return {
         "agent_interface": "fleet guard --json",
         "generated_utc": _now_iso(),
@@ -52,6 +57,20 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "stale_processes": stale,
         "recent_events": recent,
         "conflicts_prevented_24h": len(conflicts_24h),
+        "system_memory": memory.to_dict(),
+        "sessions": [
+            {
+                "pid": s.pid,
+                "name": s.name,
+                "kind": s.kind,
+                "rss_mb": s.rss_mb,
+                "cpu_pct": s.cpu_pct,
+                "started": s.started,
+                "tty": s.tty,
+            }
+            for s in sessions
+        ],
+        "idle_processes": idle,
     }
 
 
@@ -152,6 +171,45 @@ def generate_markdown(state: dict[str, Any]) -> str:
         lines.append("")
         for sid, items in sorted(sessions.items()):
             lines.append(f"**{sid}**: {', '.join(items)}")
+        lines.append("")
+
+    # --- System health ---
+    mem = state.get("system_memory", {})
+    if mem:
+        pressure = mem.get("pressure_pct", 0)
+        indicator = "OK" if pressure < 70 else "ELEVATED" if pressure < 85 else "CRITICAL"
+        lines.append(f"## System Memory — {indicator} ({pressure}% pressure)")
+        lines.append(f"- Total: {mem['total_mb']:,} MB")
+        lines.append(f"- Active: {mem['active_mb']:,} MB | Wired: {mem['wired_mb']:,} MB | "
+                     f"Compressed: {mem['compressed_mb']:,} MB")
+        lines.append(f"- Free: {mem['free_mb']:,} MB | Inactive: {mem['inactive_mb']:,} MB | "
+                     f"Available: {mem['available_mb']:,} MB")
+        lines.append("")
+
+    # --- Sessions ---
+    sess_list = state.get("sessions", [])
+    if sess_list:
+        total_rss = sum(s["rss_mb"] for s in sess_list)
+        cc = [s for s in sess_list if s["kind"] == "claude-code"]
+        cx = [s for s in sess_list if s["kind"] == "codex"]
+        lines.append(f"## Sessions ({len(cc)} Claude Code, {len(cx)} Codex — {total_rss:,} MB total)")
+        lines.append("")
+        lines.append("| PID | Type | RSS | CPU | TTY | Started |")
+        lines.append("|-----|------|-----|-----|-----|---------|")
+        for s in sorted(sess_list, key=lambda x: x["rss_mb"], reverse=True):
+            lines.append(f"| {s['pid']} | {s['kind']} | {s['rss_mb']:,} MB | "
+                         f"{s['cpu_pct']:.1f}% | {s['tty']} | {s['started']} |")
+        lines.append("")
+
+    # --- Idle processes ---
+    idle_list = state.get("idle_processes", [])
+    if idle_list:
+        total_idle_rss = sum(p["rss_mb"] for p in idle_list)
+        lines.append(f"## Idle Processes ({len(idle_list)} — {total_idle_rss:,} MB reclaimable)")
+        lines.append("")
+        for p in idle_list:
+            cmd_short = p["command"].split("/")[-1][:60] if "/" in p["command"] else p["command"][:60]
+            lines.append(f"- PID {p['pid']} — {p['rss_mb']:,} MB — CPU {p['cpu_pct']:.1f}% — `{cmd_short}`")
         lines.append("")
 
     # --- What's safe to stop ---

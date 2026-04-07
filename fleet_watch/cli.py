@@ -13,7 +13,7 @@ from typing import Any
 import click
 
 from fleet_watch import discover as discover_mod
-from fleet_watch import events, referee, registry, reporter
+from fleet_watch import events, referee, registry, reporter, syshealth
 
 
 def _get_conn():
@@ -685,6 +685,56 @@ def install_launchd(interval: int, output_path: Path, load: bool):
         sys.exit(result.returncode)
 
     click.echo("Loaded: io.fleet-watch")
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON")
+def health(as_json: bool):
+    """Show system health: RAM pressure, sessions, idle processes."""
+    mem = syshealth.get_memory_state()
+    sessions = syshealth.get_session_processes()
+    idle = syshealth.get_idle_processes()
+
+    if as_json:
+        click.echo(json.dumps({
+            "memory": mem.to_dict(),
+            "sessions": [
+                {"pid": s.pid, "name": s.name, "kind": s.kind, "rss_mb": s.rss_mb,
+                 "cpu_pct": s.cpu_pct, "started": s.started, "tty": s.tty}
+                for s in sessions
+            ],
+            "idle": idle,
+        }, indent=2))
+        return
+
+    pressure = mem.pressure_pct
+    indicator = "OK" if pressure < 70 else "ELEVATED" if pressure < 85 else "CRITICAL"
+    click.echo(f"Memory: {indicator} ({pressure}% pressure)")
+    click.echo(f"  Total: {mem.total_mb:,} MB | Active: {mem.active_mb:,} MB | "
+               f"Compressed: {mem.compressed_mb:,} MB | Free: {mem.free_mb:,} MB")
+    click.echo("")
+
+    if sessions:
+        cc = [s for s in sessions if s.kind == "claude-code"]
+        cx = [s for s in sessions if s.kind == "codex"]
+        total_rss = sum(s.rss_mb for s in sessions)
+        click.echo(f"Sessions: {len(cc)} Claude Code, {len(cx)} Codex ({total_rss:,} MB)")
+        click.echo(f"{'PID':>7}  {'Type':<12} {'RSS':>8}  {'CPU':>6}  {'TTY':<6}  Started")
+        click.echo("-" * 60)
+        for s in sorted(sessions, key=lambda x: x.rss_mb, reverse=True):
+            click.echo(f"{s.pid:>7}  {s.kind:<12} {s.rss_mb:>6} MB  {s.cpu_pct:>5.1f}%  {s.tty:<6}  {s.started}")
+    else:
+        click.echo("Sessions: none detected")
+    click.echo("")
+
+    if idle:
+        total_idle = sum(p["rss_mb"] for p in idle)
+        click.echo(f"Idle processes: {len(idle)} ({total_idle:,} MB reclaimable)")
+        for p in idle:
+            cmd_short = p["command"].split("/")[-1][:50] if "/" in p["command"] else p["command"][:50]
+            click.echo(f"  PID {p['pid']:>7}  {p['rss_mb']:>6} MB  CPU {p['cpu_pct']:>5.1f}%  {cmd_short}")
+    else:
+        click.echo("Idle processes: none detected")
 
 
 @cli.command()
