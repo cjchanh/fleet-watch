@@ -219,6 +219,54 @@ def _estimate_gpu(pattern: dict[str, Any], model: str | None) -> int:
     return pattern.get("gpu_mb_default", 0)
 
 
+def _sync_thunder(conn: sqlite3.Connection) -> int:
+    """Sync Thunder instances from tnr CLI into external_resources.
+
+    Returns the number of instances synced, or 0 if tnr is unavailable.
+    Advisory — never raises on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["tnr", "status", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
+
+    if result.returncode != 0:
+        return 0
+
+    try:
+        raw = result.stdout.strip()
+        # tnr may emit preamble text before JSON
+        bracket = raw.find("[")
+        if bracket < 0:
+            return 0
+        instances = json.loads(raw[bracket:])
+        if not isinstance(instances, list):
+            return 0
+    except (json.JSONDecodeError, ValueError):
+        return 0
+
+    mapped: list[dict[str, Any]] = []
+    for item in instances:
+        external_id = str(item.get("uuid") or item.get("name") or item.get("id"))
+        mapped.append({
+            "resource_type": "instance",
+            "external_id": external_id,
+            "name": f"Thunder {external_id}",
+            "status": str(item.get("status") or "UNKNOWN"),
+            "metadata": item,
+            "cleanup_cmd": f"tnr delete {item.get('id')} --yes",
+            "safe_to_delete": False,
+            "endpoint": None,
+            "gpu_mb": 0,
+        })
+
+    registry.replace_provider_resources(conn, provider="thunder", resources=mapped)
+    return len(mapped)
+
+
 def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
     """Scan the system for processes matching known patterns."""
     loaded = config or load_config()
@@ -358,7 +406,10 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
                          detail={"name": d["name"], "source": "discover"})
         cleaned.append(d)
 
+    # Sync Thunder instances if tnr CLI is available
+    thunder_synced = _sync_thunder(conn)
+
     if close_conn:
         conn.close()
 
-    return {"added": added, "cleaned": cleaned, "skipped": skipped}
+    return {"added": added, "cleaned": cleaned, "skipped": skipped, "thunder_synced": thunder_synced}

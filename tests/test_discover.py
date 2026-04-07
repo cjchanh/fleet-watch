@@ -1,5 +1,6 @@
 """Tests for auto-discovery sync and config behavior."""
 
+import json
 import sqlite3
 
 from fleet_watch import discover, events, registry
@@ -59,3 +60,56 @@ def test_sync_reports_skipped_conflict(tmp_path, monkeypatch):
     assert result["added"] == []
     assert result["skipped"][0]["pid"] == 2
     assert conflict_events
+
+
+def test_sync_thunder_auto_sync(tmp_path, monkeypatch):
+    """Discovery cycle syncs Thunder instances when tnr is available."""
+    _patch_paths(monkeypatch, tmp_path)
+    conn = _fresh_conn()
+
+    tnr_payload = json.dumps([
+        {"id": "0", "uuid": "mmtezz03", "name": "mmtezz03", "status": "RUNNING"},
+        {"id": "1", "uuid": "tcrsdox3", "name": "tcrsdox3", "status": "RUNNING"},
+    ])
+
+    class FakeResult:
+        def __init__(self):
+            self.stdout = "Fetching instances...\n" + tnr_payload
+            self.stderr = ""
+            self.returncode = 0
+
+    monkeypatch.setattr(
+        discover.subprocess,
+        "run",
+        lambda *args, **kwargs: FakeResult(),
+    )
+    # Stub local discovery to return nothing
+    monkeypatch.setattr(discover, "discover", lambda config=None: [])
+
+    result = discover.sync(conn)
+
+    assert result["thunder_synced"] == 2
+    resources = registry.get_all_external_resources(conn)
+    assert len(resources) == 2
+    assert resources[0]["provider"] == "thunder"
+
+
+def test_sync_thunder_unavailable_is_silent(tmp_path, monkeypatch):
+    """Discovery cycle continues without error when tnr is not installed."""
+    _patch_paths(monkeypatch, tmp_path)
+    conn = _fresh_conn()
+
+    original_run = discover.subprocess.run
+
+    def _mock_run(cmd, **kwargs):
+        if cmd[0] == "tnr":
+            raise FileNotFoundError("tnr not found")
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(discover.subprocess, "run", _mock_run)
+    monkeypatch.setattr(discover, "discover", lambda config=None: [])
+
+    result = discover.sync(conn)
+
+    assert result["thunder_synced"] == 0
+    assert registry.get_all_external_resources(conn) == []

@@ -40,6 +40,25 @@ def _holder_conflict_text(holder: dict[str, Any] | None) -> str:
     return holder["name"]
 
 
+def _notify_conflict(skipped: list[dict[str, Any]]) -> None:
+    """Send macOS notification for resource conflicts found during discovery."""
+    count = len(skipped)
+    names = ", ".join(s["name"] for s in skipped[:3])
+    title = "Fleet Watch: Resource Conflict"
+    body = f"{count} conflict(s): {names}"
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'display notification "{body}" with title "{title}"',
+            ],
+            capture_output=True,
+            timeout=3,
+        )
+    except Exception:
+        pass  # Notification failure never blocks discovery
+
+
 def _extract_json_document(raw: str) -> Any:
     raw = raw.strip()
     if not raw:
@@ -566,10 +585,17 @@ def discover():
         click.echo(f"+ PID {a['pid']} ({a['name']})")
     for c in result["cleaned"]:
         click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
-    for skipped in result.get("skipped", []):
+    skipped_list = result.get("skipped", [])
+    for skipped in skipped_list:
         click.echo(f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}")
-    if not result["added"] and not result["cleaned"] and not result.get("skipped"):
+    thunder_count = result.get("thunder_synced", 0)
+    if thunder_count:
+        click.echo(f"Thunder: {thunder_count} instance(s) synced")
+    if not result["added"] and not result["cleaned"] and not skipped_list and not thunder_count:
         click.echo("No changes. Registry is current.")
+    # Alert on conflicts via macOS notification
+    if skipped_list:
+        _notify_conflict(skipped_list)
 
 
 @cli.command()
