@@ -37,6 +37,42 @@ def test_repo_available():
     assert d.allowed is True
 
 
+def test_repo_denied_by_external_resource():
+    conn = _fresh_conn()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-other",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir="/tmp/test-repo",
+        status="RUNNING",
+    )
+    d = referee.check_repo(conn, "/tmp/test-repo")
+    assert d.allowed is False
+    assert d.holder is not None
+    assert d.holder["provider"] == "thunder"
+
+
+def test_repo_allowed_for_current_external_owner_session():
+    conn = _fresh_conn()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-current",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir="/tmp/test-repo",
+        status="RUNNING",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-current")
+    assert d.allowed is True
+
+
 def test_gpu_budget_fits():
     conn = _fresh_conn()
     d = referee.check_gpu_budget(conn, 50000)

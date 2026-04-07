@@ -34,6 +34,29 @@ CREATE TABLE IF NOT EXISTS processes (
     UNIQUE(repo_dir)
 );
 
+CREATE TABLE IF NOT EXISTS external_resources (
+    provider        TEXT NOT NULL,
+    resource_type   TEXT NOT NULL,
+    external_id     TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    workstream      TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    priority        INTEGER NOT NULL DEFAULT 3,
+    gpu_mb          INTEGER DEFAULT 0,
+    repo_dir        TEXT,
+    model           TEXT,
+    status          TEXT NOT NULL DEFAULT 'ACTIVE',
+    started_by      TEXT,
+    owner_tool      TEXT,
+    endpoint        TEXT,
+    cleanup_cmd     TEXT,
+    safe_to_delete  INTEGER NOT NULL DEFAULT 0,
+    metadata        TEXT,
+    start_time      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL,
+    PRIMARY KEY(provider, external_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   TEXT NOT NULL,
@@ -279,6 +302,222 @@ def get_locked_repos(conn: sqlite3.Connection) -> dict[str, int]:
     return {repo: pid for repo, pid in rows}
 
 
+def register_external_resource(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    resource_type: str,
+    external_id: str,
+    session_id: str | None = None,
+    workstream: str,
+    name: str,
+    priority: int = 3,
+    gpu_mb: int = 0,
+    repo_dir: str | None = None,
+    model: str | None = None,
+    status: str = "ACTIVE",
+    started_by: str | None = None,
+    owner_tool: str | None = None,
+    endpoint: str | None = None,
+    cleanup_cmd: str | None = None,
+    safe_to_delete: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not provider:
+        raise ValueError("provider is required")
+    if not resource_type:
+        raise ValueError("resource_type is required")
+    if not external_id:
+        raise ValueError("external_id is required")
+    if not 1 <= priority <= 5:
+        raise ValueError(f"Priority must be 1-5, got {priority}")
+
+    now = _now_iso()
+    sid = session_id or f"{provider}-{external_id}"
+    resolved_repo = str(Path(repo_dir).resolve()) if repo_dir else None
+    metadata_json = json.dumps(metadata or {}, separators=(",", ":"))
+
+    conn.execute(
+        """INSERT OR REPLACE INTO external_resources
+           (provider, resource_type, external_id, session_id, workstream, name,
+            priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
+            endpoint, cleanup_cmd, safe_to_delete, metadata, start_time, last_seen)
+           VALUES (
+             ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?,
+             COALESCE(
+               (SELECT start_time FROM external_resources WHERE provider = ? AND external_id = ?),
+               ?
+             ),
+             ?
+           )""",
+        (
+            provider,
+            resource_type,
+            external_id,
+            sid,
+            workstream,
+            name,
+            priority,
+            gpu_mb,
+            resolved_repo,
+            model,
+            status,
+            started_by,
+            owner_tool,
+            endpoint,
+            cleanup_cmd,
+            1 if safe_to_delete else 0,
+            metadata_json,
+            provider,
+            external_id,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def heartbeat_external_resource(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    external_id: str,
+    status: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    now = _now_iso()
+    fields = ["last_seen = ?"]
+    params: list[Any] = [now]
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if metadata is not None:
+        fields.append("metadata = ?")
+        params.append(json.dumps(metadata, separators=(",", ":")))
+    params.extend([provider, external_id])
+    cursor = conn.execute(
+        f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",
+        params,
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def release_external_resource(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    external_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """SELECT provider, resource_type, external_id, session_id, workstream, name,
+                  priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
+                  endpoint, cleanup_cmd, safe_to_delete, metadata, start_time, last_seen
+           FROM external_resources
+           WHERE provider = ? AND external_id = ?""",
+        (provider, external_id),
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        "DELETE FROM external_resources WHERE provider = ? AND external_id = ?",
+        (provider, external_id),
+    )
+    conn.commit()
+    return _external_row_to_dict(row)
+
+
+def get_external_resource(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    external_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """SELECT provider, resource_type, external_id, session_id, workstream, name,
+                  priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
+                  endpoint, cleanup_cmd, safe_to_delete, metadata, start_time, last_seen
+           FROM external_resources
+           WHERE provider = ? AND external_id = ?""",
+        (provider, external_id),
+    ).fetchone()
+    if not row:
+        return None
+    return _external_row_to_dict(row)
+
+
+def get_all_external_resources(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT provider, resource_type, external_id, session_id, workstream, name,
+                  priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
+                  endpoint, cleanup_cmd, safe_to_delete, metadata, start_time, last_seen
+           FROM external_resources
+           ORDER BY priority DESC, start_time ASC"""
+    ).fetchall()
+    return [_external_row_to_dict(r) for r in rows]
+
+
+def get_external_resources_by_repo(
+    conn: sqlite3.Connection,
+    repo_dir: str,
+) -> list[dict[str, Any]]:
+    resolved = str(Path(repo_dir).resolve())
+    rows = conn.execute(
+        """SELECT provider, resource_type, external_id, session_id, workstream, name,
+                  priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
+                  endpoint, cleanup_cmd, safe_to_delete, metadata, start_time, last_seen
+           FROM external_resources
+           WHERE repo_dir = ?
+           ORDER BY priority DESC, start_time ASC""",
+        (resolved,),
+    ).fetchall()
+    return [_external_row_to_dict(r) for r in rows]
+
+
+def replace_provider_resources(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    resources: list[dict[str, Any]],
+) -> None:
+    existing = {
+        item["external_id"]: item
+        for item in get_all_external_resources(conn)
+        if item["provider"] == provider
+    }
+    seen_ids = {item["external_id"] for item in resources}
+    for resource in resources:
+        prior = existing.get(resource["external_id"])
+        register_external_resource(
+            conn,
+            provider=provider,
+            resource_type=resource["resource_type"],
+            external_id=resource["external_id"],
+            session_id=(prior["session_id"] if prior else None),
+            workstream=(prior["workstream"] if prior else resource.get("workstream", provider)),
+            name=(prior["name"] if prior else resource["name"]),
+            priority=(prior["priority"] if prior else resource.get("priority", 3)),
+            gpu_mb=resource.get("gpu_mb", prior["gpu_mb"] if prior else 0),
+            repo_dir=(prior["repo_dir"] if prior else resource.get("repo_dir")),
+            model=(prior["model"] if prior else resource.get("model")),
+            status=resource.get("status", "ACTIVE"),
+            started_by=(prior["started_by"] if prior else resource.get("started_by")),
+            owner_tool=(prior["owner_tool"] if prior else resource.get("owner_tool")),
+            endpoint=(prior["endpoint"] if prior else resource.get("endpoint")),
+            cleanup_cmd=(prior["cleanup_cmd"] if prior else resource.get("cleanup_cmd")),
+            safe_to_delete=(prior["safe_to_delete"] if prior else resource.get("safe_to_delete", False)),
+            metadata={
+                **(prior["metadata"] if prior else {}),
+                **resource.get("metadata", {}),
+            },
+        )
+    for external_id in existing:
+        if external_id not in seen_ids:
+            release_external_resource(conn, provider=provider, external_id=external_id)
+
+
 def _row_to_dict(row: tuple, conn: sqlite3.Connection) -> dict[str, Any]:
     cols = [
         "pid", "session_id", "workstream", "name", "priority",
@@ -286,3 +525,31 @@ def _row_to_dict(row: tuple, conn: sqlite3.Connection) -> dict[str, Any]:
         "start_cmd", "start_time", "last_heartbeat", "expected_duration_min",
     ]
     return dict(zip(cols, row))
+
+
+def _external_row_to_dict(row: tuple) -> dict[str, Any]:
+    cols = [
+        "provider",
+        "resource_type",
+        "external_id",
+        "session_id",
+        "workstream",
+        "name",
+        "priority",
+        "gpu_mb",
+        "repo_dir",
+        "model",
+        "status",
+        "started_by",
+        "owner_tool",
+        "endpoint",
+        "cleanup_cmd",
+        "safe_to_delete",
+        "metadata",
+        "start_time",
+        "last_seen",
+    ]
+    data = dict(zip(cols, row))
+    data["safe_to_delete"] = bool(data["safe_to_delete"])
+    data["metadata"] = json.loads(data["metadata"]) if data["metadata"] else {}
+    return data

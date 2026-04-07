@@ -24,23 +24,47 @@ def test_build_state_empty():
     assert state["process_count"] == 0
     assert state["gpu_budget"]["allocated_mb"] == 0
     assert "safe_ports" in state
+    assert state["external_resources"] == []
 
 
 def test_build_state_with_process():
     conn = _fresh_conn()
     registry.register_process(conn, pid=1234, name="mlx", workstream="sov", port=8100, gpu_mb=54000)
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-1",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir="/tmp/fleet-watch",
+        status="RUNNING",
+    )
     state = reporter.build_state(conn)
     assert state["process_count"] == 1
     assert state["gpu_budget"]["allocated_mb"] == 54000
     assert 8100 in state["ports_claimed"]
+    assert len(state["external_resources"]) == 1
 
 
 def test_markdown_report_structure():
     conn = _fresh_conn()
     registry.register_process(conn, pid=1234, name="mlx", workstream="sov", port=8100)
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-1",
+        workstream="paper",
+        name="Thunder abc123",
+        status="RUNNING",
+    )
     md = reporter.generate_markdown(reporter.build_state(conn))
     assert "# Fleet Watch State Report" in md
     assert "Active Processes (1)" in md
+    assert "External Resources (1)" in md
     assert "mlx" in md
     assert "Resource Budget" in md
     assert "Suggested open ports" in md

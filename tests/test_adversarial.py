@@ -67,6 +67,7 @@ STATE_KEYS = {
     "agent_interface",
     "generated_utc",
     "processes",
+    "external_resources",
     "process_count",
     "gpu_budget",
     "ports_claimed",
@@ -383,3 +384,62 @@ def test_discover_writes_state_json_with_required_contract_fields(tmp_path, monk
         assert any(item["pid"] == proc.pid for item in state["processes"])
         assert state["preferred_ports"] == preferred
         assert state["safe_ports"] == preferred[1:]
+
+
+def test_thunder_sync_and_claim_surface(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    class Result:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = returncode
+
+    payload = [
+        {
+            "id": "1",
+            "uuid": "tcrsdox3",
+            "name": "tcrsdox3",
+            "status": "RUNNING",
+            "ip": "69.19.136.6",
+            "port": 32712,
+            "template": "cuda12-8",
+            "gpuType": "A6000",
+            "numGpus": "1",
+        }
+    ]
+
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *args, **kwargs: Result("Fetching instances...\n" + json.dumps(payload)),
+    )
+
+    sync_result = runner.invoke(cli_module.cli, ["thunder", "sync"])
+    assert sync_result.exit_code == 0
+    assert "Synced 1 Thunder instance" in sync_result.output
+
+    claim_result = runner.invoke(
+        cli_module.cli,
+        [
+            "thunder",
+            "claim",
+            "--uuid",
+            "tcrsdox3",
+            "--session-id",
+            "sess-1",
+            "--repo",
+            str(tmp_path),
+            "--workstream",
+            "paper",
+        ],
+    )
+    assert claim_result.exit_code == 0
+
+    status_result = runner.invoke(cli_module.cli, ["status", "--json"])
+    assert status_result.exit_code == 0
+    state = json.loads(status_result.output)
+    assert len(state["external_resources"]) == 1
+    assert state["external_resources"][0]["external_id"] == "tcrsdox3"
+    assert state["external_resources"][0]["repo_dir"] == str(tmp_path.resolve())

@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 from fleet_watch import registry
 
@@ -151,3 +152,77 @@ def test_connect_applies_configured_budget(tmp_path, monkeypatch):
 
     assert budget["total_mb"] == 65536
     assert budget["reserve_mb"] == 8192
+
+
+def test_register_and_get_external_resource():
+    conn = _fresh_conn()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-1",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir="/tmp/fleet-watch",
+        status="RUNNING",
+        metadata={"id": "0"},
+    )
+    resource = registry.get_external_resource(conn, provider="thunder", external_id="abc123")
+    assert resource is not None
+    assert resource["provider"] == "thunder"
+    assert resource["external_id"] == "abc123"
+    assert resource["repo_dir"] == str(Path("/tmp/fleet-watch").resolve())
+    assert resource["metadata"]["id"] == "0"
+
+
+def test_release_external_resource():
+    conn = _fresh_conn()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-1",
+        workstream="paper",
+        name="Thunder abc123",
+    )
+    released = registry.release_external_resource(conn, provider="thunder", external_id="abc123")
+    assert released is not None
+    assert released["external_id"] == "abc123"
+    assert registry.get_external_resource(conn, provider="thunder", external_id="abc123") is None
+
+
+def test_replace_provider_resources_preserves_claim_metadata():
+    conn = _fresh_conn()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-1",
+        workstream="paper",
+        name="Claimed resource",
+        repo_dir="/tmp/fleet-watch",
+        endpoint="http://127.0.0.1:8000/v1/chat/completions",
+        metadata={"id": "0"},
+    )
+    registry.replace_provider_resources(
+        conn,
+        provider="thunder",
+        resources=[
+            {
+                "resource_type": "instance",
+                "external_id": "abc123",
+                "name": "Thunder abc123",
+                "status": "RUNNING",
+                "metadata": {"id": "0", "gpuType": "A100"},
+                "cleanup_cmd": "tnr delete 0 --yes",
+            }
+        ],
+    )
+    resource = registry.get_external_resource(conn, provider="thunder", external_id="abc123")
+    assert resource is not None
+    assert resource["session_id"] == "sess-1"
+    assert resource["repo_dir"] == str(Path("/tmp/fleet-watch").resolve())
+    assert resource["metadata"]["gpuType"] == "A100"

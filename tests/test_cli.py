@@ -50,6 +50,7 @@ def test_context_alias_returns_guard_json(tmp_path, monkeypatch):
     payload = json.loads(result.output)
     assert payload["allowed"] is True
     assert "state" in payload
+    assert "external_resources" in payload["state"]
 
 
 def test_install_launchd_writes_real_executable_path(tmp_path, monkeypatch):
@@ -73,3 +74,54 @@ def test_install_launchd_writes_real_executable_path(tmp_path, monkeypatch):
     plist = output_path.read_text()
     assert "/tmp/fleet" in plist
     assert "<integer>30</integer>" in plist
+
+
+def test_guard_repo_denied_by_external_resource(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-other",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir=str(tmp_path),
+        status="RUNNING",
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--repo", str(tmp_path), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["checks"]["repo"]["allowed"] is False
+
+
+def test_guard_repo_allows_current_external_owner_session(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-current",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir=str(tmp_path),
+        status="RUNNING",
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        ["guard", "--repo", str(tmp_path), "--session-id", "sess-current", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["checks"]["repo"]["allowed"] is True

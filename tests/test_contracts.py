@@ -53,6 +53,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "safe_ports",
         "locked_repos",
         "gpu_budget",
+        "external_resources",
     }
     assert set(payload["state"]["gpu_budget"].keys()) == {
         "total_mb",
@@ -80,6 +81,7 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
         "agent_interface",
         "generated_utc",
         "processes",
+        "external_resources",
         "process_count",
         "gpu_budget",
         "ports_claimed",

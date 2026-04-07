@@ -32,9 +32,31 @@ def check_port(conn: sqlite3.Connection, port: int) -> Decision:
 
 
 def check_repo(conn: sqlite3.Connection, repo_dir: str) -> Decision:
+    return check_repo_with_session(conn, repo_dir, current_session_id=None)
+
+
+def check_repo_with_session(
+    conn: sqlite3.Connection,
+    repo_dir: str,
+    current_session_id: str | None,
+) -> Decision:
     holder = registry.get_process_by_repo(conn, repo_dir)
     if holder is None:
-        return Decision(allowed=True, reason="repo available")
+        external_holders = registry.get_external_resources_by_repo(conn, repo_dir)
+        if not external_holders:
+            return Decision(allowed=True, reason="repo available")
+        for external in external_holders:
+            if current_session_id and external["session_id"] == current_session_id:
+                continue
+            return Decision(
+                allowed=False,
+                reason=(
+                    f"repo {repo_dir} locked by external "
+                    f"{external['provider']} resource {external['external_id']} ({external['name']})"
+                ),
+                holder=external,
+            )
+        return Decision(allowed=True, reason="repo available (owned by current session)")
     # Check if holder PID is still alive
     try:
         os.kill(holder["pid"], 0)
@@ -75,11 +97,11 @@ def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
     if holder is None:
         return None
     return {
-        "pid": holder["pid"],
+        "pid": holder.get("pid"),
         "name": holder["name"],
         "workstream": holder["workstream"],
         "priority": holder["priority"],
-        "port": holder["port"],
+        "port": holder.get("port"),
         "repo_dir": holder["repo_dir"],
         "gpu_mb": holder["gpu_mb"],
     }
@@ -121,6 +143,7 @@ def preflight_register(
     port: int | None = None,
     gpu_mb: int = 0,
     repo_dir: str | None = None,
+    current_session_id: str | None = None,
 ) -> list[Decision]:
     """Run all checks before registration. Returns list of failed decisions (empty = all clear)."""
     failures: list[Decision] = []
@@ -136,7 +159,7 @@ def preflight_register(
             failures.append(d)
 
     if repo_dir is not None:
-        d = check_repo(conn, repo_dir)
+        d = check_repo_with_session(conn, repo_dir, current_session_id=current_session_id)
         if not d.allowed:
             failures.append(d)
 

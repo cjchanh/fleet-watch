@@ -25,6 +25,7 @@ def _seconds_ago(iso_ts: str) -> int:
 def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     """Build the full state dict used by both reporters."""
     processes = registry.get_all_processes(conn)
+    external_resources = registry.get_all_external_resources(conn)
     budget = registry.get_gpu_budget(conn)
     ports = registry.get_claimed_ports(conn)
     repos = registry.get_locked_repos(conn)
@@ -41,6 +42,7 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
         "agent_interface": "fleet guard --json",
         "generated_utc": _now_iso(),
         "processes": processes,
+        "external_resources": external_resources,
         "process_count": len(processes),
         "gpu_budget": budget,
         "ports_claimed": ports,
@@ -75,6 +77,24 @@ def generate_markdown(state: dict[str, Any]) -> str:
     else:
         lines.append("")
         lines.append("No active processes.")
+    lines.append("")
+
+    external = state.get("external_resources", [])
+    lines.append(f"## External Resources ({len(external)})")
+    if external:
+        lines.append("")
+        lines.append("| Provider | ID | Name | Status | Repo | Endpoint | Last Seen |")
+        lines.append("|----------|----|------|--------|------|----------|-----------|")
+        for item in external:
+            repo = item["repo_dir"] or "-"
+            endpoint = item["endpoint"] or "-"
+            lines.append(
+                f"| {item['provider']} | {item['external_id']} | {item['name']} | "
+                f"{item['status']} | {repo} | {endpoint} | {_seconds_ago(item['last_seen'])}s ago |"
+            )
+    else:
+        lines.append("")
+        lines.append("No external resources.")
     lines.append("")
 
     # Resource budget

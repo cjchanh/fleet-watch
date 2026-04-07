@@ -24,7 +24,7 @@ pipx install ~/path/to/fleet-watch/
 
 ## How It Works
 
-Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, etc.) by scanning `lsof` and `ps`. It registers them in a local SQLite database with their port claims, GPU memory estimates, and repo locks. Any tool — human or AI — can call `fleet guard --json` before taking resource actions. `~/.fleet-watch/state.json` is the fallback artifact when the CLI is unavailable.
+Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, etc.) by scanning `lsof` and `ps`. It registers them in a local SQLite database with their port claims, GPU memory estimates, and repo locks. It can also track non-local resources, starting with explicit Thunder instance registration and sync. Any tool — human or AI — can call `fleet guard --json` before taking resource actions. `~/.fleet-watch/state.json` is the fallback artifact when the CLI is unavailable.
 
 **You don't register anything manually.** Run `fleet discover` or let the launchd agent do it every 60 seconds.
 
@@ -35,6 +35,7 @@ Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, etc.
 3. Let discovery keep `~/.fleet-watch/state.json` current.
 4. Use `fleet status` when you want the full picture.
 5. Let agents call `fleet guard --json` before they bind ports, load models, or write into shared repos.
+6. For Thunder, run `fleet thunder sync` and then `fleet thunder claim` so remote ownership is visible in the same control plane.
 
 ## Quick Start
 
@@ -47,6 +48,10 @@ fleet discover
 
 # Canonical agent/operator pre-flight
 fleet guard --port 8899 --gpu 8192 --json
+
+# Sync Thunder instances and claim ownership metadata
+fleet thunder sync
+fleet thunder claim --uuid tcrsdox3 --session-id codex-123 --repo ~/Workspace/active/agent-civilization
 
 # Human shorthand availability check
 fleet check --repo ~/projects/my-app
@@ -124,6 +129,7 @@ Top-level keys:
 - `safe_ports` — suggested open ports
 - `locked_repos` — list of locked repo paths
 - `gpu_budget` — object with `total_mb`, `reserve_mb`, `allocated_mb`, `available_mb`
+- `external_resources` — active non-local resources currently tracked by Fleet Watch
 
 ### `~/.fleet-watch/state.json`
 
@@ -132,6 +138,7 @@ Top-level keys:
 - `agent_interface` — canonical agent entrypoint, currently `fleet guard --json`
 - `generated_utc` — snapshot timestamp
 - `processes` — active registered processes
+- `external_resources` — active tracked remote resources (for example Thunder instances)
 - `process_count` — number of active registered processes
 - `gpu_budget` — object with `total_mb`, `reserve_mb`, `allocated_mb`, `available_mb`
 - `ports_claimed` — map of port to pid
@@ -154,6 +161,9 @@ Top-level keys:
 | `fleet check --repo PATH` | Honest repo lock probe |
 | `fleet check --gpu MB` | Honest GPU budget probe |
 | `fleet discover` | Scan and register running AI processes |
+| `fleet thunder sync` | Ingest `tnr status --json` into Fleet Watch state |
+| `fleet thunder claim --uuid ...` | Attach repo/session/model ownership to a Thunder instance |
+| `fleet thunder release --uuid ...` | Remove a Thunder instance from Fleet Watch control |
 | `fleet watch` | Continuous discovery loop (foreground) |
 | `fleet install-launchd` | Install/update a launchd agent with the real `fleet` path |
 | `fleet register` | Manually register a process |
@@ -209,7 +219,7 @@ print(f"Chain valid: {valid}, events: {count}")
 ## Design Principles
 
 1. **Advisory, not mandatory.** If Fleet Watch crashes, all processes continue normally.
-2. **One honest verb per action.** `guard` decides, `check` probes, `discover` observes.
+2. **One honest verb per action.** `guard` decides, `check` probes, `discover` observes, `thunder` synchronizes and claims remote ownership.
 3. **Single machine.** No distributed consensus. SQLite is sufficient.
 4. **Observe first.** Default to alerting, not killing. Preemption requires explicit priority override.
 
@@ -226,6 +236,7 @@ print(f"Chain valid: {valid}, events: {count}")
 - Discovery is heuristic and pattern-based. Unknown workloads are invisible until they are discovered or registered.
 - GPU numbers are claims and estimates, not kernel-level Metal accounting.
 - Auto-discovery uses macOS lsof. On Linux, discovery is not yet implemented — use manual registration via `fleet register`. Linux ss integration is planned.
+- Thunder tracking is explicit, not auto-discovered. You must run `fleet thunder sync` and `fleet thunder claim` to make remote ownership visible.
 - Fleet Watch is advisory. It will not stop unrelated processes from starting.
 - Repo coordination only works for sessions that consult Fleet Watch or are auto-discovered.
 - The project is single-machine by design. No distributed coordination is attempted.
