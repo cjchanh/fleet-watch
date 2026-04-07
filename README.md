@@ -145,35 +145,71 @@ Top-level keys:
 - `preferred_ports` — preferred port list used for suggestions
 - `safe_ports` — suggested open ports
 - `repos_locked` — map of repo path to pid
-- `stale_processes` — stale heartbeat entries
+- `stale_processes` — stale heartbeat entries with evidence-based classification
 - `recent_events` — recent audit events
 - `conflicts_prevented_24h` — conflict count in the last day
+- `session_leases` — active and closed session ownership leases
+- `process_classifications` — per-process ownership state (live/disconnected/stale_candidate/orphan_confirmed/exited)
+- `system_memory` — RAM pressure snapshot (`available`, `total_mb`, `pressure_pct`, etc.)
+- `sessions` — discovered CLI sessions (Claude Code, Codex, etc.) with RSS and CPU
+- `idle_processes` — processes matching workload patterns but consuming near-zero CPU
 
 ## Commands
+
+### Core
 
 | Command | What It Does |
 |---------|-------------|
 | `fleet status` | Show active processes, GPU budget, claimed ports |
 | `fleet status --json` | Machine-readable output |
 | `fleet guard --json` | Canonical pre-flight contract for agents |
-| `fleet guard --port 8899 --repo PATH --gpu 8192` | Allow/deny decision plus holder and suggestions |
-| `fleet check --port N` | Honest availability probe (exit 0=free, 1=taken) |
-| `fleet check --repo PATH` | Honest repo lock probe |
-| `fleet check --gpu MB` | Honest GPU budget probe |
+| `fleet guard --port 8899 --repo PATH --gpu 8192 --session-id ID` | Allow/deny decision plus holder and suggestions |
+| `fleet check --port N --repo PATH --gpu MB --session-id ID` | Honest availability probe (exit 0=free, 1=taken) |
 | `fleet discover` | Scan and register running AI processes |
+| `fleet report` | Write STATE_REPORT.md + state.json + append changelog |
+
+### Observability
+
+| Command | What It Does |
+|---------|-------------|
+| `fleet health` | System memory pressure, active sessions, idle processes |
+| `fleet health --json` | Machine-readable health snapshot |
+| `fleet changelog` | Rolling state changelog (what changed and when) |
+| `fleet changelog --json` | Raw JSONL output |
+| `fleet history` | Hash-chained event audit trail |
+| `fleet stale` | List heartbeat-stale processes with evidence-based classification |
+| `fleet reconcile` | Non-destructive ownership diagnosis (live/disconnected/stale/orphan) |
+| `fleet reconcile --json` | Machine-readable classification output |
+
+### Session Lifecycle
+
+| Command | What It Does |
+|---------|-------------|
+| `fleet session start --session-id ID` | Open or refresh a session lease |
+| `fleet session heartbeat --session-id ID` | Refresh session lease heartbeat |
+| `fleet session close --session-id ID` | Close a session lease (does not kill processes) |
+
+### Thunder (Remote GPU)
+
+| Command | What It Does |
+|---------|-------------|
 | `fleet thunder sync` | Ingest `tnr status --json` into Fleet Watch state |
-| `fleet thunder claim --uuid ...` | Attach repo/session/model ownership to a Thunder instance |
-| `fleet thunder release --uuid ...` | Remove a Thunder instance from Fleet Watch control |
-| `fleet watch` | Continuous discovery loop (foreground) |
-| `fleet install-launchd` | Install/update a launchd agent with the real `fleet` path |
+| `fleet thunder claim --uuid ID --session-id ID --repo PATH` | Attach ownership to a Thunder instance |
+| `fleet thunder heartbeat --uuid ID` | Refresh Thunder resource heartbeat |
+| `fleet thunder release --uuid ID` | Remove a Thunder instance from Fleet Watch |
+
+### Process Management
+
+| Command | What It Does |
+|---------|-------------|
 | `fleet register` | Manually register a process |
-| `fleet claim --port N` | Deprecated alias for `fleet check --port N` |
 | `fleet release --pid N` | Release all claims for a PID |
-| `fleet preempt --port N --priority 5 --reason "..."` | Take a port from lower-priority holder |
-| `fleet report` | Write STATE_REPORT.md + state.json |
-| `fleet history` | Show hash-chained event audit trail |
+| `fleet reap` | Dry-run: show orphan-confirmed processes |
+| `fleet reap --confirm` | Kill and release only orphan-confirmed processes |
+| `fleet preempt --port N --priority 5 --reason "..."` | Take a port from a lower-priority holder |
 | `fleet clean` | Remove entries for dead PIDs |
-| `fleet stale` | List processes with stale heartbeats |
+| `fleet install-launchd` | Install/update a launchd agent |
+| `fleet watch` | Continuous discovery loop (foreground) |
 
 ## GPU Memory Budget
 
@@ -205,6 +241,24 @@ Fleet Watch writes a default config on first run at `~/.fleet-watch/config.json`
 
 `preferred_ports` controls the ports Fleet Watch suggests when the requested one is occupied.
 
+### Health Monitoring
+
+System health detection is also config-driven:
+
+```json
+{
+  "session_patterns": [
+    {"name": "Claude Code", "kind": "claude-code", "process_match": "/claude\\b.*--"},
+    {"name": "Codex", "kind": "codex", "process_match": "/codex\\b"}
+  ],
+  "idle_patterns": ["reranker", "socat.*TCP-LISTEN", "mlx_lm.*server"],
+  "idle_cpu_threshold": 1.0,
+  "pressure_thresholds": {"elevated": 70, "critical": 85}
+}
+```
+
+Override `session_patterns` to detect your own CLI tools. Override `idle_patterns` to flag your own idle workloads. All patterns are regular expressions.
+
 ## Event Audit Trail
 
 Every registration, release, conflict, and cleanup is logged with a SHA-256 hash chain. Each event's hash includes the previous event's hash, creating a tamper-evident audit log. Verify integrity:
@@ -215,6 +269,28 @@ conn = registry.connect()
 valid, count = events.verify_chain(conn)
 print(f"Chain valid: {valid}, events: {count}")
 ```
+
+## Ownership Model
+
+Fleet Watch uses **session leases** to track who owns what. A session lease is a row in the registry that ties a session ID to an owner PID, TTY, repo, and heartbeat timestamp.
+
+**Process classification** requires three independent signals before marking a process as safe to reap:
+
+1. **Heartbeat expired** — the process hasn't been seen by discovery in >180 seconds
+2. **Session lease missing or closed** — no active owner claims the process
+3. **Parent chain detached** — the process's parent PID is dead or is PID 1 (init)
+
+All three must be true for `orphan_confirmed`. If any signal is ambiguous, the process stays at `stale_candidate` or `disconnected` — **never automatically reaped**.
+
+States: `live` → `disconnected` → `stale_candidate` → `orphan_confirmed` → `exited`
+
+Use `fleet reconcile` to inspect classification without mutations. Use `fleet reap --confirm` to act on `orphan_confirmed` only.
+
+## State Changelog
+
+`~/.fleet-watch/state_changelog.jsonl` is an append-only log of what changed on each discovery cycle. Use `fleet changelog` to read it.
+
+Decay: keeps 1440 entries (24 hours at 60-second intervals). Oldest entries are trimmed when the limit is exceeded.
 
 ## Design Principles
 
@@ -237,8 +313,9 @@ print(f"Chain valid: {valid}, events: {count}")
 - GPU numbers are claims and estimates, not kernel-level Metal accounting.
 - Auto-discovery uses macOS lsof. On Linux, discovery is not yet implemented — use manual registration via `fleet register`. Linux ss integration is planned.
 - Thunder tracking is explicit, not auto-discovered. You must run `fleet thunder sync` and `fleet thunder claim` to make remote ownership visible.
-- Fleet Watch is advisory. It will not stop unrelated processes from starting.
+- Fleet Watch is advisory for human use. For AI agent sessions, a PreToolUse hook can make it fail-closed.
 - Repo coordination only works for sessions that consult Fleet Watch or are auto-discovered.
+- Orphan detection is conservative. Without session lease heartbeats from the launcher, discovered processes are classified as `disconnected`, not `orphan_confirmed`.
 - The project is single-machine by design. No distributed coordination is attempted.
 
 ## What Fleet Watch Is Not

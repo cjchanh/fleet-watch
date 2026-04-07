@@ -78,6 +78,7 @@ def _load_tnr_instances() -> list[dict[str, Any]]:
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
     if result.returncode != 0:
         raise click.ClickException(result.stderr.strip() or result.stdout.strip() or "tnr status failed")
@@ -352,7 +353,7 @@ def status(as_json: bool):
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to lock")
 @click.option("--model", default=None, help="Model name if applicable")
 @click.option("--priority", type=click.IntRange(1, 5), default=3, help="Priority 1-5")
-@click.option("--restart-policy", type=click.Choice(sorted(registry.RESTART_POLICIES)), default="ALERT_ONLY")
+@click.option("--restart-policy", type=click.Choice(sorted(registry.RESTART_POLICIES)), default="ALERT_ONLY", help="Restart policy for the process")
 @click.option("--start-cmd", default=None, help="Command to restart the process")
 @click.option("--expected-duration", type=int, default=None, help="Expected duration in minutes")
 def register(pid: int, name: str, workstream: str, session_id: str | None,
@@ -527,7 +528,7 @@ def release(pid: int | None, port: int | None):
 
 
 @cli.command()
-@click.option("--pid", type=int, required=True)
+@click.option("--pid", type=int, required=True, help="PID of the process to heartbeat")
 def heartbeat(pid: int):
     """Update heartbeat for a process."""
     conn = _get_conn()
@@ -924,12 +925,14 @@ def install_launchd(interval: int, output_path: Path, load: bool):
         check=False,
         capture_output=True,
         text=True,
+        timeout=5,
     )
     result = subprocess.run(
         ["launchctl", "load", str(output_path)],
         check=False,
         capture_output=True,
         text=True,
+        timeout=5,
     )
     if result.returncode != 0:
         click.echo(result.stderr.strip() or result.stdout.strip(), err=True)
