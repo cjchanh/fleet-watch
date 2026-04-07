@@ -166,12 +166,45 @@ def test_git_commit_with_C_blocked(tmp_path):
 
 # --- Repo mutation: bare git push falls back to cwd / git root ---
 
-def test_git_push_bare_uses_cwd_fallback():
-    """Bare git push without -C resolves cwd to git root for repo check."""
+def test_git_push_bare_blocked_when_cwd_repo_locked():
+    """Bare git push resolves cwd to git root; blocks if that repo is locked."""
+    # The hook subprocess inherits our cwd — fleet-watch repo root.
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert repo_root, "test must run from inside a git repo"
+
+    try:
+        _fleet_claim(f"{TEST_UUID}-bare", "sess-other", repo_root)
+        result = _invoke_hook("git push origin main")
+        assert result.returncode == 1, f"Expected block, got:\n{result.stdout}"
+        assert "FLEET GUARD BLOCKED" in result.stdout
+    finally:
+        _fleet_release(f"{TEST_UUID}-bare")
+
+
+def test_git_push_bare_allowed_when_cwd_repo_unlocked():
+    """Bare git push from an unlocked cwd repo is allowed."""
     result = _invoke_hook("git push origin main")
-    # Should either block (if cwd repo is locked) or allow (if not)
-    # The key assertion: it doesn't crash and produces a valid exit code
-    assert result.returncode in (0, 1)
+    assert result.returncode == 0
+
+
+def test_git_push_bare_fails_closed_outside_git_dir(tmp_path):
+    """Bare git push from outside any git repo fails closed."""
+    result = subprocess.run(
+        [sys.executable, HOOK],
+        input=json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin main"},
+        }),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        cwd=str(tmp_path),  # tmp_path is not a git repo
+    )
+    assert result.returncode == 1
+    assert "cannot determine repo" in result.stdout
 
 
 # --- Same-session bypass: owned repo allows ---
