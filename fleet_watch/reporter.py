@@ -38,10 +38,16 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     # Count conflicts prevented in last 24h
     conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
 
-    # System health
+    # System health (config-driven patterns)
+    health_config = syshealth.load_health_config(config)
     memory = syshealth.get_memory_state()
-    sessions = syshealth.get_session_processes()
-    idle = syshealth.get_idle_processes()
+    sessions = syshealth.get_session_processes(
+        patterns=health_config["session_patterns"],
+    )
+    idle = syshealth.get_idle_processes(
+        patterns=health_config["idle_patterns"],
+        threshold_cpu=health_config["idle_cpu_threshold"],
+    )
 
     return {
         "agent_interface": "fleet guard --json",
@@ -177,7 +183,7 @@ def generate_markdown(state: dict[str, Any]) -> str:
     mem = state.get("system_memory", {})
     if mem:
         pressure = mem.get("pressure_pct", 0)
-        indicator = "OK" if pressure < 70 else "ELEVATED" if pressure < 85 else "CRITICAL"
+        indicator = syshealth.pressure_label(pressure)
         lines.append(f"## System Memory — {indicator} ({pressure}% pressure)")
         lines.append(f"- Total: {mem['total_mb']:,} MB")
         lines.append(f"- Active: {mem['active_mb']:,} MB | Wired: {mem['wired_mb']:,} MB | "

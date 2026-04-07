@@ -1,12 +1,51 @@
-"""System health — RAM pressure, session inventory, idle detection."""
+"""System health — RAM pressure, session inventory, idle detection.
+
+All detection patterns are config-driven via ~/.fleet-watch/config.json.
+No product names, tool names, or install paths are hardcoded.
+"""
 
 from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+
+# --- Default patterns (overridable via config.json) ---
+
+DEFAULT_SESSION_PATTERNS: list[dict[str, str]] = [
+    {
+        "name": "Claude Code",
+        "kind": "claude-code",
+        "process_match": r"/claude\b.*--",
+    },
+    {
+        "name": "Codex",
+        "kind": "codex",
+        "process_match": r"/codex\b",
+    },
+]
+
+DEFAULT_IDLE_PATTERNS: list[str] = [
+    r"reranker",
+    r"socat.*TCP-LISTEN",
+    r"mlx_lm.*server",
+    r"mlx_vlm.*server",
+    r"uvicorn",
+    r"gunicorn",
+    r"vllm.*serve",
+]
+
+DEFAULT_IDLE_CPU_THRESHOLD = 1.0
+
+DEFAULT_PRESSURE_THRESHOLDS = {
+    "elevated": 70,
+    "critical": 85,
+}
+
+
+# --- Memory ---
 
 @dataclass
 class MemoryState:
@@ -24,7 +63,7 @@ class MemoryState:
 
     @property
     def pressure_pct(self) -> int:
-        """Memory pressure as percentage. >80% is constrained."""
+        """Memory pressure as percentage."""
         used = self.active_mb + self.wired_mb + self.compressed_mb
         return int(used / max(self.total_mb, 1) * 100)
 
@@ -42,34 +81,30 @@ class MemoryState:
 
 
 def get_memory_state() -> MemoryState:
-    """Read system memory state via vm_stat + sysctl."""
-    total_mb = 0
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if out.returncode == 0:
-            total_mb = int(out.stdout.strip()) // (1024 * 1024)
-    except Exception:
-        total_mb = 131072  # 128GB fallback
+    """Read system memory state via vm_stat + sysctl (macOS).
+
+    Returns zeroed MemoryState on non-macOS or on failure.
+    """
+    total_mb = _get_total_memory_mb()
+    if total_mb == 0:
+        return MemoryState(0, 0, 0, 0, 0, 0)
 
     pages: dict[str, int] = {}
+    page_size = 16384  # default, overridden by vm_stat header
     try:
         out = subprocess.run(
             ["vm_stat"], capture_output=True, text=True, timeout=3,
         )
-        # vm_stat uses 16384-byte pages on Apple Silicon
-        page_size = 16384
+        if out.returncode != 0:
+            return MemoryState(total_mb, 0, 0, total_mb, 0, 0)
         for line in out.stdout.splitlines():
             match = re.match(r"(.+?):\s+(\d+)", line)
             if match:
                 pages[match.group(1).strip()] = int(match.group(2))
-        if "Mach Virtual Memory Statistics" in out.stdout:
-            ps_match = re.search(r"page size of (\d+) bytes", out.stdout)
-            if ps_match:
-                page_size = int(ps_match.group(1))
-    except Exception:
+        ps_match = re.search(r"page size of (\d+) bytes", out.stdout)
+        if ps_match:
+            page_size = int(ps_match.group(1))
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return MemoryState(total_mb, 0, 0, total_mb, 0, 0)
 
     def mb(key: str) -> int:
@@ -85,12 +120,28 @@ def get_memory_state() -> MemoryState:
     )
 
 
+def _get_total_memory_mb() -> int:
+    """Get total physical memory in MB. Returns 0 on failure."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out.returncode == 0:
+            return int(out.stdout.strip()) // (1024 * 1024)
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return 0
+
+
+# --- Session discovery ---
+
 @dataclass
 class SessionProcess:
-    """A Claude Code or Codex session process."""
+    """A discovered CLI session process."""
     pid: int
     name: str
-    kind: str  # "claude-code" or "codex"
+    kind: str
     rss_mb: int
     cpu_pct: float
     started: str
@@ -98,36 +149,34 @@ class SessionProcess:
     command: str
 
 
-def get_session_processes() -> list[SessionProcess]:
-    """Discover running Claude Code and Codex processes."""
-    try:
-        out = subprocess.run(
-            ["ps", "aux"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+def get_session_processes(
+    patterns: list[dict[str, str]] | None = None,
+) -> list[SessionProcess]:
+    """Discover running CLI session processes by config-driven patterns.
+
+    Each pattern dict has: name, kind, process_match (regex).
+    """
+    compiled = _compile_session_patterns(
+        patterns if patterns is not None else DEFAULT_SESSION_PATTERNS
+    )
+    if not compiled:
         return []
 
+    lines = _ps_aux_lines()
     sessions: list[SessionProcess] = []
-    for line in out.stdout.splitlines()[1:]:
-        parts = line.split(None, 10)
-        if len(parts) < 11:
-            continue
 
+    for parts in lines:
         cmd = parts[10]
-        kind = None
-        name = None
+        matched_name = None
+        matched_kind = None
 
-        # Claude Code CLI sessions
-        if "/claude" in cmd and ("--dangerously-skip-permissions" in cmd or "--effort" in cmd):
-            kind = "claude-code"
-            name = "Claude Code"
-        # Codex sandbox processes
-        elif "/codex" in cmd and "codex" in parts[10].lower():
-            kind = "codex"
-            name = "Codex"
+        for regex, name, kind in compiled:
+            if regex.search(cmd):
+                matched_name = name
+                matched_kind = kind
+                break
 
-        if kind is None:
+        if matched_kind is None:
             continue
 
         try:
@@ -141,8 +190,8 @@ def get_session_processes() -> list[SessionProcess]:
 
         sessions.append(SessionProcess(
             pid=pid,
-            name=name,
-            kind=kind,
+            name=matched_name,
+            kind=matched_kind,
             rss_mb=rss_mb,
             cpu_pct=cpu_pct,
             started=started,
@@ -153,46 +202,56 @@ def get_session_processes() -> list[SessionProcess]:
     return sessions
 
 
-def get_idle_processes(threshold_cpu: float = 1.0) -> list[dict[str, Any]]:
-    """Find registered-style processes that are alive but consuming near-zero CPU.
+def _compile_session_patterns(
+    patterns: list[dict[str, str]],
+) -> list[tuple[re.Pattern, str, str]]:
+    """Compile session pattern dicts to (regex, name, kind) tuples."""
+    compiled = []
+    for p in patterns:
+        try:
+            compiled.append((
+                re.compile(p["process_match"]),
+                p["name"],
+                p["kind"],
+            ))
+        except (KeyError, re.error):
+            continue
+    return compiled
 
-    Returns process info dicts for anything matching known AI workload patterns
-    that's below the CPU threshold — likely idle and reclaimable.
+
+# --- Idle detection ---
+
+def get_idle_processes(
+    patterns: list[str] | None = None,
+    threshold_cpu: float | None = None,
+) -> list[dict[str, Any]]:
+    """Find processes matching patterns that consume near-zero CPU.
+
+    Patterns and threshold are config-driven.
     """
-    idle_patterns = [
-        re.compile(r"reranker"),
-        re.compile(r"socat.*TCP-LISTEN"),
-        re.compile(r"mlx_lm.*server"),
-        re.compile(r"mlx_vlm.*server"),
-        re.compile(r"uvicorn"),
-    ]
+    pattern_list = patterns if patterns is not None else DEFAULT_IDLE_PATTERNS
+    cpu_limit = threshold_cpu if threshold_cpu is not None else DEFAULT_IDLE_CPU_THRESHOLD
 
-    try:
-        out = subprocess.run(
-            ["ps", "aux"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    compiled = []
+    for p in pattern_list:
+        try:
+            compiled.append(re.compile(p))
+        except re.error:
+            continue
+    if not compiled:
         return []
 
+    lines = _ps_aux_lines()
     idle: list[dict[str, Any]] = []
-    for line in out.stdout.splitlines()[1:]:
-        parts = line.split(None, 10)
-        if len(parts) < 11:
-            continue
 
+    for parts in lines:
         cmd = parts[10]
-        matched = False
-        for pattern in idle_patterns:
-            if pattern.search(cmd):
-                matched = True
-                break
-        if not matched:
+        if not any(regex.search(cmd) for regex in compiled):
             continue
 
         try:
             cpu_pct = float(parts[2])
-            if cpu_pct > threshold_cpu:
+            if cpu_pct > cpu_limit:
                 continue
             pid = int(parts[1])
             rss_mb = int(parts[5]) // 1024
@@ -209,3 +268,55 @@ def get_idle_processes(threshold_cpu: float = 1.0) -> list[dict[str, Any]]:
         })
 
     return idle
+
+
+# --- Shared ---
+
+def _ps_aux_lines() -> list[list[str]]:
+    """Run ps aux and return parsed lines (11+ fields each)."""
+    try:
+        out = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    result = []
+    for line in out.stdout.splitlines()[1:]:
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            result.append(parts)
+    return result
+
+
+def load_health_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Extract health-specific config from the main Fleet Watch config.
+
+    Expected config keys (all optional, defaults used if absent):
+      session_patterns: [{name, kind, process_match}, ...]
+      idle_patterns: ["regex", ...]
+      idle_cpu_threshold: float
+      pressure_thresholds: {elevated: int, critical: int}
+    """
+    if config is None:
+        return {
+            "session_patterns": DEFAULT_SESSION_PATTERNS,
+            "idle_patterns": DEFAULT_IDLE_PATTERNS,
+            "idle_cpu_threshold": DEFAULT_IDLE_CPU_THRESHOLD,
+            "pressure_thresholds": DEFAULT_PRESSURE_THRESHOLDS,
+        }
+    return {
+        "session_patterns": config.get("session_patterns", DEFAULT_SESSION_PATTERNS),
+        "idle_patterns": config.get("idle_patterns", DEFAULT_IDLE_PATTERNS),
+        "idle_cpu_threshold": config.get("idle_cpu_threshold", DEFAULT_IDLE_CPU_THRESHOLD),
+        "pressure_thresholds": config.get("pressure_thresholds", DEFAULT_PRESSURE_THRESHOLDS),
+    }
+
+
+def pressure_label(pressure_pct: int, thresholds: dict[str, int] | None = None) -> str:
+    """Return OK / ELEVATED / CRITICAL based on pressure percentage."""
+    t = thresholds or DEFAULT_PRESSURE_THRESHOLDS
+    if pressure_pct >= t.get("critical", 85):
+        return "CRITICAL"
+    if pressure_pct >= t.get("elevated", 70):
+        return "ELEVATED"
+    return "OK"

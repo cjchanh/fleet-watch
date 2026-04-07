@@ -691,9 +691,17 @@ def install_launchd(interval: int, output_path: Path, load: bool):
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON")
 def health(as_json: bool):
     """Show system health: RAM pressure, sessions, idle processes."""
+    config = discover_mod.load_config()
+    health_config = syshealth.load_health_config(config)
+
     mem = syshealth.get_memory_state()
-    sessions = syshealth.get_session_processes()
-    idle = syshealth.get_idle_processes()
+    sessions = syshealth.get_session_processes(
+        patterns=health_config["session_patterns"],
+    )
+    idle = syshealth.get_idle_processes(
+        patterns=health_config["idle_patterns"],
+        threshold_cpu=health_config["idle_cpu_threshold"],
+    )
 
     if as_json:
         click.echo(json.dumps({
@@ -708,17 +716,19 @@ def health(as_json: bool):
         return
 
     pressure = mem.pressure_pct
-    indicator = "OK" if pressure < 70 else "ELEVATED" if pressure < 85 else "CRITICAL"
+    indicator = syshealth.pressure_label(pressure, health_config["pressure_thresholds"])
     click.echo(f"Memory: {indicator} ({pressure}% pressure)")
     click.echo(f"  Total: {mem.total_mb:,} MB | Active: {mem.active_mb:,} MB | "
                f"Compressed: {mem.compressed_mb:,} MB | Free: {mem.free_mb:,} MB")
     click.echo("")
 
     if sessions:
-        cc = [s for s in sessions if s.kind == "claude-code"]
-        cx = [s for s in sessions if s.kind == "codex"]
+        by_kind: dict[str, list] = {}
+        for s in sessions:
+            by_kind.setdefault(s.kind, []).append(s)
+        kind_summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(by_kind.items()))
         total_rss = sum(s.rss_mb for s in sessions)
-        click.echo(f"Sessions: {len(cc)} Claude Code, {len(cx)} Codex ({total_rss:,} MB)")
+        click.echo(f"Sessions: {kind_summary} ({total_rss:,} MB)")
         click.echo(f"{'PID':>7}  {'Type':<12} {'RSS':>8}  {'CPU':>6}  {'TTY':<6}  Started")
         click.echo("-" * 60)
         for s in sorted(sessions, key=lambda x: x.rss_mb, reverse=True):

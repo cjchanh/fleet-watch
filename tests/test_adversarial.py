@@ -77,6 +77,9 @@ STATE_KEYS = {
     "stale_processes",
     "recent_events",
     "conflicts_prevented_24h",
+    "system_memory",
+    "sessions",
+    "idle_processes",
 }
 
 

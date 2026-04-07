@@ -91,6 +91,9 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
         "stale_processes",
         "recent_events",
         "conflicts_prevented_24h",
+        "system_memory",
+        "sessions",
+        "idle_processes",
     }
     assert set(state["gpu_budget"].keys()) == {
         "total_mb",
