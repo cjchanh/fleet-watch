@@ -69,6 +69,10 @@ def check_repo_with_session(
     except PermissionError:
         pass  # Process exists
 
+    # Same-session bypass for local processes
+    if current_session_id and holder.get("session_id") == current_session_id:
+        return Decision(allowed=True, reason="repo available (owned by current session)")
+
     return Decision(
         allowed=False,
         reason=f"repo {repo_dir} locked by PID {holder['pid']} ({holder['name']})",

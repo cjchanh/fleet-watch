@@ -1,5 +1,6 @@
 """Tests for the referee — claim logic and budget enforcement."""
 
+import os
 import sqlite3
 
 from fleet_watch import events, referee, registry
@@ -71,6 +72,37 @@ def test_repo_allowed_for_current_external_owner_session():
     )
     d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-current")
     assert d.allowed is True
+
+
+def test_repo_allowed_for_current_local_owner_session():
+    """Same-session bypass works for local process repo locks, not just external."""
+    conn = _fresh_conn()
+    registry.register_process(
+        conn,
+        pid=os.getpid(),
+        name="writer",
+        workstream="test",
+        repo_dir="/tmp/test-repo",
+        session_id="sess-current",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-current")
+    assert d.allowed is True
+    assert "owned by current session" in d.reason
+
+
+def test_repo_denied_for_different_local_session():
+    """Different session is denied even for local processes."""
+    conn = _fresh_conn()
+    registry.register_process(
+        conn,
+        pid=os.getpid(),
+        name="writer",
+        workstream="test",
+        repo_dir="/tmp/test-repo",
+        session_id="sess-other",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+    assert d.allowed is False
 
 
 def test_gpu_budget_fits():
