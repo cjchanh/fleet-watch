@@ -51,7 +51,11 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     """Build the full observability state. Includes system health (subprocess calls)."""
     state = build_guard_state(conn)
 
-    stale = registry.get_stale_processes(conn)
+    classifications = registry.get_process_classifications(conn)
+    stale = [
+        proc for proc in classifications
+        if proc["classification"] in {"stale_candidate", "orphan_confirmed"}
+    ]
     recent = events.get_events(conn, hours=1, limit=20)
     conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
 
@@ -67,6 +71,8 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     )
 
     state.update({
+        "session_leases": registry.list_session_leases(conn),
+        "process_classifications": classifications,
         "stale_processes": stale,
         "recent_events": recent,
         "conflicts_prevented_24h": len(conflicts_24h),
@@ -170,21 +176,58 @@ def generate_markdown(state: dict[str, Any]) -> str:
         lines.append("")
 
     # --- Ownership map ---
-    sessions: dict[str, list[str]] = {}
-    for p in procs:
-        sid = p.get("session_id")
-        if sid:
-            sessions.setdefault(sid, []).append(f"PID {p['pid']} ({p['name']})")
-    for e in external:
-        sid = e.get("session_id")
-        if sid:
-            sessions.setdefault(sid, []).append(f"{e['provider']}:{e['external_id']} ({e['name']})")
+    classifications = state.get("process_classifications", [])
+    leases = {
+        lease["session_id"]: lease
+        for lease in state.get("session_leases", [])
+    }
+    classification_by_pid = {
+        item["pid"]: item
+        for item in classifications
+    }
 
-    if sessions:
+    if classifications:
+        counts: dict[str, int] = {}
+        for item in classifications:
+            counts[item["classification"]] = counts.get(item["classification"], 0) + 1
+        summary = ", ".join(
+            f"{count} {name}"
+            for name, count in sorted(counts.items())
+        )
+        lines.append("## Reconciliation")
+        lines.append("")
+        lines.append(summary)
+        lines.append("")
+
+    session_ids = sorted({
+        *(lease["session_id"] for lease in leases.values()),
+        *(p["session_id"] for p in procs if p.get("session_id")),
+        *(e["session_id"] for e in external if e.get("session_id")),
+    })
+    if session_ids:
         lines.append("## Ownership")
         lines.append("")
-        for sid, items in sorted(sessions.items()):
-            lines.append(f"**{sid}**: {', '.join(items)}")
+        for sid in session_ids:
+            lease = leases.get(sid)
+            if lease:
+                owner_pid = lease["owner_pid"] if lease["owner_pid"] is not None else "-"
+                owner_tty = lease["owner_tty"] or "-"
+                repo = lease["repo_dir"] or "-"
+                lines.append(
+                    f"**{sid}** — {lease['status']} | owner PID {owner_pid} | tty {owner_tty} | repo {repo}"
+                )
+            else:
+                lines.append(f"**{sid}** — UNLEASED")
+
+            for p in [proc for proc in procs if proc.get("session_id") == sid]:
+                classification = classification_by_pid.get(p["pid"], {})
+                lines.append(
+                    f"- PID {p['pid']} ({p['name']}) — {classification.get('classification', 'unknown')}"
+                )
+            for e in [item for item in external if item.get("session_id") == sid]:
+                lines.append(
+                    f"- {e['provider']}:{e['external_id']} ({e['name']}) — {e['status']}"
+                )
         lines.append("")
 
     # --- System health ---
@@ -238,10 +281,14 @@ def generate_markdown(state: dict[str, Any]) -> str:
         if e.get("safe_to_delete"):
             cmd = e.get("cleanup_cmd") or f"fleet thunder release --uuid {e['external_id']}"
             stoppable.append(f"- {e['provider']}:{e['external_id']} ({e['name']}) — `{cmd}`")
-    stale = state["stale_processes"]
-    for s in stale:
-        stoppable.append(f"- PID {s['pid']} ({s['name']}) — stale {_human_duration(s['stale_seconds'])}, "
-                         f"likely dead. `fleet release --pid {s['pid']}`")
+    for s in classifications:
+        if s["classification"] != "orphan_confirmed":
+            continue
+        evidence = "; ".join(s.get("evidence", [])[:3])
+        stoppable.append(
+            f"- PID {s['pid']} ({s['name']}) — orphan confirmed; {evidence}. "
+            f"`fleet reap --confirm`"
+        )
 
     lines.append("## Safe to Stop")
     lines.append("")
@@ -251,6 +298,20 @@ def generate_markdown(state: dict[str, Any]) -> str:
     else:
         lines.append("Nothing flagged as safe to stop. All resources are active or owned.")
     lines.append("")
+
+    stale_candidates = [
+        item for item in classifications
+        if item["classification"] == "stale_candidate"
+    ]
+    if stale_candidates:
+        lines.append("## Stale Candidates")
+        lines.append("")
+        for item in stale_candidates:
+            evidence = "; ".join(item.get("evidence", [])[:3])
+            lines.append(
+                f"- PID {item['pid']} ({item['name']}) — heartbeat stale {_human_duration(item['stale_seconds'])}; {evidence}"
+            )
+        lines.append("")
 
     # --- Resource budget ---
     lines.append("## Resource Budget")

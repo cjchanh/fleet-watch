@@ -369,6 +369,7 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
                     priority=proc.priority,
                     restart_policy=proc.restart_policy,
                     start_cmd=proc.command,
+                    manage_session_lease=False,
                 )
             except sqlite3.IntegrityError as exc:
                 reason = str(exc)

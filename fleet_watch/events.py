@@ -24,6 +24,10 @@ EVENT_TYPES = frozenset({
     "CONFLICT",
     "CLEAN",
     "CLAIM",
+    "SESSION_START",
+    "SESSION_HEARTBEAT",
+    "SESSION_CLOSE",
+    "REAP",
     "FUSE_TRIPPED",
     "GPU_BUDGET_DENY",
 })

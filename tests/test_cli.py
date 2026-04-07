@@ -76,6 +76,48 @@ def test_install_launchd_writes_real_executable_path(tmp_path, monkeypatch):
     assert "<integer>30</integer>" in plist
 
 
+def test_session_start_and_close_updates_lease(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    start = runner.invoke(
+        cli_module.cli,
+        ["session", "start", "--session-id", "sess-1", "--owner-pid", str(os.getpid())],
+    )
+    assert start.exit_code == 0
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-1")
+    assert lease is not None
+    assert lease["status"] == "ACTIVE"
+    conn.close()
+
+    close = runner.invoke(cli_module.cli, ["session", "close", "--session-id", "sess-1"])
+    assert close.exit_code == 0
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-1")
+    assert lease is not None
+    assert lease["status"] == "CLOSED"
+    conn.close()
+
+
+def test_reconcile_json_reports_process_classification(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    registry.register_process(conn, pid=os.getpid(), name="mlx", workstream="ws")
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["reconcile", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert "summary" in payload
+    assert payload["processes"]
+    assert payload["processes"][0]["classification"] == "live"
+
+
 def test_guard_repo_denied_by_external_resource(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()

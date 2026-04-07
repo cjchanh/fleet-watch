@@ -87,6 +87,72 @@ def test_heartbeat_unknown_pid():
     assert registry.heartbeat(conn, 9999) is False
 
 
+def test_register_process_creates_auto_session_lease():
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=1234, name="test", workstream="ws")
+    lease = registry.get_session_lease(conn, "cli-1234")
+    assert lease is not None
+    assert lease["status"] == "ACTIVE"
+    assert lease["owner_pid"] == 1234
+
+
+def test_classify_process_orphan_confirmed_when_stale_and_closed(monkeypatch):
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=5555, name="stale", workstream="ws")
+    assert registry.close_session_lease(conn, "cli-5555") is True
+
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid == 5555)
+    monkeypatch.setattr(
+        registry,
+        "_inspect_process",
+        lambda pid: {
+            "pid": pid,
+            "alive": True,
+            "inspectable": True,
+            "ppid": 1,
+            "pgid": 5555,
+            "tty": "?",
+        } if pid == 5555 else None,
+    )
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 600 if ts else None)
+
+    items = registry.get_process_classifications(conn)
+    assert len(items) == 1
+    assert items[0]["classification"] == "orphan_confirmed"
+    assert items[0]["safe_to_reap"] is True
+
+
+def test_classify_discovered_process_without_lease_is_disconnected(monkeypatch):
+    conn = _fresh_conn()
+    registry.register_process(
+        conn,
+        pid=6666,
+        name="observed",
+        workstream="ws",
+        manage_session_lease=False,
+    )
+
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid in {6666, 7777})
+    monkeypatch.setattr(
+        registry,
+        "_inspect_process",
+        lambda pid: {
+            "pid": pid,
+            "alive": True,
+            "inspectable": True,
+            "ppid": 7777 if pid == 6666 else 1,
+            "pgid": 6666,
+            "tty": "ttys000",
+        } if pid in {6666, 7777} else None,
+    )
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 30 if ts else None)
+
+    items = registry.get_process_classifications(conn)
+    assert len(items) == 1
+    assert items[0]["classification"] == "disconnected"
+    assert items[0]["session_lease_present"] is False
+
+
 def test_release_unknown_pid():
     conn = _fresh_conn()
     assert registry.release_process(conn, 9999) is None

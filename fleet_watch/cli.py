@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -199,6 +202,52 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
         lines.append("Locked repos: " + ", ".join(state["locked_repos"]))
 
     return lines
+
+
+def _default_owner_pid() -> int:
+    parent = os.getppid()
+    return parent if parent > 1 else os.getpid()
+
+
+def _build_reconcile_payload(conn) -> dict[str, Any]:
+    processes = registry.get_process_classifications(conn)
+    summary: dict[str, int] = {}
+    for item in processes:
+        summary[item["classification"]] = summary.get(item["classification"], 0) + 1
+    return {
+        "generated_utc": registry._now_iso(),
+        "summary": summary,
+        "processes": processes,
+    }
+
+
+def _terminate_orphan(pid: int, grace_seconds: float = 1.5) -> bool:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not registry._pid_exists(pid):
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not registry._pid_exists(pid):
+            return True
+        time.sleep(0.1)
+    return not registry._pid_exists(pid)
 
 
 def _render_launchd_plist(executable: str, interval: int) -> str:
@@ -492,6 +541,97 @@ def heartbeat(pid: int):
     conn.close()
 
 
+@cli.group()
+def session():
+    """Manage explicit session leases for long-lived agent ownership."""
+    pass
+
+
+@session.command("start")
+@click.option("--session-id", required=True, help="Session identifier")
+@click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
+def session_start(session_id: str, owner_pid: int | None, repo_dir: str | None):
+    """Open or refresh a session lease."""
+    conn = _get_conn()
+    failures = referee.preflight_register(
+        conn,
+        repo_dir=repo_dir,
+        current_session_id=session_id,
+    )
+    if failures:
+        for failure in failures:
+            click.echo(f"DENY: {failure.reason}", err=True)
+        conn.close()
+        sys.exit(1)
+
+    resolved_owner_pid = owner_pid or _default_owner_pid()
+    registry.upsert_session_lease(
+        conn,
+        session_id,
+        owner_pid=resolved_owner_pid,
+        repo_dir=repo_dir,
+    )
+    events.log_event(
+        conn,
+        "SESSION_START",
+        pid=resolved_owner_pid,
+        detail={"session_id": session_id, "repo_dir": repo_dir},
+    )
+    reporter.write_report(conn)
+    click.echo(f"Session {session_id} active (owner PID {resolved_owner_pid})")
+    conn.close()
+
+
+@session.command("heartbeat")
+@click.option("--session-id", required=True, help="Session identifier")
+@click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
+def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | None):
+    """Refresh a session lease heartbeat."""
+    conn = _get_conn()
+    resolved_owner_pid = owner_pid or _default_owner_pid()
+    ok = registry.heartbeat_session_lease(
+        conn,
+        session_id,
+        owner_pid=resolved_owner_pid,
+        repo_dir=repo_dir,
+    )
+    if not ok:
+        click.echo(f"Session {session_id} not found", err=True)
+        conn.close()
+        sys.exit(2)
+    events.log_event(
+        conn,
+        "SESSION_HEARTBEAT",
+        pid=resolved_owner_pid,
+        detail={"session_id": session_id, "repo_dir": repo_dir},
+    )
+    reporter.write_report(conn)
+    click.echo(f"Session heartbeat updated for {session_id}")
+    conn.close()
+
+
+@session.command("close")
+@click.option("--session-id", required=True, help="Session identifier")
+def session_close(session_id: str):
+    """Close a session lease without touching attached processes."""
+    conn = _get_conn()
+    ok = registry.close_session_lease(conn, session_id)
+    if not ok:
+        click.echo(f"Session {session_id} not found", err=True)
+        conn.close()
+        sys.exit(2)
+    events.log_event(
+        conn,
+        "SESSION_CLOSE",
+        detail={"session_id": session_id},
+    )
+    reporter.write_report(conn)
+    click.echo(f"Session {session_id} closed")
+    conn.close()
+
+
 @cli.command()
 @click.option("--port", type=int, required=True)
 @click.option("--priority", type=click.IntRange(1, 5), required=True)
@@ -541,15 +681,126 @@ def history(event_type: str | None, hours: int):
 
 @cli.command()
 def stale():
-    """List processes with stale heartbeats (>180s)."""
+    """List heartbeat-stale processes with evidence-based classification."""
     conn = _get_conn()
     stale_procs = registry.get_stale_processes(conn)
     if not stale_procs:
         click.echo("No stale processes.")
     else:
         for s in stale_procs:
-            click.echo(f"PID {s['pid']} ({s['name']}) — heartbeat {s['stale_seconds']}s ago")
+            evidence = "; ".join(s.get("evidence", [])[:3])
+            click.echo(
+                f"PID {s['pid']} ({s['name']}) — {s['classification']} — "
+                f"heartbeat {s['stale_seconds']}s ago"
+                + (f" — {evidence}" if evidence else "")
+            )
     conn.close()
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def reconcile(as_json: bool):
+    """Inspect process ownership state without mutating registry rows."""
+    conn = _get_conn()
+    payload = _build_reconcile_payload(conn)
+    conn.close()
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        return
+
+    summary = payload["summary"]
+    if not payload["processes"]:
+        click.echo("No registered processes.")
+        return
+
+    summary_text = ", ".join(
+        f"{count} {name}"
+        for name, count in sorted(summary.items())
+    )
+    click.echo(f"Reconciliation: {summary_text}")
+    for item in payload["processes"]:
+        evidence = "; ".join(item.get("evidence", [])[:2])
+        click.echo(
+            f"PID {item['pid']} ({item['name']}) — {item['classification']}"
+            + (f" — {evidence}" if evidence else "")
+        )
+
+
+@cli.command()
+@click.option("--confirm", is_flag=True, help="Kill and release orphan-confirmed processes")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def reap(confirm: bool, as_json: bool):
+    """Kill only orphan-confirmed processes. Dry-run by default."""
+    conn = _get_conn()
+    candidates = registry.get_reapable_processes(conn)
+    released: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    if confirm:
+        for item in candidates:
+            terminated = _terminate_orphan(item["pid"])
+            if not terminated and registry._pid_exists(item["pid"]):
+                failed.append({
+                    "pid": item["pid"],
+                    "name": item["name"],
+                    "reason": "failed to terminate orphan-confirmed PID",
+                })
+                continue
+
+            released_item = registry.release_process(conn, item["pid"])
+            if released_item is None:
+                failed.append({
+                    "pid": item["pid"],
+                    "name": item["name"],
+                    "reason": "process disappeared before registry release",
+                })
+                continue
+            released.append(released_item)
+            events.log_event(
+                conn,
+                "REAP",
+                pid=item["pid"],
+                workstream=item["workstream"],
+                detail={
+                    "reason": "orphan_confirmed",
+                    "session_id": item["session_id"],
+                },
+            )
+        reporter.write_report(conn)
+
+    payload = {
+        "confirmed": confirm,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "released": released,
+        "failed": failed,
+    }
+    conn.close()
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        sys.exit(1 if failed else 0)
+
+    if not candidates:
+        click.echo("No orphan-confirmed processes.")
+        return
+
+    if not confirm:
+        click.echo("Dry run. Orphan-confirmed processes:")
+        for item in candidates:
+            evidence = "; ".join(item.get("evidence", [])[:3])
+            click.echo(
+                f"PID {item['pid']} ({item['name']}) — {evidence}"
+            )
+        click.echo("Run `fleet reap --confirm` to terminate and release these rows.")
+        return
+
+    for item in released:
+        click.echo(f"Reaped PID {item['pid']} ({item['name']})")
+    for item in failed:
+        click.echo(f"FAIL: PID {item['pid']} ({item['name']}) — {item['reason']}", err=True)
+    sys.exit(1 if failed else 0)
 
 
 @cli.command()

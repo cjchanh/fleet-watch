@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ FLEET_DIR = Path.home() / ".fleet-watch"
 DB_PATH = FLEET_DIR / "registry.db"
 DEFAULT_GPU_TOTAL_MB = 131072
 DEFAULT_GPU_RESERVE_MB = 16384
+DEFAULT_STALE_SECONDS = 180
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS processes (
@@ -32,6 +34,19 @@ CREATE TABLE IF NOT EXISTS processes (
     expected_duration_min INTEGER,
     UNIQUE(port),
     UNIQUE(repo_dir)
+);
+
+CREATE TABLE IF NOT EXISTS session_leases (
+    session_id          TEXT PRIMARY KEY,
+    owner_pid           INTEGER,
+    owner_ppid          INTEGER,
+    owner_pgid          INTEGER,
+    owner_tty           TEXT,
+    repo_dir            TEXT,
+    started_at          TEXT NOT NULL,
+    last_heartbeat_at   TEXT NOT NULL,
+    shutdown_at         TEXT,
+    status              TEXT NOT NULL DEFAULT 'ACTIVE'
 );
 
 CREATE TABLE IF NOT EXISTS external_resources (
@@ -83,6 +98,19 @@ RESTART_POLICIES = frozenset({
     "ALERT_ONLY",
 })
 
+SESSION_LEASE_STATUSES = frozenset({
+    "ACTIVE",
+    "CLOSED",
+})
+
+PROCESS_STATES = frozenset({
+    "live",
+    "disconnected",
+    "stale_candidate",
+    "orphan_confirmed",
+    "exited",
+})
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -91,6 +119,117 @@ def _now_iso() -> str:
 def ensure_dir() -> Path:
     FLEET_DIR.mkdir(parents=True, exist_ok=True)
     return FLEET_DIR
+
+
+def _resolve_repo_dir(repo_dir: str | None) -> str | None:
+    return str(Path(repo_dir).resolve()) if repo_dir else None
+
+
+def _age_seconds(iso_ts: str | None) -> int | None:
+    if not iso_ts:
+        return None
+    ts = datetime.fromisoformat(iso_ts)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return int((datetime.now(timezone.utc) - ts).total_seconds())
+
+
+def _pid_exists(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _inspect_process(pid: int | None) -> dict[str, Any] | None:
+    if pid is None or pid <= 0:
+        return None
+    if not _pid_exists(pid):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-o", "pgid=", "-o", "tty=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {
+            "pid": pid,
+            "alive": True,
+            "inspectable": False,
+            "ppid": None,
+            "pgid": None,
+            "tty": None,
+            "error": str(exc),
+        }
+
+    line = result.stdout.strip()
+    if result.returncode != 0 or not line:
+        return {
+            "pid": pid,
+            "alive": True,
+            "inspectable": False,
+            "ppid": None,
+            "pgid": None,
+            "tty": None,
+            "error": result.stderr.strip() or "ps inspection failed",
+        }
+
+    parts = line.split(None, 2)
+    if len(parts) < 2:
+        return {
+            "pid": pid,
+            "alive": True,
+            "inspectable": False,
+            "ppid": None,
+            "pgid": None,
+            "tty": None,
+            "error": f"unexpected ps output: {line}",
+        }
+
+    tty = parts[2] if len(parts) >= 3 else "?"
+    try:
+        return {
+            "pid": pid,
+            "alive": True,
+            "inspectable": True,
+            "ppid": int(parts[0]),
+            "pgid": int(parts[1]),
+            "tty": tty,
+        }
+    except ValueError:
+        return {
+            "pid": pid,
+            "alive": True,
+            "inspectable": False,
+            "ppid": None,
+            "pgid": None,
+            "tty": tty,
+            "error": f"unexpected ps output: {line}",
+        }
+
+
+def _is_parent_chain_detached(pid: int) -> bool | None:
+    info = _inspect_process(pid)
+    if info is None:
+        return True
+    if not info.get("inspectable"):
+        return None
+
+    parent_pid = info["ppid"]
+    if parent_pid in (0, 1):
+        return True
+    if not _pid_exists(parent_pid):
+        return True
+    return False
 
 
 def _configured_budget_defaults() -> tuple[int, int]:
@@ -141,6 +280,147 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def upsert_session_lease(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    owner_pid: int | None = None,
+    repo_dir: str | None = None,
+    status: str = "ACTIVE",
+) -> None:
+    if status not in SESSION_LEASE_STATUSES:
+        raise ValueError(f"Invalid session lease status: {status}")
+
+    now = _now_iso()
+    resolved_repo = _resolve_repo_dir(repo_dir)
+    inspect = _inspect_process(owner_pid)
+    owner_ppid = inspect.get("ppid") if inspect else None
+    owner_pgid = inspect.get("pgid") if inspect else None
+    owner_tty = inspect.get("tty") if inspect else None
+
+    conn.execute(
+        """
+        INSERT INTO session_leases (
+            session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+            started_at, last_heartbeat_at, shutdown_at, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            owner_pid = COALESCE(excluded.owner_pid, session_leases.owner_pid),
+            owner_ppid = COALESCE(excluded.owner_ppid, session_leases.owner_ppid),
+            owner_pgid = COALESCE(excluded.owner_pgid, session_leases.owner_pgid),
+            owner_tty = COALESCE(excluded.owner_tty, session_leases.owner_tty),
+            repo_dir = COALESCE(excluded.repo_dir, session_leases.repo_dir),
+            last_heartbeat_at = excluded.last_heartbeat_at,
+            shutdown_at = NULL,
+            status = excluded.status
+        """,
+        (
+            session_id,
+            owner_pid,
+            owner_ppid,
+            owner_pgid,
+            owner_tty,
+            resolved_repo,
+            now,
+            now,
+            status,
+        ),
+    )
+    conn.commit()
+
+
+def heartbeat_session_lease(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    owner_pid: int | None = None,
+    repo_dir: str | None = None,
+) -> bool:
+    lease = get_session_lease(conn, session_id)
+    if lease is None:
+        if owner_pid is None:
+            return False
+        upsert_session_lease(conn, session_id, owner_pid=owner_pid, repo_dir=repo_dir)
+        return True
+
+    now = _now_iso()
+    pid_to_use = owner_pid if owner_pid is not None else lease.get("owner_pid")
+    inspect = _inspect_process(pid_to_use)
+    owner_ppid = inspect.get("ppid") if inspect else lease.get("owner_ppid")
+    owner_pgid = inspect.get("pgid") if inspect else lease.get("owner_pgid")
+    owner_tty = inspect.get("tty") if inspect else lease.get("owner_tty")
+    resolved_repo = _resolve_repo_dir(repo_dir) or lease.get("repo_dir")
+    cursor = conn.execute(
+        """
+        UPDATE session_leases
+        SET owner_pid = COALESCE(?, owner_pid),
+            owner_ppid = ?,
+            owner_pgid = ?,
+            owner_tty = ?,
+            repo_dir = COALESCE(?, repo_dir),
+            last_heartbeat_at = ?,
+            shutdown_at = NULL,
+            status = 'ACTIVE'
+        WHERE session_id = ?
+        """,
+        (
+            pid_to_use,
+            owner_ppid,
+            owner_pgid,
+            owner_tty,
+            resolved_repo,
+            now,
+            session_id,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
+    now = _now_iso()
+    cursor = conn.execute(
+        """
+        UPDATE session_leases
+        SET shutdown_at = ?,
+            last_heartbeat_at = ?,
+            status = 'CLOSED'
+        WHERE session_id = ?
+        """,
+        (now, now, session_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+               started_at, last_heartbeat_at, shutdown_at, status
+        FROM session_leases
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return _session_lease_row_to_dict(row)
+
+
+def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+               started_at, last_heartbeat_at, shutdown_at, status
+        FROM session_leases
+        ORDER BY started_at ASC
+        """
+    ).fetchall()
+    return [_session_lease_row_to_dict(row) for row in rows]
+
+
 def register_process(
     conn: sqlite3.Connection,
     pid: int,
@@ -155,6 +435,7 @@ def register_process(
     restart_policy: str = "ALERT_ONLY",
     start_cmd: str | None = None,
     expected_duration_min: int | None = None,
+    manage_session_lease: bool = True,
 ) -> None:
     if restart_policy not in RESTART_POLICIES:
         raise ValueError(f"Invalid restart policy: {restart_policy}")
@@ -165,7 +446,7 @@ def register_process(
     sid = session_id or f"cli-{pid}"
 
     # Resolve repo_dir to absolute path
-    resolved_repo = str(Path(repo_dir).resolve()) if repo_dir else None
+    resolved_repo = _resolve_repo_dir(repo_dir)
 
     conn.execute(
         """INSERT INTO processes
@@ -182,25 +463,68 @@ def register_process(
             "UPDATE gpu_budget SET allocated_mb = allocated_mb + ? WHERE id = 1",
             (gpu_mb,),
         )
+    if manage_session_lease and get_session_lease(conn, sid) is None:
+        inspect = _inspect_process(pid) or {}
+        conn.execute(
+            """
+            INSERT INTO session_leases (
+                session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+                started_at, last_heartbeat_at, shutdown_at, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE')
+            """,
+            (
+                sid,
+                pid,
+                inspect.get("ppid"),
+                inspect.get("pgid"),
+                inspect.get("tty"),
+                resolved_repo,
+                now,
+                now,
+            ),
+        )
     conn.commit()
 
 
 def release_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT pid, name, workstream, gpu_mb FROM processes WHERE pid = ?", (pid,)
+        "SELECT pid, session_id, name, workstream, gpu_mb FROM processes WHERE pid = ?", (pid,)
     ).fetchone()
     if not row:
         return None
 
-    gpu_mb = row[3] or 0
+    gpu_mb = row[4] or 0
     conn.execute("DELETE FROM processes WHERE pid = ?", (pid,))
     if gpu_mb > 0:
         conn.execute(
             "UPDATE gpu_budget SET allocated_mb = MAX(0, allocated_mb - ?) WHERE id = 1",
             (gpu_mb,),
         )
+    session_id = row[1]
+    if session_id == f"cli-{pid}":
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM processes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        external_remaining = conn.execute(
+            "SELECT COUNT(*) FROM external_resources WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        if remaining == 0 and external_remaining == 0:
+            now = _now_iso()
+            conn.execute(
+                """
+                UPDATE session_leases
+                SET shutdown_at = COALESCE(shutdown_at, ?),
+                    last_heartbeat_at = ?,
+                    status = 'CLOSED'
+                WHERE session_id = ?
+                """,
+                (now, now, session_id),
+            )
     conn.commit()
-    return {"pid": row[0], "name": row[1], "workstream": row[2], "gpu_mb": gpu_mb}
+    return {"pid": row[0], "name": row[2], "workstream": row[3], "gpu_mb": gpu_mb}
 
 
 def release_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] | None:
@@ -214,9 +538,39 @@ def release_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] | None:
 
 def heartbeat(conn: sqlite3.Connection, pid: int) -> bool:
     now = _now_iso()
+    row = conn.execute(
+        "SELECT session_id, repo_dir FROM processes WHERE pid = ?",
+        (pid,),
+    ).fetchone()
+    if row is None:
+        return False
     cursor = conn.execute(
         "UPDATE processes SET last_heartbeat = ? WHERE pid = ?", (now, pid)
     )
+    lease = get_session_lease(conn, row[0])
+    if lease is not None and lease.get("owner_pid") == pid:
+        inspect = _inspect_process(pid)
+        conn.execute(
+            """
+            UPDATE session_leases
+            SET owner_ppid = ?,
+                owner_pgid = ?,
+                owner_tty = ?,
+                repo_dir = COALESCE(?, repo_dir),
+                last_heartbeat_at = ?,
+                shutdown_at = NULL,
+                status = 'ACTIVE'
+            WHERE session_id = ?
+            """,
+            (
+                (inspect or {}).get("ppid"),
+                (inspect or {}).get("pgid"),
+                (inspect or {}).get("tty"),
+                row[1],
+                now,
+                row[0],
+            ),
+        )
     conn.commit()
     return cursor.rowcount > 0
 
@@ -259,20 +613,26 @@ def get_gpu_budget(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
-def get_stale_processes(conn: sqlite3.Connection, stale_seconds: int = 180) -> list[dict[str, Any]]:
-    rows = conn.execute("SELECT * FROM processes").fetchall()
-    now = datetime.now(timezone.utc)
-    stale = []
-    for r in rows:
-        proc = _row_to_dict(r, conn)
-        last_hb = datetime.fromisoformat(proc["last_heartbeat"])
-        if last_hb.tzinfo is None:
-            last_hb = last_hb.replace(tzinfo=timezone.utc)
-        age = (now - last_hb).total_seconds()
-        if age > stale_seconds:
-            proc["stale_seconds"] = int(age)
-            stale.append(proc)
-    return stale
+def get_stale_processes(
+    conn: sqlite3.Connection,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    return [
+        proc
+        for proc in get_process_classifications(conn, stale_seconds=stale_seconds)
+        if (proc.get("heartbeat_age_seconds") or 0) > stale_seconds
+    ]
+
+
+def get_reapable_processes(
+    conn: sqlite3.Connection,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    return [
+        proc
+        for proc in get_process_classifications(conn, stale_seconds=stale_seconds)
+        if proc["classification"] == "orphan_confirmed"
+    ]
 
 
 def clean_dead_pids(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -280,13 +640,9 @@ def clean_dead_pids(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT pid, name, workstream, gpu_mb FROM processes").fetchall()
     cleaned = []
     for pid, name, ws, gpu_mb in rows:
-        try:
-            os.kill(pid, 0)  # Check if process exists
-        except ProcessLookupError:
+        if not _pid_exists(pid):
             release_process(conn, pid)
             cleaned.append({"pid": pid, "name": name, "workstream": ws})
-        except PermissionError:
-            pass  # Process exists but we can't signal it — leave it
     return cleaned
 
 
@@ -300,6 +656,92 @@ def get_locked_repos(conn: sqlite3.Connection) -> dict[str, int]:
     """Return {repo_dir: pid} for all locked repos."""
     rows = conn.execute("SELECT repo_dir, pid FROM processes WHERE repo_dir IS NOT NULL").fetchall()
     return {repo: pid for repo, pid in rows}
+
+
+def get_process_classifications(
+    conn: sqlite3.Connection,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for proc in get_all_processes(conn):
+        process_alive = _pid_exists(proc["pid"])
+        heartbeat_age = _age_seconds(proc.get("last_heartbeat"))
+        stale = heartbeat_age is not None and heartbeat_age > stale_seconds
+        lease = get_session_lease(conn, proc["session_id"])
+        lease_present = lease is not None
+        lease_active = bool(lease and lease["status"] == "ACTIVE" and lease["shutdown_at"] is None)
+        owner_pid = lease.get("owner_pid") if lease else None
+        owner_alive = _pid_exists(owner_pid) if owner_pid else None
+        process_info = _inspect_process(proc["pid"]) if process_alive else None
+        parent_chain_detached = (
+            _is_parent_chain_detached(proc["pid"])
+            if process_alive else True
+        )
+        evidence: list[str] = []
+
+        if not process_alive:
+            classification = "exited"
+            evidence.append("registered PID is no longer running")
+        elif lease_active and owner_alive and not stale:
+            classification = "live"
+            evidence.append(f"active session lease owner PID {owner_pid} is alive")
+        elif (not lease_present or not lease_active) and stale and parent_chain_detached is True:
+            classification = "orphan_confirmed"
+            evidence.append("process heartbeat expired")
+            evidence.append("session lease is missing or closed")
+            evidence.append("parent chain is detached")
+        elif stale:
+            classification = "stale_candidate"
+            evidence.append("process heartbeat expired")
+            if lease_present:
+                evidence.append(f"session lease status={lease['status']}")
+                if owner_pid:
+                    evidence.append(
+                        "session owner alive"
+                        if owner_alive else "session owner missing"
+                    )
+            else:
+                evidence.append("session lease missing")
+            if parent_chain_detached is None:
+                evidence.append("parent chain inspection unavailable")
+            elif parent_chain_detached:
+                evidence.append("parent chain detached")
+            else:
+                evidence.append("parent chain still attached")
+        else:
+            classification = "disconnected"
+            if not lease_present:
+                evidence.append("session lease missing")
+            elif not lease_active:
+                evidence.append(f"session lease closed ({lease['status']})")
+            elif owner_pid and not owner_alive:
+                evidence.append(f"session owner PID {owner_pid} is not running")
+            else:
+                evidence.append("ownership evidence incomplete")
+
+        item = dict(proc)
+        item.update({
+            "classification": classification,
+            "heartbeat_age_seconds": heartbeat_age,
+            "stale_seconds": heartbeat_age if stale else 0,
+            "process_alive": process_alive,
+            "session_lease_present": lease_present,
+            "session_lease_status": lease["status"] if lease else "MISSING",
+            "session_lease_owner_pid": owner_pid,
+            "session_lease_owner_alive": owner_alive,
+            "session_lease_last_heartbeat_age_seconds": (
+                _age_seconds(lease.get("last_heartbeat_at")) if lease else None
+            ),
+            "session_lease_shutdown_at": lease.get("shutdown_at") if lease else None,
+            "parent_pid": process_info.get("ppid") if process_info else None,
+            "process_group_id": process_info.get("pgid") if process_info else None,
+            "tty": process_info.get("tty") if process_info else None,
+            "parent_chain_detached": parent_chain_detached,
+            "safe_to_reap": classification == "orphan_confirmed",
+            "evidence": evidence,
+        })
+        results.append(item)
+    return results
 
 
 def register_external_resource(
@@ -334,7 +776,7 @@ def register_external_resource(
 
     now = _now_iso()
     sid = session_id or f"{provider}-{external_id}"
-    resolved_repo = str(Path(repo_dir).resolve()) if repo_dir else None
+    resolved_repo = _resolve_repo_dir(repo_dir)
     metadata_json = json.dumps(metadata or {}, separators=(",", ":"))
 
     conn.execute(
@@ -375,6 +817,32 @@ def register_external_resource(
             now,
             now,
         ),
+    )
+    lease = get_session_lease(conn, sid)
+    if lease is None:
+        conn.execute(
+            """
+            INSERT INTO session_leases (
+                session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+                started_at, last_heartbeat_at, shutdown_at, status
+            )
+            VALUES (?, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, 'ACTIVE')
+            """,
+            (sid, resolved_repo, now, now),
+        )
+        conn.commit()
+        return
+
+    conn.execute(
+        """
+        UPDATE session_leases
+        SET repo_dir = COALESCE(?, repo_dir),
+            last_heartbeat_at = ?,
+            shutdown_at = NULL,
+            status = 'ACTIVE'
+        WHERE session_id = ?
+        """,
+        (resolved_repo, now, sid),
     )
     conn.commit()
 
@@ -425,6 +893,28 @@ def release_external_resource(
         "DELETE FROM external_resources WHERE provider = ? AND external_id = ?",
         (provider, external_id),
     )
+    session_id = row[3]
+    if session_id == f"{provider}-{external_id}":
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM external_resources WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        proc_remaining = conn.execute(
+            "SELECT COUNT(*) FROM processes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        if remaining == 0 and proc_remaining == 0:
+            now = _now_iso()
+            conn.execute(
+                """
+                UPDATE session_leases
+                SET shutdown_at = COALESCE(shutdown_at, ?),
+                    last_heartbeat_at = ?,
+                    status = 'CLOSED'
+                WHERE session_id = ?
+                """,
+                (now, now, session_id),
+            )
     conn.commit()
     return _external_row_to_dict(row)
 
@@ -523,6 +1013,22 @@ def _row_to_dict(row: tuple, conn: sqlite3.Connection) -> dict[str, Any]:
         "pid", "session_id", "workstream", "name", "priority",
         "port", "gpu_mb", "repo_dir", "model", "restart_policy",
         "start_cmd", "start_time", "last_heartbeat", "expected_duration_min",
+    ]
+    return dict(zip(cols, row))
+
+
+def _session_lease_row_to_dict(row: tuple) -> dict[str, Any]:
+    cols = [
+        "session_id",
+        "owner_pid",
+        "owner_ppid",
+        "owner_pgid",
+        "owner_tty",
+        "repo_dir",
+        "started_at",
+        "last_heartbeat_at",
+        "shutdown_at",
+        "status",
     ]
     return dict(zip(cols, row))
 
