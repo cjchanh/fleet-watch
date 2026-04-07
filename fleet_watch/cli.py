@@ -687,6 +687,49 @@ def install_launchd(interval: int, output_path: Path, load: bool):
     click.echo("Loaded: io.fleet-watch")
 
 
+@cli.command()
+@click.option("--lines", "max_lines", type=int, default=20, help="Number of entries to show")
+@click.option("--json", "as_json", is_flag=True, help="Raw JSONL output")
+def changelog(max_lines: int, as_json: bool):
+    """Show rolling state changelog (what changed and when)."""
+    log_path = registry.FLEET_DIR / "state_changelog.jsonl"
+    if not log_path.exists():
+        click.echo("No changelog yet. Run `fleet discover` to start recording.")
+        return
+
+    all_lines = log_path.read_text().strip().splitlines()
+    tail = all_lines[-max_lines:]
+
+    if as_json:
+        for line in tail:
+            click.echo(line)
+        return
+
+    for line in tail:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("timestamp", "?")
+        delta = entry.get("delta", {})
+        parts: list[str] = []
+        for p in delta.get("processes_added", []):
+            parts.append(f"+{p['name']} (PID {p['pid']}, {p.get('gpu_mb', 0)}MB)")
+        for p in delta.get("processes_removed", []):
+            parts.append(f"-{p['name']} (PID {p['pid']})")
+        for e in delta.get("external_added", []):
+            parts.append(f"+{e['provider']}:{e['external_id']} ({e['name']})")
+        for e in delta.get("external_removed", []):
+            parts.append(f"-{e['provider']}:{e['external_id']} ({e['name']})")
+        for s in delta.get("status_changes", []):
+            parts.append(f"{s['provider']}:{s['external_id']} {s['old_status']}→{s['new_status']}")
+        gpu = delta.get("gpu_allocated_mb")
+        if gpu:
+            parts.append(f"GPU {gpu['old']}→{gpu['new']}MB")
+        if parts:
+            click.echo(f"{ts}  {' | '.join(parts)}")
+
+
 @cli.group()
 def thunder():
     """Thunder instance coordination."""

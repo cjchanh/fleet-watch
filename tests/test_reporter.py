@@ -94,3 +94,76 @@ def test_write_report(tmp_path):
     assert "Fleet Watch" in md_path.read_text()
     parsed = json.loads(json_path.read_text())
     assert parsed["process_count"] == 1
+
+
+def test_changelog_records_process_added(tmp_path):
+    """Changelog records when a new process appears."""
+    conn = _fresh_conn()
+    # First report: empty
+    reporter.write_report(conn, output_dir=tmp_path)
+    # Add a process
+    registry.register_process(conn, pid=9999, name="new-mlx", workstream="ws", gpu_mb=8192)
+    # Second report: should record the addition
+    reporter.write_report(conn, output_dir=tmp_path)
+    log = (tmp_path / "state_changelog.jsonl").read_text().strip().splitlines()
+    assert len(log) >= 1
+    entry = json.loads(log[-1])
+    assert "delta" in entry
+    added = entry["delta"].get("processes_added", [])
+    assert any(p["name"] == "new-mlx" for p in added)
+
+
+def test_changelog_records_process_removed(tmp_path):
+    """Changelog records when a process disappears."""
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=9999, name="old-mlx", workstream="ws")
+    reporter.write_report(conn, output_dir=tmp_path)
+    # Remove the process
+    registry.release_process(conn, 9999)
+    reporter.write_report(conn, output_dir=tmp_path)
+    log = (tmp_path / "state_changelog.jsonl").read_text().strip().splitlines()
+    entry = json.loads(log[-1])
+    removed = entry["delta"].get("processes_removed", [])
+    assert any(p["name"] == "old-mlx" for p in removed)
+
+
+def test_changelog_records_gpu_change(tmp_path):
+    """Changelog records GPU budget changes."""
+    conn = _fresh_conn()
+    reporter.write_report(conn, output_dir=tmp_path)
+    registry.register_process(conn, pid=9999, name="gpu-hog", workstream="ws", gpu_mb=50000)
+    reporter.write_report(conn, output_dir=tmp_path)
+    log = (tmp_path / "state_changelog.jsonl").read_text().strip().splitlines()
+    entry = json.loads(log[-1])
+    gpu = entry["delta"].get("gpu_allocated_mb")
+    assert gpu is not None
+    assert gpu["old"] == 0
+    assert gpu["new"] == 50000
+
+
+def test_changelog_no_entry_when_no_change(tmp_path):
+    """Changelog doesn't append when nothing changed."""
+    conn = _fresh_conn()
+    reporter.write_report(conn, output_dir=tmp_path)
+    reporter.write_report(conn, output_dir=tmp_path)
+    log_path = tmp_path / "state_changelog.jsonl"
+    if log_path.exists():
+        lines = log_path.read_text().strip().splitlines()
+        # At most the initial state diff, no duplicate
+        assert len(lines) <= 1
+
+
+def test_changelog_decays_old_entries(tmp_path):
+    """Changelog trims oldest entries when exceeding max."""
+    conn = _fresh_conn()
+    log_path = tmp_path / "state_changelog.jsonl"
+    # Write more than CHANGELOG_MAX_LINES entries directly
+    with log_path.open("w") as f:
+        for i in range(reporter.CHANGELOG_MAX_LINES + 100):
+            f.write(json.dumps({"timestamp": f"T{i}", "delta": {"i": i}}) + "\n")
+    # Trigger decay by appending one more
+    reporter._append_changelog(log_path, {"timestamp": "T-final", "delta": {}})
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) <= reporter.CHANGELOG_MAX_LINES
+    # Most recent entry is preserved
+    assert "T-final" in lines[-1]

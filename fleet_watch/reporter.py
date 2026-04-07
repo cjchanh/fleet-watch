@@ -240,17 +240,116 @@ def generate_json(state: dict[str, Any]) -> str:
     return json.dumps(state, indent=2, default=str)
 
 
+# Maximum changelog entries before decay (24h at 60s intervals)
+CHANGELOG_MAX_LINES = 1440
+
+
+def _diff_state(prev: dict[str, Any], curr: dict[str, Any]) -> dict[str, Any]:
+    """Compute what changed between two state snapshots."""
+    prev_pids = {p["pid"] for p in prev.get("processes", [])}
+    curr_pids = {p["pid"] for p in curr.get("processes", [])}
+    prev_ext = {(e["provider"], e["external_id"]) for e in prev.get("external_resources", [])}
+    curr_ext = {(e["provider"], e["external_id"]) for e in curr.get("external_resources", [])}
+
+    added_pids = curr_pids - prev_pids
+    removed_pids = prev_pids - curr_pids
+    added_ext = curr_ext - prev_ext
+    removed_ext = prev_ext - curr_ext
+
+    # Detect status changes on external resources
+    prev_ext_status = {
+        (e["provider"], e["external_id"]): e.get("status")
+        for e in prev.get("external_resources", [])
+    }
+    status_changes = []
+    for e in curr.get("external_resources", []):
+        key = (e["provider"], e["external_id"])
+        if key in prev_ext_status and prev_ext_status[key] != e.get("status"):
+            status_changes.append({
+                "provider": e["provider"],
+                "external_id": e["external_id"],
+                "old_status": prev_ext_status[key],
+                "new_status": e.get("status"),
+            })
+
+    # Detect GPU budget changes
+    prev_gpu = prev.get("gpu_budget", {}).get("allocated_mb", 0)
+    curr_gpu = curr.get("gpu_budget", {}).get("allocated_mb", 0)
+
+    delta: dict[str, Any] = {}
+    if added_pids:
+        delta["processes_added"] = [
+            {"pid": p["pid"], "name": p["name"], "workstream": p["workstream"],
+             "port": p.get("port"), "gpu_mb": p.get("gpu_mb", 0)}
+            for p in curr["processes"] if p["pid"] in added_pids
+        ]
+    if removed_pids:
+        delta["processes_removed"] = [
+            {"pid": p["pid"], "name": p["name"], "workstream": p["workstream"]}
+            for p in prev["processes"] if p["pid"] in removed_pids
+        ]
+    if added_ext:
+        delta["external_added"] = [
+            {"provider": e["provider"], "external_id": e["external_id"],
+             "name": e["name"], "status": e.get("status")}
+            for e in curr["external_resources"]
+            if (e["provider"], e["external_id"]) in added_ext
+        ]
+    if removed_ext:
+        delta["external_removed"] = [
+            {"provider": e["provider"], "external_id": e["external_id"],
+             "name": e["name"]}
+            for e in prev["external_resources"]
+            if (e["provider"], e["external_id"]) in removed_ext
+        ]
+    if status_changes:
+        delta["status_changes"] = status_changes
+    if prev_gpu != curr_gpu:
+        delta["gpu_allocated_mb"] = {"old": prev_gpu, "new": curr_gpu}
+
+    return delta
+
+
+def _append_changelog(log_path: Path, entry: dict[str, Any]) -> None:
+    """Append a changelog entry and decay old entries if needed."""
+    line = json.dumps(entry, separators=(",", ":"), default=str) + "\n"
+    with log_path.open("a") as f:
+        f.write(line)
+
+    # Decay: if file is too large, keep the newest half
+    try:
+        all_lines = log_path.read_text().splitlines()
+        if len(all_lines) > CHANGELOG_MAX_LINES:
+            keep = all_lines[len(all_lines) - CHANGELOG_MAX_LINES // 2:]
+            log_path.write_text("\n".join(keep) + "\n")
+    except Exception:
+        pass  # Decay failure never blocks reporting
+
+
 def write_report(conn: sqlite3.Connection, output_dir: Path | None = None) -> tuple[Path, Path]:
-    """Write both STATE_REPORT.md and state.json. Returns (md_path, json_path)."""
+    """Write STATE_REPORT.md, state.json, and append to state_changelog.jsonl."""
     out = output_dir or registry.FLEET_DIR
     out.mkdir(parents=True, exist_ok=True)
 
     state = build_state(conn)
 
+    # Diff against previous state for changelog
+    json_path = out / "state.json"
+    prev_state: dict[str, Any] = {}
+    try:
+        prev_state = json.loads(json_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    delta = _diff_state(prev_state, state)
+    if delta:
+        log_path = out / "state_changelog.jsonl"
+        entry = {"timestamp": state["generated_utc"], "delta": delta}
+        _append_changelog(log_path, entry)
+
     md_path = out / "STATE_REPORT.md"
     md_path.write_text(generate_markdown(state))
 
-    json_path = out / "state.json"
     json_path.write_text(generate_json(state))
 
     return md_path, json_path
