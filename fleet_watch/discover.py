@@ -69,6 +69,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 class DiscoveredProcess:
     pid: int
     port: int | None
+    listener_owned: bool
     name: str
     workstream: str
     model: str | None
@@ -219,6 +220,36 @@ def _estimate_gpu(pattern: dict[str, Any], model: str | None) -> int:
     return pattern.get("gpu_mb_default", 0)
 
 
+def parse_tnr_instances_output(stdout: str, stderr: str) -> list[dict[str, Any]] | None:
+    """Parse ``tnr status --json`` output.
+
+    Only *stdout* is searched for JSON — stderr is checked solely for the
+    "no instances found" sentinel so that error text containing ``[`` can
+    never be mistaken for an instance list.
+
+    Returns:
+        A list of instance dicts (possibly empty) when the output is
+        parseable, or ``None`` when the output is unavailable/malformed
+        and should not mutate registry state.
+    """
+    raw = stdout.strip()
+    if raw:
+        bracket = raw.find("[")
+        if bracket >= 0:
+            try:
+                instances = json.loads(raw[bracket:])
+            except (json.JSONDecodeError, ValueError):
+                pass
+            else:
+                if isinstance(instances, list):
+                    return instances
+
+    combined = f"{stdout}\n{stderr}".lower()
+    if "no instances found" in combined:
+        return []
+    return None
+
+
 def _sync_thunder(conn: sqlite3.Connection) -> int:
     """Sync Thunder instances from tnr CLI into external_resources.
 
@@ -236,16 +267,8 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
     if result.returncode != 0:
         return 0
 
-    try:
-        raw = result.stdout.strip()
-        # tnr may emit preamble text before JSON
-        bracket = raw.find("[")
-        if bracket < 0:
-            return 0
-        instances = json.loads(raw[bracket:])
-        if not isinstance(instances, list):
-            return 0
-    except (json.JSONDecodeError, ValueError):
+    instances = parse_tnr_instances_output(result.stdout, result.stderr)
+    if instances is None:
         return 0
 
     mapped: list[dict[str, Any]] = []
@@ -267,6 +290,33 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
     return len(mapped)
 
 
+def _prefer_listener_owned_processes(found: list[DiscoveredProcess]) -> list[DiscoveredProcess]:
+    """Prefer the real listener PID over parent/helper processes sharing a default port."""
+    selected_by_key: dict[tuple[str, str, int], DiscoveredProcess] = {}
+    selected_without_port: list[DiscoveredProcess] = []
+
+    for proc in found:
+        if proc.port is None:
+            selected_without_port.append(proc)
+            continue
+
+        key = (proc.workstream, proc.name, proc.port)
+        prior = selected_by_key.get(key)
+        if prior is None:
+            selected_by_key[key] = proc
+            continue
+        if proc.listener_owned and not prior.listener_owned:
+            selected_by_key[key] = proc
+            continue
+        if proc.listener_owned == prior.listener_owned and proc.pid < prior.pid:
+            selected_by_key[key] = proc
+
+    return sorted(
+        [*selected_without_port, *selected_by_key.values()],
+        key=lambda proc: proc.pid,
+    )
+
+
 def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
     """Scan the system for processes matching known patterns."""
     loaded = config or load_config()
@@ -278,7 +328,8 @@ def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
         for pattern in loaded["patterns"]:
             regex = pattern["process_match"]
             if re.search(regex, cmd):
-                port = listeners.get(pid)
+                listener_port = listeners.get(pid)
+                port = listener_port
                 # Some patterns have a default port (e.g., ollama always on 11434)
                 if port is None:
                     port = pattern.get("port_default")
@@ -296,6 +347,7 @@ def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
                     DiscoveredProcess(
                         pid=pid,
                         port=port,
+                        listener_owned=listener_port is not None,
                         name=name,
                         workstream=pattern["workstream"],
                         model=model,
@@ -307,7 +359,7 @@ def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
                 )
                 break  # First match wins
 
-    return found
+    return _prefer_listener_owned_processes(found)
 
 
 def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
@@ -319,11 +371,46 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
 
     config = load_config()
     discovered = discover(config=config)
-    registered_pids = {p["pid"] for p in registry.get_all_processes(conn)}
+    discovered_pids = {proc.pid for proc in discovered}
+    registered = registry.get_all_processes(conn)
+    replacement_keys = {
+        (proc.name, proc.workstream, proc.port): proc.pid
+        for proc in discovered
+        if proc.port is not None
+    }
 
     added: list[dict[str, Any]] = []
     cleaned: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+
+    # Replace stale parent/helper registrations with the preferred live listener PID.
+    for existing in registered:
+        key = (existing["name"], existing["workstream"], existing["port"])
+        replacement_pid = replacement_keys.get(key)
+        if (
+            replacement_pid is None
+            or replacement_pid == existing["pid"]
+            or existing["pid"] in discovered_pids
+        ):
+            continue
+        released = registry.release_process(conn, existing["pid"])
+        if released:
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=existing["pid"],
+                workstream=existing["workstream"],
+                detail={
+                    "reason": "listener_reassign",
+                    "name": existing["name"],
+                    "source": "discover",
+                    "replacement_pid": replacement_pid,
+                    "port": existing["port"],
+                },
+            )
+            cleaned.append(released)
+
+    registered_pids = {p["pid"] for p in registry.get_all_processes(conn)}
 
     # Register new discoveries
     for proc in discovered:

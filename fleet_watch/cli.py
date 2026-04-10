@@ -82,8 +82,8 @@ def _load_tnr_instances() -> list[dict[str, Any]]:
     )
     if result.returncode != 0:
         raise click.ClickException(result.stderr.strip() or result.stdout.strip() or "tnr status failed")
-    payload = _extract_json_document(result.stdout)
-    if not isinstance(payload, list):
+    payload = discover_mod.parse_tnr_instances_output(result.stdout, result.stderr)
+    if payload is None:
         raise click.ClickException("unexpected tnr status payload")
     return payload
 

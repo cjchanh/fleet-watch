@@ -43,6 +43,7 @@ def test_sync_reports_skipped_conflict(tmp_path, monkeypatch):
             discover.DiscoveredProcess(
                 pid=2,
                 port=8100,
+                listener_owned=True,
                 name="new",
                 workstream="ws",
                 model=None,
@@ -113,3 +114,166 @@ def test_sync_thunder_unavailable_is_silent(tmp_path, monkeypatch):
 
     assert result["thunder_synced"] == 0
     assert registry.get_all_external_resources(conn) == []
+
+
+# --- parse_tnr_instances_output ---
+
+
+class TestParseTnrInstancesOutput:
+    def test_no_instances_in_stderr(self):
+        result = discover.parse_tnr_instances_output(
+            "", "Fetching instances...\nNo instances found.\n"
+        )
+        assert result == []
+
+    def test_no_instances_in_stdout(self):
+        result = discover.parse_tnr_instances_output(
+            "Fetching instances...\nNo instances found.\n", ""
+        )
+        assert result == []
+
+    def test_valid_json_in_stdout(self):
+        result = discover.parse_tnr_instances_output(
+            '[{"id":"0","status":"RUNNING"}]', "Fetching instances...\n"
+        )
+        assert result == [{"id": "0", "status": "RUNNING"}]
+
+    def test_json_with_preamble(self):
+        result = discover.parse_tnr_instances_output(
+            'Fetching instances...\n[{"id":"1","status":"STARTING"}]', ""
+        )
+        assert result == [{"id": "1", "status": "STARTING"}]
+
+    def test_garbage_returns_none(self):
+        result = discover.parse_tnr_instances_output(
+            "Something weird happened", "error text"
+        )
+        assert result is None
+
+    def test_empty_returns_none(self):
+        result = discover.parse_tnr_instances_output("", "")
+        assert result is None
+
+    def test_stderr_bracket_not_parsed_as_json(self):
+        """stderr containing '[' must not be mistaken for an instance list."""
+        result = discover.parse_tnr_instances_output(
+            "", 'error: [broken stuff]\nNo instances found.'
+        )
+        assert result == []
+
+    def test_stderr_bracket_no_sentinel_returns_none(self):
+        result = discover.parse_tnr_instances_output("", "error: [broken stuff]")
+        assert result is None
+
+
+# --- _prefer_listener_owned_processes ---
+
+
+def _proc(pid: int, port: int | None, listener_owned: bool, name: str = "Svc") -> discover.DiscoveredProcess:
+    return discover.DiscoveredProcess(
+        pid=pid, port=port, listener_owned=listener_owned, name=name,
+        workstream="ws", model=None, gpu_mb=0, priority=3,
+        restart_policy="ALERT_ONLY", command="python test.py",
+    )
+
+
+class TestPreferListenerOwned:
+    def test_listener_beats_parent(self):
+        parent = _proc(829, 4343, False, "Reranker")
+        child = _proc(1242, 4343, True, "Reranker")
+        result = discover._prefer_listener_owned_processes([parent, child])
+        assert len(result) == 1
+        assert result[0].pid == 1242
+
+    def test_both_listeners_lower_pid_wins(self):
+        a = _proc(100, 8080, True)
+        b = _proc(200, 8080, True)
+        result = discover._prefer_listener_owned_processes([b, a])
+        assert len(result) == 1
+        assert result[0].pid == 100
+
+    def test_no_port_passes_through(self):
+        parent = _proc(829, 4343, False, "Reranker")
+        child = _proc(1242, 4343, True, "Reranker")
+        worker = _proc(999, None, False, "Worker")
+        result = discover._prefer_listener_owned_processes([parent, child, worker])
+        assert len(result) == 2
+        pids = {p.pid for p in result}
+        assert pids == {999, 1242}
+
+    def test_different_keys_not_merged(self):
+        a = _proc(100, 8080, True, "SvcA")
+        b = _proc(200, 8080, True, "SvcB")
+        result = discover._prefer_listener_owned_processes([a, b])
+        assert len(result) == 2
+
+
+# --- Thunder empty-output clears stale rows ---
+
+
+def test_sync_thunder_empty_clears_stale(tmp_path, monkeypatch):
+    """When tnr returns 'No instances found', stale Thunder rows are cleared."""
+    _patch_paths(monkeypatch, tmp_path)
+    conn = _fresh_conn()
+
+    registry.register_external_resource(
+        conn, provider="thunder", resource_type="instance",
+        external_id="stale-abc", workstream="thunder", name="Thunder stale-abc",
+        status="RUNNING",
+    )
+    assert len(registry.get_all_external_resources(conn)) == 1
+
+    class FakeResult:
+        def __init__(self):
+            self.stdout = "Fetching instances...\nNo instances found.\n"
+            self.stderr = ""
+            self.returncode = 0
+
+    monkeypatch.setattr(
+        discover.subprocess, "run",
+        lambda *args, **kwargs: FakeResult(),
+    )
+    monkeypatch.setattr(discover, "discover", lambda config=None: [])
+
+    result = discover.sync(conn)
+
+    assert result["thunder_synced"] == 0
+    assert registry.get_all_external_resources(conn) == []
+
+
+# --- Listener reassignment in sync ---
+
+
+def test_sync_reassigns_parent_to_listener(tmp_path, monkeypatch):
+    """sync() replaces a registered parent PID with the actual listener child."""
+    _patch_paths(monkeypatch, tmp_path)
+    conn = _fresh_conn()
+
+    registry.register_process(
+        conn, pid=829, name="Reranker", workstream="ws", port=4343,
+    )
+    assert registry.get_process(conn, 829) is not None
+
+    monkeypatch.setattr(
+        discover, "discover",
+        lambda config=None: [
+            discover.DiscoveredProcess(
+                pid=1242, port=4343, listener_owned=True, name="Reranker",
+                workstream="ws", model=None, gpu_mb=0, priority=3,
+                restart_policy="ALERT_ONLY", command="python reranker.py",
+            ),
+        ],
+    )
+
+    def _fake_thunder(*args, **kwargs):
+        raise FileNotFoundError("tnr not found")
+
+    monkeypatch.setattr(discover.subprocess, "run", _fake_thunder)
+
+    result = discover.sync(conn)
+
+    assert registry.get_process(conn, 829) is None
+    assert registry.get_process(conn, 1242) is not None
+    assert registry.get_process(conn, 1242)["port"] == 4343
+    assert any(c["pid"] == 829 for c in result["cleaned"])
+    assert any(a["pid"] == 1242 for a in result["added"])
