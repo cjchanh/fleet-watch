@@ -74,6 +74,66 @@ def test_repo_allowed_for_current_external_owner_session():
     assert d.allowed is True
 
 
+def test_repo_denied_by_active_session_lease():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-other",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+    assert d.allowed is False
+    assert d.holder is not None
+    assert d.holder["session_id"] == "sess-other"
+
+
+def test_repo_allowed_for_current_session_lease():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-current",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-current")
+    assert d.allowed is True
+    assert "owned by current session" in d.reason
+
+
+def test_repo_denied_by_session_lease_with_dead_owner_but_fresh_heartbeat(monkeypatch):
+    """A lease whose owner PID is dead but heartbeat is fresh still blocks."""
+    conn = _fresh_conn()
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
+    registry.upsert_session_lease(
+        conn,
+        "sess-dead-owner",
+        owner_pid=99999,
+        repo_dir="/tmp/test-repo",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+    assert d.allowed is False
+    assert d.holder is not None
+    assert d.holder["session_id"] == "sess-dead-owner"
+    lease = registry.get_session_lease(conn, "sess-dead-owner")
+    assert lease["status"] == "ACTIVE"
+
+
+def test_repo_allowed_when_owner_dead_and_heartbeat_stale(monkeypatch):
+    """A lease whose owner PID is dead AND heartbeat is stale does not block the repo."""
+    conn = _fresh_conn()
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+    registry.upsert_session_lease(
+        conn,
+        "sess-dead-stale",
+        owner_pid=99999,
+        repo_dir="/tmp/test-repo",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+    assert d.allowed is True
+
+
 def test_repo_allowed_for_current_local_owner_session():
     """Same-session bypass works for local process repo locks, not just external."""
     conn = _fresh_conn()

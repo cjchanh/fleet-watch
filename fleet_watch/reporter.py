@@ -28,7 +28,7 @@ def build_guard_state(conn: sqlite3.Connection) -> dict[str, Any]:
     external_resources = registry.get_all_external_resources(conn)
     budget = registry.get_gpu_budget(conn)
     ports = registry.get_claimed_ports(conn)
-    repos = registry.get_locked_repos(conn)
+    repos = registry.get_effective_locked_repos(conn)
     config = discover.load_config()
     preferred = discover.preferred_ports(config)
     safe_ports = referee.suggest_ports(conn, preferred_ports=preferred)
@@ -86,6 +86,15 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
                 "cpu_pct": s.cpu_pct,
                 "started": s.started,
                 "tty": s.tty,
+                "ppid": s.ppid,
+                "pgid": s.pgid,
+                "group_leader_pid": s.group_leader_pid,
+                "member_pids": s.member_pids,
+                "member_count": s.member_count,
+                "parent_chain_detached": s.parent_chain_detached,
+                "classification": s.classification,
+                "attention": s.attention,
+                "evidence": s.evidence,
             }
             for s in sessions
         ],
@@ -257,12 +266,29 @@ def generate_markdown(state: dict[str, Any]) -> str:
         kind_summary = ", ".join(f"{count} {kind}" for kind, count in sorted(by_kind.items()))
         lines.append(f"## Sessions ({kind_summary} — {total_rss:,} MB total)")
         lines.append("")
-        lines.append("| PID | Type | RSS | CPU | TTY | Started |")
-        lines.append("|-----|------|-----|-----|-----|---------|")
+        attention = [s for s in sess_list if s.get("attention")]
+        if attention:
+            lines.append(f"Attention required: {len(attention)} detached hot session(s)")
+            lines.append("")
+        lines.append("| PID | Type | State | RSS | CPU | TTY | N | Started |")
+        lines.append("|-----|------|-------|-----|-----|-----|---|---------|")
         for s in sorted(sess_list, key=lambda x: x["rss_mb"], reverse=True):
-            lines.append(f"| {s['pid']} | {s['kind']} | {s['rss_mb']:,} MB | "
-                         f"{s['cpu_pct']:.1f}% | {s['tty']} | {s['started']} |")
+            lines.append(f"| {s['pid']} | {s['kind']} | {s.get('classification', 'attached')} | "
+                         f"{s['rss_mb']:,} MB | {s['cpu_pct']:.1f}% | {s['tty']} | "
+                         f"{s.get('member_count', 1)} | {s['started']} |")
         lines.append("")
+
+        if attention:
+            lines.append("## Attention Required Sessions")
+            lines.append("")
+            for s in sorted(attention, key=lambda x: x["cpu_pct"], reverse=True):
+                evidence = "; ".join(s.get("evidence", [])[:3])
+                lines.append(
+                    f"- PID {s['pid']} ({s['kind']}) — {s['classification']} — "
+                    f"CPU {s['cpu_pct']:.1f}% — {s['rss_mb']:,} MB"
+                    + (f" — {evidence}" if evidence else "")
+                )
+            lines.append("")
 
     # --- Idle processes ---
     idle_list = state.get("idle_processes", [])
@@ -335,7 +361,10 @@ def generate_markdown(state: dict[str, Any]) -> str:
     if repos or ext_repos:
         lines.append("- Repos locked:")
         for repo, pid in repos.items():
-            name = next((p["name"] for p in procs if p["pid"] == pid), f"PID {pid}")
+            if pid is not None:
+                name = next((p["name"] for p in procs if p["pid"] == pid), f"PID {pid}")
+            else:
+                name = "session lease"
             lines.append(f"  - {repo} — {name}")
         for repo, holder in ext_repos:
             lines.append(f"  - {repo} — {holder}")

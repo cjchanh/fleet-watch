@@ -86,6 +86,20 @@ def test_guard_state_contract_shape(tmp_path, monkeypatch):
     assert "idle_processes" not in state
 
 
+def test_guard_state_surfaces_session_locked_repos(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-other",
+        owner_pid=None,
+        repo_dir=tmp_path,
+    )
+
+    state = reporter.build_guard_state(conn)
+    assert str(tmp_path.resolve()) in state["repos_locked"]
+
+
 def test_state_json_contract_shape(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()

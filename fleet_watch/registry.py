@@ -160,7 +160,7 @@ def _inspect_process(pid: int | None) -> dict[str, Any] | None:
             timeout=2,
             check=False,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired) as exc:
         return {
             "pid": pid,
             "alive": True,
@@ -224,12 +224,29 @@ def _is_parent_chain_detached(pid: int) -> bool | None:
     if not info.get("inspectable"):
         return None
 
-    parent_pid = info["ppid"]
-    if parent_pid in (0, 1):
-        return True
-    if not _pid_exists(parent_pid):
-        return True
-    return False
+    seen: set[int] = {pid}
+    current = info
+    while True:
+        parent_pid = current["ppid"]
+        if parent_pid in (0, 1):
+            return True
+        if parent_pid in seen:
+            return None
+        if not _pid_exists(parent_pid):
+            return True
+
+        parent_info = _inspect_process(parent_pid)
+        if parent_info is None:
+            return True
+        if not parent_info.get("inspectable"):
+            return None
+
+        parent_tty = (parent_info.get("tty") or "").strip()
+        if parent_tty and parent_tty not in {"?", "??"}:
+            return False
+
+        seen.add(parent_pid)
+        current = parent_info
 
 
 def _configured_budget_defaults() -> tuple[int, int]:
@@ -416,6 +433,19 @@ def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         ORDER BY started_at ASC
+        """
+    ).fetchall()
+    return [_session_lease_row_to_dict(row) for row in rows]
+
+
+def list_active_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+               started_at, last_heartbeat_at, shutdown_at, status
+        FROM session_leases
+        WHERE status = 'ACTIVE' AND shutdown_at IS NULL
+        ORDER BY last_heartbeat_at DESC
         """
     ).fetchall()
     return [_session_lease_row_to_dict(row) for row in rows]
@@ -658,6 +688,59 @@ def get_locked_repos(conn: sqlite3.Connection) -> dict[str, int]:
     return {repo: pid for repo, pid in rows}
 
 
+def _session_lease_blocks_repo(
+    lease: dict[str, Any],
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> bool:
+    if lease.get("status") != "ACTIVE" or lease.get("shutdown_at") is not None:
+        return False
+
+    owner_pid = lease.get("owner_pid")
+    if owner_pid is not None and _pid_exists(owner_pid):
+        return True
+
+    heartbeat_age = _age_seconds(lease.get("last_heartbeat_at"))
+    return heartbeat_age is not None and heartbeat_age <= stale_seconds
+
+
+def get_active_session_leases_by_repo(
+    conn: sqlite3.Connection,
+    repo_dir: str,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    resolved = str(Path(repo_dir).resolve())
+    rows = conn.execute(
+        """
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+               started_at, last_heartbeat_at, shutdown_at, status
+        FROM session_leases
+        WHERE repo_dir = ?
+        ORDER BY last_heartbeat_at DESC
+        """,
+        (resolved,),
+    ).fetchall()
+    leases = [_session_lease_row_to_dict(row) for row in rows]
+    return [
+        lease
+        for lease in leases
+        if _session_lease_blocks_repo(lease, stale_seconds=stale_seconds)
+    ]
+
+
+def get_effective_locked_repos(
+    conn: sqlite3.Connection,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> dict[str, int | None]:
+    locks = get_locked_repos(conn)
+    for lease in list_session_leases(conn):
+        repo_dir = lease.get("repo_dir")
+        if not repo_dir or repo_dir in locks:
+            continue
+        if _session_lease_blocks_repo(lease, stale_seconds=stale_seconds):
+            locks[repo_dir] = lease.get("owner_pid")
+    return locks
+
+
 def get_process_classifications(
     conn: sqlite3.Connection,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
@@ -685,29 +768,37 @@ def get_process_classifications(
         elif lease_active and owner_alive and not stale:
             classification = "live"
             evidence.append(f"active session lease owner PID {owner_pid} is alive")
-        elif (not lease_present or not lease_active) and stale and parent_chain_detached is True:
+        elif lease_present and not lease_active and stale and parent_chain_detached is True:
             classification = "orphan_confirmed"
             evidence.append("process heartbeat expired")
-            evidence.append("session lease is missing or closed")
+            evidence.append("session lease is closed or owner is gone")
             evidence.append("parent chain is detached")
         elif stale:
-            classification = "stale_candidate"
-            evidence.append("process heartbeat expired")
             if lease_present:
+                classification = "stale_candidate"
+                evidence.append("process heartbeat expired")
                 evidence.append(f"session lease status={lease['status']}")
                 if owner_pid:
                     evidence.append(
                         "session owner alive"
                         if owner_alive else "session owner missing"
                     )
+                if parent_chain_detached is None:
+                    evidence.append("parent chain inspection unavailable")
+                elif parent_chain_detached:
+                    evidence.append("parent chain detached")
+                else:
+                    evidence.append("parent chain still attached")
             else:
+                classification = "disconnected"
+                evidence.append("process heartbeat expired")
                 evidence.append("session lease missing")
-            if parent_chain_detached is None:
-                evidence.append("parent chain inspection unavailable")
-            elif parent_chain_detached:
-                evidence.append("parent chain detached")
-            else:
-                evidence.append("parent chain still attached")
+                if parent_chain_detached is None:
+                    evidence.append("parent chain inspection unavailable")
+                elif parent_chain_detached:
+                    evidence.append("parent chain detached")
+                else:
+                    evidence.append("parent chain still attached")
         else:
             classification = "disconnected"
             if not lease_present:

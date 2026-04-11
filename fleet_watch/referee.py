@@ -20,6 +20,19 @@ class Decision:
     holder: dict[str, Any] | None = None
 
 
+def _session_holder_from_lease(lease: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "pid": lease.get("owner_pid"),
+        "name": f"session {lease['session_id']}",
+        "workstream": "session",
+        "priority": 3,
+        "port": None,
+        "repo_dir": lease.get("repo_dir"),
+        "gpu_mb": 0,
+        "session_id": lease["session_id"],
+    }
+
+
 def check_port(conn: sqlite3.Connection, port: int) -> Decision:
     holder = registry.get_process_by_port(conn, port)
     if holder is None:
@@ -40,10 +53,39 @@ def check_repo_with_session(
     repo_dir: str,
     current_session_id: str | None,
 ) -> Decision:
-    holder = registry.get_process_by_repo(conn, repo_dir)
+    resolved_repo_dir = str(Path(repo_dir).resolve())
+    holder = registry.get_process_by_repo(conn, resolved_repo_dir)
     if holder is None:
         external_holders = registry.get_external_resources_by_repo(conn, repo_dir)
         if not external_holders:
+            session_leases = registry.get_active_session_leases_by_repo(conn, repo_dir)
+            owned_by_current_session = False
+            for lease in session_leases:
+                if current_session_id and lease["session_id"] == current_session_id:
+                    owned_by_current_session = True
+                    continue
+
+                owner_pid = lease.get("owner_pid")
+                if owner_pid is not None and not registry._pid_exists(owner_pid):
+                    heartbeat_age = registry._age_seconds(lease.get("last_heartbeat_at"))
+                    if heartbeat_age is not None and heartbeat_age > registry.DEFAULT_STALE_SECONDS:
+                        registry.close_session_lease(conn, lease["session_id"])
+                        events.log_event(
+                            conn,
+                            "CLEAN",
+                            pid=owner_pid,
+                            workstream="session",
+                            detail={"reason": "dead_session_owner", "repo_dir": resolved_repo_dir, "session_id": lease["session_id"]},
+                        )
+                        continue
+
+                return Decision(
+                    allowed=False,
+                    reason=f"repo {resolved_repo_dir} locked by active session {lease['session_id']}",
+                    holder=_session_holder_from_lease(lease),
+                )
+            if owned_by_current_session:
+                return Decision(allowed=True, reason="repo available (owned by current session)")
             return Decision(allowed=True, reason="repo available")
         for external in external_holders:
             if current_session_id and external["session_id"] == current_session_id:
@@ -51,7 +93,7 @@ def check_repo_with_session(
             return Decision(
                 allowed=False,
                 reason=(
-                    f"repo {repo_dir} locked by external "
+                    f"repo {resolved_repo_dir} locked by external "
                     f"{external['provider']} resource {external['external_id']} ({external['name']})"
                 ),
                 holder=external,
@@ -75,7 +117,7 @@ def check_repo_with_session(
 
     return Decision(
         allowed=False,
-        reason=f"repo {repo_dir} locked by PID {holder['pid']} ({holder['name']})",
+        reason=f"repo {resolved_repo_dir} locked by PID {holder['pid']} ({holder['name']})",
         holder=holder,
     )
 

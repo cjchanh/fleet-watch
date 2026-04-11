@@ -153,6 +153,53 @@ def test_classify_discovered_process_without_lease_is_disconnected(monkeypatch):
     assert items[0]["session_lease_present"] is False
 
 
+def test_classify_stale_detached_process_without_lease_stays_disconnected(monkeypatch):
+    conn = _fresh_conn()
+    registry.register_process(
+        conn,
+        pid=7777,
+        name="observed-stale",
+        workstream="ws",
+        manage_session_lease=False,
+    )
+
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid == 7777)
+    monkeypatch.setattr(
+        registry,
+        "_inspect_process",
+        lambda pid: {
+            "pid": pid,
+            "alive": True,
+            "inspectable": True,
+            "ppid": 1,
+            "pgid": 7777,
+            "tty": "??",
+        } if pid == 7777 else None,
+    )
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 600 if ts else None)
+
+    items = registry.get_process_classifications(conn)
+    assert len(items) == 1
+    assert items[0]["classification"] == "disconnected"
+    assert items[0]["safe_to_reap"] is False
+
+
+def test_parent_chain_detached_walks_ancestors(monkeypatch):
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid in {100, 90, 80})
+
+    def fake_inspect(pid):
+        mapping = {
+            100: {"pid": 100, "alive": True, "inspectable": True, "ppid": 90, "pgid": 80, "tty": "??"},
+            90: {"pid": 90, "alive": True, "inspectable": True, "ppid": 80, "pgid": 80, "tty": "??"},
+            80: {"pid": 80, "alive": True, "inspectable": True, "ppid": 1, "pgid": 80, "tty": "ttys003"},
+        }
+        return mapping.get(pid)
+
+    monkeypatch.setattr(registry, "_inspect_process", fake_inspect)
+
+    assert registry._is_parent_chain_detached(100) is False
+
+
 def test_release_unknown_pid():
     conn = _fresh_conn()
     assert registry.release_process(conn, 9999) is None

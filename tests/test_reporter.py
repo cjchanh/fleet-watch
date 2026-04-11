@@ -1,7 +1,9 @@
 """Tests for the state reporter."""
 
+import os
 import json
 import sqlite3
+from pathlib import Path
 
 from fleet_watch import events, registry, reporter
 
@@ -48,6 +50,18 @@ def test_build_state_with_process():
     assert len(state["external_resources"]) == 1
 
 
+def test_build_guard_state_includes_active_session_repo_lock():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-1",
+        owner_pid=os.getpid(),
+        repo_dir="/tmp/fleet-watch",
+    )
+    state = reporter.build_guard_state(conn)
+    assert state["repos_locked"][str(Path("/tmp/fleet-watch").resolve())] == os.getpid()
+
+
 def test_markdown_report_structure():
     conn = _fresh_conn()
     registry.register_process(conn, pid=1234, name="mlx", workstream="sov", port=8100)
@@ -83,6 +97,36 @@ def test_json_report_parseable():
     parsed = json.loads(json_str)
     assert parsed["process_count"] == 1
     assert "gpu_budget" in parsed
+
+
+def test_markdown_reports_attention_required_sessions(monkeypatch):
+    conn = _fresh_conn()
+    monkeypatch.setattr(
+        reporter.syshealth,
+        "get_session_processes",
+        lambda patterns=None: [
+            reporter.syshealth.SessionProcess(
+                pid=61042,
+                name="Codex",
+                kind="codex",
+                rss_mb=84,
+                cpu_pct=61.7,
+                started="1:57PM",
+                tty="??",
+                command="codex",
+                member_count=2,
+                attention=True,
+                classification="detached_hot",
+                evidence=["launcher ancestry detached", "cpu 61.7%"],
+            ),
+        ],
+    )
+    monkeypatch.setattr(reporter.syshealth, "get_idle_processes", lambda **kwargs: [])
+
+    md = reporter.generate_markdown(reporter.build_state(conn))
+
+    assert "Attention Required Sessions" in md
+    assert "detached_hot" in md
 
 
 def test_write_report(tmp_path):
