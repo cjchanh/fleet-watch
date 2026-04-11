@@ -665,11 +665,21 @@ def get_reapable_processes(
     ]
 
 
-def clean_dead_pids(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Remove entries for PIDs that no longer exist."""
+def clean_dead_pids(
+    conn: sqlite3.Connection,
+    exclude_pids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Remove entries for PIDs that no longer exist.
+
+    *exclude_pids*, when provided, are skipped — they were just confirmed
+    alive by the discovery scan and should not be reaped.
+    """
     rows = conn.execute("SELECT pid, name, workstream, gpu_mb FROM processes").fetchall()
+    skip = exclude_pids or set()
     cleaned = []
     for pid, name, ws, gpu_mb in rows:
+        if pid in skip:
+            continue
         if not _pid_exists(pid):
             release_process(conn, pid)
             cleaned.append({"pid": pid, "name": name, "workstream": ws})

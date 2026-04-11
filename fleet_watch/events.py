@@ -33,6 +33,7 @@ EVENT_TYPES = frozenset({
     "GPU_BUDGET_DENY",
     "RUNAWAY_DETECTED",
     "RUNAWAY_KILL",
+    "RUNAWAY_KILL_FAILED",
 })
 
 

@@ -99,8 +99,9 @@ def _run_runaway_tick(
     conn: sqlite3.Connection,
     tracker: runaway.DaemonRunawayTracker,
     tracker_path: Path | None = None,
+    auto_kill: bool = True,
 ) -> list[runaway.RunawayProcess]:
-    """Run one runaway tracker tick, log events, optionally persist state."""
+    """Run one runaway tracker tick, log events, kill runaways if auto_kill."""
     try:
         newly_flagged = tracker.tick()
     except Exception:
@@ -118,10 +119,29 @@ def _run_runaway_tick(
                 "consecutive_ticks": runaway.DAEMON_CONSECUTIVE_TICKS,
             },
         )
-        click.echo(
-            f"WARNING: runaway PID {proc.pid} ({proc.name}) — "
-            f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} consecutive ticks"
-        )
+        if auto_kill:
+            success = runaway.kill_runaway(proc.pid)
+            event_type = "RUNAWAY_KILL" if success else "RUNAWAY_KILL_FAILED"
+            events.log_event(
+                conn,
+                event_type,
+                pid=proc.pid,
+                workstream="runaway",
+                detail={
+                    "cpu_pct": proc.cpu_pct,
+                    "command": proc.command[:200],
+                },
+            )
+            status = "killed" if success else "KILL FAILED"
+            click.echo(
+                f"RUNAWAY: PID {proc.pid} ({proc.name}) — "
+                f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} ticks — {status}"
+            )
+        else:
+            click.echo(
+                f"WARNING: runaway PID {proc.pid} ({proc.name}) — "
+                f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} consecutive ticks"
+            )
     if tracker_path is not None:
         tracker.save(tracker_path)
     return newly_flagged
@@ -1092,7 +1112,9 @@ def context(ctx):
 
 
 @cli.command()
-def discover():
+@click.option("--no-auto-kill", is_flag=True, default=False,
+              help="Log runaway processes without killing them")
+def discover(no_auto_kill: bool):
     """Auto-discover running processes and sync registry + state.json."""
     config = discover_mod.load_config()
     conn = _get_conn()
@@ -1131,13 +1153,16 @@ def discover():
     # Runaway detection: persistent tracker across discover invocations
     tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
     tracker = runaway.DaemonRunawayTracker.load(tracker_path)
-    _run_runaway_tick(conn, tracker, tracker_path=tracker_path)
+    _run_runaway_tick(conn, tracker, tracker_path=tracker_path,
+                      auto_kill=not no_auto_kill)
     conn.close()
 
 
 @cli.command()
 @click.option("--interval", type=int, default=60, help="Seconds between scans")
-def watch(interval: int):
+@click.option("--no-auto-kill", is_flag=True, default=False,
+              help="Log runaway processes without killing them")
+def watch(interval: int, no_auto_kill: bool):
     """Run continuous discovery loop (foreground daemon)."""
     import signal
     import time
@@ -1170,8 +1195,8 @@ def watch(interval: int):
                     f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
                 )
 
-            # Runaway detection: log WARNING for processes exceeding threshold
-            _run_runaway_tick(conn, tracker)
+            # Runaway detection: kill by default, --no-auto-kill for warning only
+            _run_runaway_tick(conn, tracker, auto_kill=not no_auto_kill)
 
             conn.close()
         except Exception as e:

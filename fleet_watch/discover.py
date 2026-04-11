@@ -63,7 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         {
             "name_template": "Codex agent",
-            "process_match": "codex/codex$",
+            "process_match": "codex/codex\\b",
             "workstream": "codex",
             "priority": 3,
             "restart_policy": "ALERT_ONLY",
@@ -536,7 +536,7 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
             registry.heartbeat(conn, proc.pid)
 
     # Clean dead PIDs (registered but no longer running)
-    dead = registry.clean_dead_pids(conn)
+    dead = registry.clean_dead_pids(conn, exclude_pids=discovered_pids)
     for d in dead:
         events.log_event(conn, "CLEAN", pid=d["pid"], workstream=d["workstream"],
                          detail={"name": d["name"], "source": "discover"})

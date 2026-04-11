@@ -485,3 +485,166 @@ class TestDaemonRunawayLogging:
         assert detail["cpu_pct"] == 99.0
         assert detail["runtime_seconds"] == 600
         conn.close()
+
+    def test_discover_auto_kills_runaway(self, tmp_path, monkeypatch):
+        """fleet discover kills runaway processes by default (auto_kill=True)."""
+        _patch_paths(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
+            "added": [], "cleaned": [], "skipped": [],
+            "thunder_synced": 0, "session_leases_cleaned": 0,
+        })
+        monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
+        monkeypatch.setattr(
+            cli_module.reporter, "write_report",
+            lambda conn: (tmp_path / "r.md", tmp_path / "r.json"),
+        )
+        monkeypatch.setattr(
+            cli_module.syshealth, "get_session_processes",
+            lambda patterns=None: [],
+        )
+
+        proc = runaway.RunawayProcess(
+            pid=77777, name="codex", cpu_pct=99.0,
+            runtime_seconds=600, command="codex/codex",
+        )
+        monkeypatch.setattr(
+            runaway, "scan_runaways",
+            lambda cpu_threshold=90.0, sustained_seconds=60: [proc],
+        )
+
+        killed_pids: list[int] = []
+        monkeypatch.setattr(runaway, "kill_runaway", lambda pid: (killed_pids.append(pid), True)[1])
+
+        runner = CliRunner()
+        for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
+            runner.invoke(cli_module.cli, ["discover"])
+
+        assert killed_pids == [77777]
+
+        conn = registry.connect()
+        kill_events = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
+        assert len(kill_events) == 1
+        assert kill_events[0]["pid"] == 77777
+        conn.close()
+
+    def test_discover_no_auto_kill_flag(self, tmp_path, monkeypatch):
+        """fleet discover --no-auto-kill suppresses kills, only logs warnings."""
+        _patch_paths(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
+            "added": [], "cleaned": [], "skipped": [],
+            "thunder_synced": 0, "session_leases_cleaned": 0,
+        })
+        monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
+        monkeypatch.setattr(
+            cli_module.reporter, "write_report",
+            lambda conn: (tmp_path / "r.md", tmp_path / "r.json"),
+        )
+        monkeypatch.setattr(
+            cli_module.syshealth, "get_session_processes",
+            lambda patterns=None: [],
+        )
+
+        proc = runaway.RunawayProcess(
+            pid=77777, name="codex", cpu_pct=99.0,
+            runtime_seconds=600, command="codex/codex",
+        )
+        monkeypatch.setattr(
+            runaway, "scan_runaways",
+            lambda cpu_threshold=90.0, sustained_seconds=60: [proc],
+        )
+
+        killed_pids: list[int] = []
+        monkeypatch.setattr(runaway, "kill_runaway", lambda pid: (killed_pids.append(pid), True)[1])
+
+        runner = CliRunner()
+        for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
+            result = runner.invoke(cli_module.cli, ["discover", "--no-auto-kill"])
+            assert result.exit_code == 0
+
+        assert killed_pids == []
+
+        conn = registry.connect()
+        detected = events.get_events(conn, hours=1, event_type="RUNAWAY_DETECTED")
+        assert len(detected) == 1
+        kill_events = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
+        assert len(kill_events) == 0
+        conn.close()
+
+    def test_discover_kill_failure_logs_failed_event(self, tmp_path, monkeypatch):
+        """RUNAWAY_KILL_FAILED event is logged when kill_runaway returns False."""
+        _patch_paths(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
+            "added": [], "cleaned": [], "skipped": [],
+            "thunder_synced": 0, "session_leases_cleaned": 0,
+        })
+        monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
+        monkeypatch.setattr(
+            cli_module.reporter, "write_report",
+            lambda conn: (tmp_path / "r.md", tmp_path / "r.json"),
+        )
+        monkeypatch.setattr(
+            cli_module.syshealth, "get_session_processes",
+            lambda patterns=None: [],
+        )
+
+        proc = runaway.RunawayProcess(
+            pid=88888, name="stubborn", cpu_pct=98.0,
+            runtime_seconds=1200, command="/bin/stubborn",
+        )
+        monkeypatch.setattr(
+            runaway, "scan_runaways",
+            lambda cpu_threshold=90.0, sustained_seconds=60: [proc],
+        )
+        monkeypatch.setattr(runaway, "kill_runaway", lambda pid: False)
+
+        runner = CliRunner()
+        for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
+            runner.invoke(cli_module.cli, ["discover"])
+
+        conn = registry.connect()
+        failed = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL_FAILED")
+        assert len(failed) == 1
+        assert failed[0]["pid"] == 88888
+        conn.close()
+
+
+class TestKillRunawayGuards:
+    def test_refuses_low_pid(self):
+        """kill_runaway refuses PIDs below MIN_SAFE_PID."""
+        assert runaway.kill_runaway(1) is False
+        assert runaway.kill_runaway(50) is False
+        assert runaway.kill_runaway(99) is False
+
+    def test_refuses_zero_and_negative(self):
+        """kill_runaway refuses PID 0 and negative PIDs."""
+        assert runaway.kill_runaway(0) is False
+        assert runaway.kill_runaway(-1) is False
+
+    def test_refuses_own_pid(self):
+        """kill_runaway refuses to kill its own process."""
+        assert runaway.kill_runaway(os.getpid()) is False
+
+    def test_refuses_parent_pid(self):
+        """kill_runaway refuses to kill its parent process."""
+        assert runaway.kill_runaway(os.getppid()) is False
+
+
+class TestCodexPatternWithArgs:
+    def test_matches_binary_with_cli_args(self):
+        """Codex pattern matches the binary path when followed by CLI arguments."""
+        import re
+        pattern = None
+        for p in cli_module.discover_mod.DEFAULT_CONFIG["patterns"]:
+            if p["name_template"] == "Codex agent":
+                pattern = p
+                break
+
+        cmd_with_args = (
+            "/opt/homebrew/lib/node_modules/@openai/codex/"
+            "node_modules/@openai/codex-darwin-arm64/"
+            "vendor/aarch64-apple-darwin/codex/codex -a never -s danger-full-access"
+        )
+        assert re.search(pattern["process_match"], cmd_with_args)

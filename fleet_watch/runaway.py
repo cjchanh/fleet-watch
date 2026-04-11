@@ -140,9 +140,12 @@ def scan_runaways(
     return runaways
 
 
+MIN_SAFE_PID = 100  # Never kill kernel threads or core system daemons
+
+
 def kill_runaway(pid: int) -> bool:
     """Send SIGKILL to a runaway process. Returns True if process is gone."""
-    if pid <= 0:
+    if pid < MIN_SAFE_PID:
         return False
     if pid == os.getpid() or pid == os.getppid():
         return False
