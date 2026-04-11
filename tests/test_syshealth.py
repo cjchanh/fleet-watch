@@ -1,6 +1,6 @@
 """Tests for system health monitoring."""
 
-from fleet_watch import syshealth
+from fleet_watch import registry, syshealth
 
 
 def test_memory_state_returns_valid_data():
@@ -69,6 +69,90 @@ def test_session_processes_bad_regex():
         {"name": "Bad", "kind": "bad", "process_match": r"[invalid"},
     ])
     assert sessions == []
+
+
+def test_session_processes_collapse_detached_codex_family(monkeypatch):
+    monkeypatch.setattr(
+        syshealth,
+        "_ps_aux_lines",
+        lambda: [
+            ["cj", "61041", "0.0", "0.0", "0", "23552", "??", "S", "1:57PM", "0:00.10",
+             "node /opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox"],
+            ["cj", "61042", "61.7", "0.0", "0", "60416", "??", "R", "1:57PM", "10:29.00",
+             "/opt/homebrew/lib/node_modules/@openai/codex/vendor/codex/codex --dangerously-bypass-approvals-and-sandbox"],
+        ],
+    )
+
+    def fake_inspect(pid):
+        mapping = {
+            61041: {"pid": 61041, "alive": True, "inspectable": True, "ppid": 61009, "pgid": 61009, "tty": "??"},
+            61042: {"pid": 61042, "alive": True, "inspectable": True, "ppid": 61041, "pgid": 61009, "tty": "??"},
+            61009: {"pid": 61009, "alive": True, "inspectable": True, "ppid": 1, "pgid": 61009, "tty": "??"},
+        }
+        return mapping.get(pid)
+
+    monkeypatch.setattr(registry, "_inspect_process", fake_inspect)
+    monkeypatch.setattr(registry, "_is_parent_chain_detached", lambda pid: pid == 61009)
+
+    sessions = syshealth.get_session_processes()
+
+    assert len(sessions) == 1
+    assert sessions[0].pid == 61042
+    assert sessions[0].member_count == 2
+    assert sessions[0].member_pids == [61041, 61042]
+    assert sessions[0].classification == "detached_hot"
+    assert sessions[0].attention is True
+    assert sessions[0].rss_mb == (23552 + 60416) // 1024
+    assert sessions[0].cpu_pct == 61.7
+
+
+def test_session_processes_split_by_ppid_despite_shared_pgid(monkeypatch):
+    """Two independent launches with same PGID but different PPIDs are separate sessions."""
+    monkeypatch.setattr(
+        syshealth,
+        "_ps_aux_lines",
+        lambda: [
+            # PID 100, PPID 50, PGID 50 — session A member 1
+            ["cj", "100", "10.0", "0.0", "0", "20480", "??", "S", "1:00PM", "1:00.00",
+             "node /opt/homebrew/bin/codex --session-a"],
+            # PID 200, PPID 50, PGID 50 — session A member 2
+            ["cj", "200", "15.0", "0.0", "0", "30720", "??", "R", "1:00PM", "2:00.00",
+             "node /opt/homebrew/bin/codex --session-a-child"],
+            # PID 300, PPID 60, PGID 50 — session B (different PPID)
+            ["cj", "300", "25.0", "0.0", "0", "40960", "??", "R", "1:05PM", "3:00.00",
+             "node /opt/homebrew/bin/codex --session-b"],
+        ],
+    )
+
+    def fake_inspect(pid):
+        mapping = {
+            100: {"pid": 100, "alive": True, "inspectable": True, "ppid": 50, "pgid": 50, "tty": "??"},
+            200: {"pid": 200, "alive": True, "inspectable": True, "ppid": 50, "pgid": 50, "tty": "??"},
+            300: {"pid": 300, "alive": True, "inspectable": True, "ppid": 60, "pgid": 50, "tty": "??"},
+            50:  {"pid": 50, "alive": True, "inspectable": True, "ppid": 1, "pgid": 50, "tty": "??"},
+            60:  {"pid": 60, "alive": True, "inspectable": True, "ppid": 1, "pgid": 50, "tty": "??"},
+        }
+        return mapping.get(pid)
+
+    monkeypatch.setattr(registry, "_inspect_process", fake_inspect)
+    monkeypatch.setattr(registry, "_is_parent_chain_detached", lambda pid: True)
+
+    sessions = syshealth.get_session_processes()
+
+    assert len(sessions) == 2
+
+    by_pid = {s.pid: s for s in sessions}
+    # Session A: PIDs 100+200 collapsed (same PGID + same PPID)
+    session_a = by_pid.get(200)  # 200 has higher CPU
+    assert session_a is not None
+    assert session_a.member_count == 2
+    assert sorted(session_a.member_pids) == [100, 200]
+
+    # Session B: PID 300 alone (different PPID despite same PGID)
+    session_b = by_pid.get(300)
+    assert session_b is not None
+    assert session_b.member_count == 1
+    assert session_b.member_pids == [300]
 
 
 def test_idle_processes_returns_list():

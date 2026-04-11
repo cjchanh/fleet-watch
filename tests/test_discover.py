@@ -277,3 +277,44 @@ def test_sync_reassigns_parent_to_listener(tmp_path, monkeypatch):
     assert registry.get_process(conn, 1242)["port"] == 4343
     assert any(c["pid"] == 829 for c in result["cleaned"])
     assert any(a["pid"] == 1242 for a in result["added"])
+
+
+def test_clean_stale_session_leases_closes_dead_stale(monkeypatch):
+    """Stale session leases with dead owners are closed during discover."""
+    conn = _fresh_conn()
+    registry.upsert_session_lease(conn, "stale-sess", owner_pid=99999)
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid != 99999)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+
+    cleaned = discover._clean_stale_session_leases(conn)
+
+    assert cleaned == 1
+    lease = registry.get_session_lease(conn, "stale-sess")
+    assert lease["status"] == "CLOSED"
+
+
+def test_clean_stale_session_leases_skips_fresh_heartbeat(monkeypatch):
+    """Leases with dead owner but fresh heartbeat are NOT closed."""
+    conn = _fresh_conn()
+    registry.upsert_session_lease(conn, "fresh-sess", owner_pid=99999)
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid != 99999)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 30 if ts else None)
+
+    cleaned = discover._clean_stale_session_leases(conn)
+
+    assert cleaned == 0
+    lease = registry.get_session_lease(conn, "fresh-sess")
+    assert lease["status"] == "ACTIVE"
+
+
+def test_clean_stale_session_leases_skips_alive_owner():
+    """Leases with alive owners are never touched."""
+    conn = _fresh_conn()
+    import os
+    registry.upsert_session_lease(conn, "alive-sess", owner_pid=os.getpid())
+
+    cleaned = discover._clean_stale_session_leases(conn)
+
+    assert cleaned == 0
+    lease = registry.get_session_lease(conn, "alive-sess")
+    assert lease["status"] == "ACTIVE"

@@ -61,6 +61,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "restart_policy": "RESTART_ON_FAILURE",
             "gpu_mb_default": 20480,
         },
+        {
+            "name_template": "Codex agent",
+            "process_match": "codex/codex$",
+            "workstream": "codex",
+            "priority": 3,
+            "restart_policy": "ALERT_ONLY",
+            "gpu_mb_default": 0,
+        },
     ],
 }
 
@@ -122,7 +130,7 @@ def _get_listeners() -> dict[int, int]:
             ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"],
             capture_output=True, text=True, timeout=5,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return result
 
     current_pid = None
@@ -146,7 +154,7 @@ def _get_process_commands() -> dict[int, str]:
             ["ps", "-eo", "pid,command"],
             capture_output=True, text=True, timeout=5,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return {}
 
     result: dict[int, str] = {}
@@ -261,7 +269,7 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
             ["tnr", "status", "--json"],
             capture_output=True, text=True, timeout=10,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
         return 0
 
     if result.returncode != 0:
@@ -288,6 +296,46 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
 
     registry.replace_provider_resources(conn, provider="thunder", resources=mapped)
     return len(mapped)
+
+
+_MAX_LEASE_CLEANUP_PER_CYCLE = 50
+
+
+def _clean_stale_session_leases(conn: sqlite3.Connection) -> int:
+    """Close ACTIVE session leases whose owner PID is dead and heartbeat is stale.
+
+    Bounded to _MAX_LEASE_CLEANUP_PER_CYCLE per invocation to avoid
+    monopolising a sync cycle when thousands of leases have accumulated.
+    """
+    cleaned = 0
+    for lease in registry.list_session_leases(conn):
+        if cleaned >= _MAX_LEASE_CLEANUP_PER_CYCLE:
+            break
+        if lease["status"] != "ACTIVE" or lease.get("shutdown_at") is not None:
+            continue
+        owner_pid = lease.get("owner_pid")
+        if owner_pid is None or registry._pid_exists(owner_pid):
+            continue
+        age = registry._age_seconds(lease.get("last_heartbeat_at"))
+        if age is None or age <= registry.DEFAULT_STALE_SECONDS:
+            continue
+        try:
+            registry.close_session_lease(conn, lease["session_id"])
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=owner_pid,
+                workstream="session",
+                detail={
+                    "reason": "stale_dead_session_lease",
+                    "session_id": lease["session_id"],
+                    "owner_pid": owner_pid,
+                },
+            )
+            cleaned += 1
+        except (sqlite3.Error, OSError):
+            continue
+    return cleaned
 
 
 def _prefer_listener_owned_processes(found: list[DiscoveredProcess]) -> list[DiscoveredProcess]:
@@ -362,14 +410,14 @@ def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
     return _prefer_listener_owned_processes(found)
 
 
-def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
+def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Discover processes and sync with registry. Returns summary."""
     close_conn = False
     if conn is None:
         conn = registry.connect()
         close_conn = True
 
-    config = load_config()
+    config = config or load_config()
     discovered = discover(config=config)
     discovered_pids = {proc.pid for proc in discovered}
     registered = registry.get_all_processes(conn)
@@ -497,7 +545,16 @@ def sync(conn=None) -> dict[str, list[dict[str, Any]]]:
     # Sync Thunder instances if tnr CLI is available
     thunder_synced = _sync_thunder(conn)
 
+    # Close stale session leases with dead owners
+    session_leases_cleaned = _clean_stale_session_leases(conn)
+
     if close_conn:
         conn.close()
 
-    return {"added": added, "cleaned": cleaned, "skipped": skipped, "thunder_synced": thunder_synced}
+    return {
+        "added": added,
+        "cleaned": cleaned,
+        "skipped": skipped,
+        "thunder_synced": thunder_synced,
+        "session_leases_cleaned": session_leases_cleaned,
+    }

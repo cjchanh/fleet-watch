@@ -28,8 +28,11 @@ EVENT_TYPES = frozenset({
     "SESSION_HEARTBEAT",
     "SESSION_CLOSE",
     "REAP",
+    "REAP_SESSION",
     "FUSE_TRIPPED",
     "GPU_BUDGET_DENY",
+    "RUNAWAY_DETECTED",
+    "RUNAWAY_KILL",
 })
 
 

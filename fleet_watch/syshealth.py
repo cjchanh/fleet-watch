@@ -11,6 +11,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_watch import registry
+
 
 # --- Default patterns (overridable via config.json) ---
 
@@ -38,6 +40,7 @@ DEFAULT_IDLE_PATTERNS: list[str] = [
 ]
 
 DEFAULT_IDLE_CPU_THRESHOLD = 1.0
+DEFAULT_SESSION_HOT_CPU_THRESHOLD = 20.0
 
 DEFAULT_PRESSURE_THRESHOLDS = {
     "elevated": 70,
@@ -112,7 +115,7 @@ def get_memory_state() -> MemoryState:
         ps_match = re.search(r"page size of (\d+) bytes", out.stdout)
         if ps_match:
             page_size = int(ps_match.group(1))
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return MemoryState(total_mb, 0, 0, total_mb, 0, 0)
 
     def mb(key: str) -> int:
@@ -137,7 +140,7 @@ def _get_total_memory_mb() -> int:
         )
         if out.returncode == 0:
             return int(out.stdout.strip()) // (1024 * 1024)
-    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, ValueError):
         pass
     return 0
 
@@ -155,6 +158,15 @@ class SessionProcess:
     started: str
     tty: str
     command: str
+    ppid: int | None = None
+    pgid: int | None = None
+    group_leader_pid: int | None = None
+    member_pids: list[int] = field(default_factory=list)
+    member_count: int = 1
+    parent_chain_detached: bool | None = None
+    classification: str = "attached"
+    attention: bool = False
+    evidence: list[str] = field(default_factory=list)
 
 
 def get_session_processes(
@@ -171,7 +183,7 @@ def get_session_processes(
         return []
 
     lines = _ps_aux_lines()
-    sessions: list[SessionProcess] = []
+    raw_matches: list[dict[str, Any]] = []
 
     for parts in lines:
         cmd = parts[10]
@@ -196,15 +208,97 @@ def get_session_processes(
         except (ValueError, IndexError):
             continue
 
+        info = registry._inspect_process(pid) or {}
+        raw_matches.append({
+            "pid": pid,
+            "name": matched_name,
+            "kind": matched_kind,
+            "rss_mb": rss_mb,
+            "cpu_pct": cpu_pct,
+            "started": started,
+            "tty": tty,
+            "command": cmd[:200],
+            "ppid": info.get("ppid"),
+            "pgid": info.get("pgid"),
+        })
+
+    pgid_groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for item in raw_matches:
+        group_pid = item["pgid"] or item["pid"]
+        pgid_groups.setdefault((item["kind"], group_pid), []).append(item)
+
+    grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+    for (kind, pgid), members in pgid_groups.items():
+        by_pid: dict[int, dict[str, Any]] = {m["pid"]: m for m in members}
+        for m in members:
+            cursor = m["pid"]
+            ppid = m["ppid"]
+            while ppid in by_pid:
+                cursor = ppid
+                ppid = by_pid[cursor]["ppid"]
+            # cursor is the topmost member; ppid is its external parent.
+            # Siblings spawned by the same external parent share ppid here,
+            # so use ppid as the family key when it exists.
+            family = ppid if ppid is not None else cursor
+            grouped.setdefault((kind, pgid, family), []).append(m)
+
+    sessions: list[SessionProcess] = []
+    for (_, group_pid, _root), members in grouped.items():
+        representative = max(
+            members,
+            key=lambda item: (item["cpu_pct"], item["rss_mb"], -item["pid"]),
+        )
+        leader_pid = group_pid or representative["pid"]
+        leader_info = registry._inspect_process(leader_pid) or {}
+        tty = next(
+            (
+                candidate["tty"]
+                for candidate in members
+                if candidate["tty"] not in {"?", "??"}
+            ),
+            leader_info.get("tty") or representative["tty"],
+        )
+        detached = registry._is_parent_chain_detached(leader_pid)
+        total_cpu = round(sum(item["cpu_pct"] for item in members), 1)
+        total_rss = sum(item["rss_mb"] for item in members)
+        evidence: list[str] = []
+        classification = "attached"
+        attention = False
+
+        if detached is True:
+            evidence.append("launcher ancestry detached")
+            if total_cpu >= DEFAULT_SESSION_HOT_CPU_THRESHOLD:
+                classification = "detached_hot"
+                attention = True
+                evidence.append(f"cpu {total_cpu:.1f}%")
+            else:
+                classification = "detached"
+        elif detached is False:
+            evidence.append("launcher ancestry attached")
+        else:
+            evidence.append("launcher ancestry unknown")
+
+        if len(members) > 1:
+            evidence.append(f"{len(members)} matched processes collapsed")
+
         sessions.append(SessionProcess(
-            pid=pid,
-            name=matched_name,
-            kind=matched_kind,
-            rss_mb=rss_mb,
-            cpu_pct=cpu_pct,
-            started=started,
+            pid=representative["pid"],
+            name=representative["name"],
+            kind=representative["kind"],
+            rss_mb=total_rss,
+            cpu_pct=total_cpu,
+            started=representative["started"],
             tty=tty,
-            command=cmd[:200],
+            command=representative["command"],
+            ppid=leader_info.get("ppid", representative["ppid"]),
+            pgid=leader_info.get("pgid", representative["pgid"]),
+            group_leader_pid=leader_pid,
+            member_pids=sorted(item["pid"] for item in members),
+            member_count=len(members),
+            parent_chain_detached=detached,
+            classification=classification,
+            attention=attention,
+            evidence=evidence,
         ))
 
     return sessions
@@ -286,7 +380,9 @@ def _ps_aux_lines() -> list[list[str]]:
         out = subprocess.run(
             ["ps", "aux"], capture_output=True, text=True, timeout=5,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        return []
+    if out.returncode != 0:
         return []
     result = []
     for line in out.stdout.splitlines()[1:]:

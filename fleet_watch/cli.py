@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from typing import Any
 import click
 
 from fleet_watch import discover as discover_mod
-from fleet_watch import events, referee, registry, reporter, syshealth
+from fleet_watch import events, referee, registry, reporter, runaway, syshealth
 
 
 def _get_conn():
@@ -43,6 +44,18 @@ def _holder_conflict_text(holder: dict[str, Any] | None) -> str:
     return holder["name"]
 
 
+def _resolved_session_id(session_id: str | None) -> str | None:
+    if session_id:
+        return session_id
+    fleet_sid = os.environ.get("FLEET_SESSION_ID")
+    if fleet_sid:
+        return fleet_sid
+    term_sid = os.environ.get("TERM_SESSION_ID")
+    if term_sid:
+        return f"term-{term_sid}"
+    return None
+
+
 def _notify_conflict(skipped: list[dict[str, Any]]) -> None:
     """Send macOS notification for resource conflicts found during discovery."""
     count = len(skipped)
@@ -60,6 +73,58 @@ def _notify_conflict(skipped: list[dict[str, Any]]) -> None:
         )
     except Exception:
         pass  # Notification failure never blocks discovery
+
+
+def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
+    """Send macOS notification when detached hot sessions require attention."""
+    if not sessions:
+        return
+    total_cpu = sum(s.cpu_pct for s in sessions)
+    title = "Fleet Watch: Attention Required"
+    body = f"{len(sessions)} detached hot session(s) — {total_cpu:.0f}% total CPU"
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'display notification "{body}" with title "{title}"',
+            ],
+            capture_output=True,
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def _run_runaway_tick(
+    conn: sqlite3.Connection,
+    tracker: runaway.DaemonRunawayTracker,
+    tracker_path: Path | None = None,
+) -> list[runaway.RunawayProcess]:
+    """Run one runaway tracker tick, log events, optionally persist state."""
+    try:
+        newly_flagged = tracker.tick()
+    except Exception:
+        return []
+    for proc in newly_flagged:
+        events.log_event(
+            conn,
+            "RUNAWAY_DETECTED",
+            pid=proc.pid,
+            workstream="runaway",
+            detail={
+                "cpu_pct": proc.cpu_pct,
+                "runtime_seconds": proc.runtime_seconds,
+                "command": proc.command[:200],
+                "consecutive_ticks": runaway.DAEMON_CONSECUTIVE_TICKS,
+            },
+        )
+        click.echo(
+            f"WARNING: runaway PID {proc.pid} ({proc.name}) — "
+            f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} consecutive ticks"
+        )
+    if tracker_path is not None:
+        tracker.save(tracker_path)
+    return newly_flagged
 
 
 def _extract_json_document(raw: str) -> Any:
@@ -94,6 +159,7 @@ def _build_guard_payload(
     repo_dir: str | None = None,
     gpu_mb: int | None = None,
     current_session_id: str | None = None,
+    runaway_tracker: runaway.DaemonRunawayTracker | None = None,
 ) -> dict[str, Any]:
     state = reporter.build_guard_state(conn)
     budget = state["gpu_budget"]
@@ -114,6 +180,12 @@ def _build_guard_payload(
             "external_resources": state.get("external_resources", []),
         },
     }
+
+    # Advisory: include active runaway warnings if tracker is available
+    if runaway_tracker is not None:
+        warnings = runaway_tracker.get_active_warnings()
+        if warnings:
+            payload["runaways"] = warnings
 
     if port is not None:
         decision = referee.check_port(conn, port)
@@ -407,6 +479,7 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
         click.echo("Specify --port, --repo, or --gpu", err=True)
         sys.exit(2)
 
+    current_session_id = _resolved_session_id(session_id)
     conn = _get_conn()
     failed = False
 
@@ -419,7 +492,11 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
             failed = True
 
     if repo_dir is not None:
-        decision = referee.check_repo_with_session(conn, repo_dir, current_session_id=session_id)
+        decision = referee.check_repo_with_session(
+            conn,
+            repo_dir,
+            current_session_id=current_session_id,
+        )
         if decision.allowed:
             click.echo(f"Repo {repo_dir}: available")
         else:
@@ -452,6 +529,7 @@ def guard(
     as_json: bool,
 ):
     """Canonical pre-flight interface for agents and operators."""
+    current_session_id = _resolved_session_id(session_id)
     conn = _get_conn()
     for cleaned in registry.clean_dead_pids(conn):
         events.log_event(
@@ -467,9 +545,17 @@ def guard(
         port=port,
         repo_dir=repo_dir,
         gpu_mb=gpu_mb,
-        current_session_id=session_id,
+        current_session_id=current_session_id,
     )
     conn.close()
+
+    # Advisory: scan for active runaway processes (never crash the guard)
+    try:
+        runaways = runaway.scan_runaways()
+    except Exception:
+        runaways = []
+    if runaways:
+        payload["runaways"] = [r.to_dict() for r in runaways]
 
     if as_json:
         click.echo(json.dumps(payload, indent=2, default=str))
@@ -611,6 +697,79 @@ def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | No
     reporter.write_report(conn)
     click.echo(f"Session heartbeat updated for {session_id}")
     conn.close()
+
+
+@session.command("ensure")
+@click.option("--session-id", required=True, help="Session identifier")
+@click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
+@click.option("--retries", type=int, default=3, help="Max retry attempts on transient failure")
+@click.option("--retry-delay", type=float, default=2.0, help="Seconds between retries")
+def session_ensure(
+    session_id: str,
+    owner_pid: int | None,
+    repo_dir: str | None,
+    retries: int,
+    retry_delay: float,
+):
+    """Open or refresh a session lease with automatic retry on transient failure.
+
+    Fail-open: on final failure, exits 0 with a stderr warning so the
+    calling process (e.g. Codex bootstrap) is never blocked.
+    """
+    resolved_owner_pid = owner_pid or _default_owner_pid()
+    last_err: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        conn = None
+        try:
+            conn = _get_conn()
+            failures = referee.preflight_register(
+                conn,
+                repo_dir=repo_dir,
+                current_session_id=session_id,
+            )
+            if failures:
+                for failure in failures:
+                    click.echo(f"DENY: {failure.reason}", err=True)
+                conn.close()
+                sys.exit(1)
+
+            registry.upsert_session_lease(
+                conn,
+                session_id,
+                owner_pid=resolved_owner_pid,
+                repo_dir=repo_dir,
+            )
+            events.log_event(
+                conn,
+                "SESSION_START",
+                pid=resolved_owner_pid,
+                detail={"session_id": session_id, "repo_dir": repo_dir, "source": "ensure"},
+            )
+            reporter.write_report(conn)
+            conn.close()
+            click.echo(f"Session {session_id} active (owner PID {resolved_owner_pid})")
+            return
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as exc:
+            last_err = exc
+            if conn is not None:
+                try:
+                    conn.close()
+                except (sqlite3.Error, OSError):
+                    pass
+            if attempt < retries:
+                click.echo(
+                    f"fleet session ensure: attempt {attempt}/{retries} failed ({exc}), retrying...",
+                    err=True,
+                )
+                time.sleep(retry_delay)
+
+    click.echo(
+        f"fleet session ensure: all {retries} attempts failed ({last_err}). "
+        f"Session {session_id} is UNTRACKED.",
+        err=True,
+    )
 
 
 @session.command("close")
@@ -804,6 +963,112 @@ def reap(confirm: bool, as_json: bool):
     sys.exit(1 if failed else 0)
 
 
+@cli.command("reap-sessions")
+@click.option("--confirm", is_flag=True, help="Kill detached hot sessions (dry-run by default)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def reap_sessions(confirm: bool, as_json: bool):
+    """Kill detached_hot syshealth sessions. Dry-run by default."""
+    config = discover_mod.load_config()
+    health_config = syshealth.load_health_config(config)
+    sessions = syshealth.get_session_processes(
+        patterns=health_config["session_patterns"],
+    )
+    candidates = [s for s in sessions if s.attention and s.classification == "detached_hot"]
+
+    killed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    if confirm:
+        conn = _get_conn()
+        try:
+            for sess in candidates:
+                member_results: list[dict[str, Any]] = []
+                all_ok = True
+                for pid in sess.member_pids:
+                    ok = _terminate_orphan(pid)
+                    member_results.append({"pid": pid, "terminated": ok})
+                    if not ok and registry._pid_exists(pid):
+                        all_ok = False
+
+                entry = {
+                    "pid": sess.pid,
+                    "kind": sess.kind,
+                    "name": sess.name,
+                    "member_pids": sess.member_pids,
+                    "cpu_pct": sess.cpu_pct,
+                    "rss_mb": sess.rss_mb,
+                    "members": member_results,
+                }
+                if all_ok:
+                    killed.append(entry)
+                else:
+                    entry["reason"] = "one or more member PIDs could not be terminated"
+                    failed.append(entry)
+
+                events.log_event(
+                    conn,
+                    "REAP_SESSION",
+                    pid=sess.pid,
+                    workstream="session",
+                    detail={
+                        "kind": sess.kind,
+                        "member_pids": sess.member_pids,
+                        "cpu_pct": sess.cpu_pct,
+                        "classification": sess.classification,
+                        "success": all_ok,
+                    },
+                )
+            reporter.write_report(conn)
+        finally:
+            conn.close()
+
+    payload = {
+        "confirmed": confirm,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "pid": s.pid,
+                "kind": s.kind,
+                "name": s.name,
+                "member_pids": s.member_pids,
+                "cpu_pct": s.cpu_pct,
+                "rss_mb": s.rss_mb,
+                "classification": s.classification,
+                "evidence": s.evidence,
+            }
+            for s in candidates
+        ],
+        "killed": killed,
+        "failed": failed,
+    }
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        sys.exit(1 if failed else 0)
+        return
+
+    if not candidates:
+        click.echo("No detached hot sessions.")
+        return
+
+    if not confirm:
+        click.echo("Dry run. Detached hot sessions:")
+        for s in candidates:
+            evidence = "; ".join(s.evidence[:3])
+            click.echo(
+                f"  PID {s.pid} ({s.kind}) — {s.cpu_pct:.1f}% CPU — "
+                f"{s.member_count} member(s) — {evidence}"
+            )
+        click.echo("Run `fleet reap-sessions --confirm` to terminate these sessions.")
+        return
+
+    for entry in killed:
+        click.echo(f"Killed session PID {entry['pid']} ({entry['kind']}) — {len(entry['member_pids'])} member(s)")
+    for entry in failed:
+        click.echo(f"FAIL: session PID {entry['pid']} ({entry['kind']}) — {entry['reason']}", err=True)
+    sys.exit(1 if failed else 0)
+
+
 @cli.command()
 def clean():
     """Remove entries for dead PIDs."""
@@ -829,10 +1094,11 @@ def context(ctx):
 @cli.command()
 def discover():
     """Auto-discover running processes and sync registry + state.json."""
+    config = discover_mod.load_config()
     conn = _get_conn()
-    result = discover_mod.sync(conn)
+    result = discover_mod.sync(conn, config=config)
     reporter.write_report(conn)
-    conn.close()
+
     for a in result["added"]:
         click.echo(f"+ PID {a['pid']} ({a['name']})")
     for c in result["cleaned"]:
@@ -843,11 +1109,30 @@ def discover():
     thunder_count = result.get("thunder_synced", 0)
     if thunder_count:
         click.echo(f"Thunder: {thunder_count} instance(s) synced")
-    if not result["added"] and not result["cleaned"] and not skipped_list and not thunder_count:
+    leases_cleaned = result.get("session_leases_cleaned", 0)
+    if leases_cleaned:
+        click.echo(f"Cleaned {leases_cleaned} stale session lease(s)")
+    if not result["added"] and not result["cleaned"] and not skipped_list and not thunder_count and not leases_cleaned:
         click.echo("No changes. Registry is current.")
     # Alert on conflicts via macOS notification
     if skipped_list:
         _notify_conflict(skipped_list)
+    # Alert on detached hot sessions
+    health_config = syshealth.load_health_config(config)
+    flagged = [
+        s for s in syshealth.get_session_processes(
+            patterns=health_config["session_patterns"],
+        )
+        if s.attention
+    ]
+    if flagged:
+        _notify_attention(flagged)
+
+    # Runaway detection: persistent tracker across discover invocations
+    tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
+    tracker = runaway.DaemonRunawayTracker.load(tracker_path)
+    _run_runaway_tick(conn, tracker, tracker_path=tracker_path)
+    conn.close()
 
 
 @cli.command()
@@ -860,6 +1145,7 @@ def watch(interval: int):
     click.echo(f"Fleet Watch running. Scanning every {interval}s. Ctrl-C to stop.")
 
     running = True
+    tracker = runaway.DaemonRunawayTracker()
 
     def _stop(signum, frame):
         nonlocal running
@@ -874,7 +1160,6 @@ def watch(interval: int):
             conn = _get_conn()
             result = discover_mod.sync(conn)
             reporter.write_report(conn)
-            conn.close()
 
             for a in result["added"]:
                 click.echo(f"+ PID {a['pid']} ({a['name']})")
@@ -884,6 +1169,11 @@ def watch(interval: int):
                 click.echo(
                     f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
                 )
+
+            # Runaway detection: log WARNING for processes exceeding threshold
+            _run_runaway_tick(conn, tracker)
+
+            conn.close()
         except Exception as e:
             click.echo(f"Error: {e}", err=True)
 
@@ -961,8 +1251,24 @@ def health(as_json: bool):
         click.echo(json.dumps({
             "memory": mem.to_dict(),
             "sessions": [
-                {"pid": s.pid, "name": s.name, "kind": s.kind, "rss_mb": s.rss_mb,
-                 "cpu_pct": s.cpu_pct, "started": s.started, "tty": s.tty}
+                {
+                    "pid": s.pid,
+                    "name": s.name,
+                    "kind": s.kind,
+                    "rss_mb": s.rss_mb,
+                    "cpu_pct": s.cpu_pct,
+                    "started": s.started,
+                    "tty": s.tty,
+                    "ppid": s.ppid,
+                    "pgid": s.pgid,
+                    "group_leader_pid": s.group_leader_pid,
+                    "member_pids": s.member_pids,
+                    "member_count": s.member_count,
+                    "parent_chain_detached": s.parent_chain_detached,
+                    "classification": s.classification,
+                    "attention": s.attention,
+                    "evidence": s.evidence,
+                }
                 for s in sessions
             ],
             "idle": idle,
@@ -980,16 +1286,36 @@ def health(as_json: bool):
     click.echo("")
 
     if sessions:
+        flagged = [s for s in sessions if s.attention]
         by_kind: dict[str, list] = {}
         for s in sessions:
             by_kind.setdefault(s.kind, []).append(s)
         kind_summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(by_kind.items()))
         total_rss = sum(s.rss_mb for s in sessions)
         click.echo(f"Sessions: {kind_summary} ({total_rss:,} MB)")
-        click.echo(f"{'PID':>7}  {'Type':<12} {'RSS':>8}  {'CPU':>6}  {'TTY':<6}  Started")
-        click.echo("-" * 60)
-        for s in sorted(sessions, key=lambda x: x.rss_mb, reverse=True):
-            click.echo(f"{s.pid:>7}  {s.kind:<12} {s.rss_mb:>6} MB  {s.cpu_pct:>5.1f}%  {s.tty:<6}  {s.started}")
+        if flagged:
+            click.echo(f"Attention: {len(flagged)} detached hot session(s)")
+            for s in sorted(flagged, key=lambda x: x.cpu_pct, reverse=True):
+                evidence = "; ".join(s.evidence[:2])
+                click.echo(
+                    f"  PID {s.pid:>7}  {s.kind:<12} {s.cpu_pct:>5.1f}%  "
+                    f"{s.rss_mb:>6} MB  {evidence}"
+                )
+            click.echo("")
+        click.echo(
+            f"{'PID':>7}  {'Type':<12} {'State':<13} {'RSS':>8}  "
+            f"{'CPU':>6}  {'TTY':<6} {'N':>2}  Started"
+        )
+        click.echo("-" * 86)
+        for s in sorted(
+            sessions,
+            key=lambda x: (0 if x.attention else 1, -x.cpu_pct, -x.rss_mb),
+        ):
+            click.echo(
+                f"{s.pid:>7}  {s.kind:<12} {s.classification:<13} "
+                f"{s.rss_mb:>6} MB  {s.cpu_pct:>5.1f}%  {s.tty:<6} "
+                f"{s.member_count:>2}  {s.started}"
+            )
     else:
         click.echo("Sessions: none detected")
     click.echo("")
@@ -1002,6 +1328,10 @@ def health(as_json: bool):
             click.echo(f"  PID {p['pid']:>7}  {p['rss_mb']:>6} MB  CPU {p['cpu_pct']:>5.1f}%  {cmd_short}")
     else:
         click.echo("Idle processes: none detected")
+
+    flagged = [s for s in sessions if s.attention]
+    if flagged:
+        _notify_attention(flagged)
 
 
 @cli.command()
@@ -1202,6 +1532,85 @@ def thunder_release(external_id: str):
     reporter.write_report(conn)
     click.echo(f"Released thunder:{external_id}")
     conn.close()
+
+
+@cli.command("runaway")
+@click.option("--kill", "do_kill", is_flag=True, help="SIGKILL flagged processes (default: dry-run)")
+@click.option("--cpu-threshold", type=float, default=runaway.DEFAULT_CPU_THRESHOLD,
+              help="CPU percentage threshold (default 90)")
+@click.option("--sustained-seconds", type=int, default=runaway.DEFAULT_SUSTAINED_SECONDS,
+              help="Minimum runtime in seconds (default 60)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as_json: bool):
+    """Detect and optionally kill runaway high-CPU processes."""
+    flagged = runaway.scan_runaways(
+        cpu_threshold=cpu_threshold,
+        sustained_seconds=sustained_seconds,
+    )
+
+    killed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    if do_kill and flagged:
+        conn = _get_conn()
+        try:
+            for proc in flagged:
+                success = runaway.kill_runaway(proc.pid)
+                entry = proc.to_dict()
+                if success:
+                    killed.append(entry)
+                    events.log_event(
+                        conn,
+                        "RUNAWAY_KILL",
+                        pid=proc.pid,
+                        workstream="runaway",
+                        detail={
+                            "cpu_pct": proc.cpu_pct,
+                            "runtime_seconds": proc.runtime_seconds,
+                            "command": proc.command[:200],
+                        },
+                    )
+                else:
+                    entry["reason"] = "kill failed"
+                    failed.append(entry)
+        finally:
+            conn.close()
+
+    payload = {
+        "confirmed": do_kill,
+        "cpu_threshold": cpu_threshold,
+        "sustained_seconds": sustained_seconds,
+        "flagged_count": len(flagged),
+        "flagged": [p.to_dict() for p in flagged],
+        "killed": killed,
+        "failed": failed,
+    }
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        sys.exit(1 if failed else 0)
+        return
+
+    if not flagged:
+        click.echo("No runaway processes detected.")
+        return
+
+    if not do_kill:
+        click.echo(f"Dry run. {len(flagged)} runaway process(es) detected (>{cpu_threshold}% CPU, >{sustained_seconds}s):")
+        for proc in flagged:
+            click.echo(
+                f"  PID {proc.pid:>7}  {proc.name:<20} CPU {proc.cpu_pct:>5.1f}%  "
+                f"runtime {proc.runtime_seconds}s  {proc.command[:60]}"
+            )
+        click.echo("Run `fleet runaway --kill` to terminate these processes.")
+        return
+
+    for entry in killed:
+        click.echo(f"Killed PID {entry['pid']} ({entry['name']}) — CPU {entry['cpu_pct']}%")
+    for entry in failed:
+        click.echo(f"FAIL: PID {entry['pid']} ({entry['name']}) — {entry.get('reason', 'unknown')}", err=True)
+    sys.exit(1 if failed else 0)
+
 
 
 def main():
