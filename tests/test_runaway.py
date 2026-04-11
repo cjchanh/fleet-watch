@@ -591,8 +591,8 @@ class TestDaemonRunawayLogging:
         )
 
         proc = runaway.RunawayProcess(
-            pid=88888, name="stubborn", cpu_pct=98.0,
-            runtime_seconds=1200, command="/bin/stubborn",
+            pid=88888, name="codex", cpu_pct=98.0,
+            runtime_seconds=1200, command="vendor/aarch64-apple-darwin/codex/codex -a never",
         )
         monkeypatch.setattr(
             runaway, "scan_runaways",
@@ -609,6 +609,71 @@ class TestDaemonRunawayLogging:
         assert len(failed) == 1
         assert failed[0]["pid"] == 88888
         conn.close()
+
+
+    def _run_external_survive_test(self, tmp_path, monkeypatch, pid, name, command):
+        """Helper: verify an external process is warned but never auto-killed."""
+        _patch_paths(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
+            "added": [], "cleaned": [], "skipped": [],
+            "thunder_synced": 0, "session_leases_cleaned": 0,
+        })
+        monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
+        monkeypatch.setattr(
+            cli_module.reporter, "write_report",
+            lambda conn: (tmp_path / "r.md", tmp_path / "r.json"),
+        )
+        monkeypatch.setattr(
+            cli_module.syshealth, "get_session_processes",
+            lambda patterns=None: [],
+        )
+
+        proc = runaway.RunawayProcess(
+            pid=pid, name=name, cpu_pct=99.0,
+            runtime_seconds=3600, command=command,
+        )
+        monkeypatch.setattr(
+            runaway, "scan_runaways",
+            lambda cpu_threshold=90.0, sustained_seconds=60: [proc],
+        )
+
+        killed_pids: list[int] = []
+        monkeypatch.setattr(runaway, "kill_runaway", lambda pid: (killed_pids.append(pid), True)[1])
+
+        runner = CliRunner()
+        for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
+            result = runner.invoke(cli_module.cli, ["discover"])
+            assert result.exit_code == 0
+
+        assert killed_pids == [], f"{name} was killed but should have survived"
+
+        conn = registry.connect()
+        detected = events.get_events(conn, hours=1, event_type="RUNAWAY_DETECTED")
+        assert len(detected) == 1
+        assert detected[0]["detail"]["fleet_owned"] is False
+        conn.close()
+
+    def test_external_ffmpeg_survives(self, tmp_path, monkeypatch):
+        """ffmpeg encode is never auto-killed."""
+        self._run_external_survive_test(
+            tmp_path, monkeypatch, 55555, "ffmpeg",
+            "/usr/local/bin/ffmpeg -i video.mp4 -c:v libx265 out.mp4",
+        )
+
+    def test_external_vllm_survives(self, tmp_path, monkeypatch):
+        """External vllm serve (not Fleet-registered) is never auto-killed."""
+        self._run_external_survive_test(
+            tmp_path, monkeypatch, 55556, "vllm",
+            "python3 -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3-8B",
+        )
+
+    def test_external_uvicorn_router_survives(self, tmp_path, monkeypatch):
+        """External uvicorn router (not Fleet-registered) is never auto-killed."""
+        self._run_external_survive_test(
+            tmp_path, monkeypatch, 55557, "uvicorn",
+            "uvicorn my_app.router:app --host 0.0.0.0 --port 8000",
+        )
 
 
 class TestKillRunawayGuards:

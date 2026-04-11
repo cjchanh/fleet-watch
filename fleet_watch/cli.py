@@ -95,18 +95,42 @@ def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
         pass
 
 
+_CODEX_ORPHAN_RE = re.compile(r"codex/codex\b")
+
+
+def _is_fleet_owned(conn: sqlite3.Connection, proc: runaway.RunawayProcess) -> bool:
+    """Check if a process is owned by Fleet Watch.
+
+    Auto-kill requires real ownership evidence, not regex classification.
+    Two paths qualify:
+    1. Registered in Fleet Watch registry (explicit registration via discover/register)
+    2. Codex binary orphan — launched by our bootstrap but never registered
+       (narrow exception: only the Codex native binary path, not broad patterns)
+    """
+    if registry.get_process(conn, proc.pid) is not None:
+        return True
+    if _CODEX_ORPHAN_RE.search(proc.command):
+        return True
+    return False
+
+
 def _run_runaway_tick(
     conn: sqlite3.Connection,
     tracker: runaway.DaemonRunawayTracker,
     tracker_path: Path | None = None,
     auto_kill: bool = True,
 ) -> list[runaway.RunawayProcess]:
-    """Run one runaway tracker tick, log events, kill runaways if auto_kill."""
+    """Run one runaway tracker tick, log events, kill Fleet-owned runaways if auto_kill.
+
+    Auto-kill requires real ownership evidence: registry entry or Codex orphan match.
+    Unowned processes (ML training, ffmpeg, external vllm) get an EXTERNAL warning only.
+    """
     try:
         newly_flagged = tracker.tick()
     except Exception:
         return []
     for proc in newly_flagged:
+        fleet_owned = _is_fleet_owned(conn, proc)
         events.log_event(
             conn,
             "RUNAWAY_DETECTED",
@@ -117,9 +141,10 @@ def _run_runaway_tick(
                 "runtime_seconds": proc.runtime_seconds,
                 "command": proc.command[:200],
                 "consecutive_ticks": runaway.DAEMON_CONSECUTIVE_TICKS,
+                "fleet_owned": fleet_owned,
             },
         )
-        if auto_kill:
+        if auto_kill and fleet_owned:
             success = runaway.kill_runaway(proc.pid)
             event_type = "RUNAWAY_KILL" if success else "RUNAWAY_KILL_FAILED"
             events.log_event(
@@ -138,8 +163,9 @@ def _run_runaway_tick(
                 f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} ticks — {status}"
             )
         else:
+            label = "WARNING" if fleet_owned else "EXTERNAL"
             click.echo(
-                f"WARNING: runaway PID {proc.pid} ({proc.name}) — "
+                f"{label}: runaway PID {proc.pid} ({proc.name}) — "
                 f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} consecutive ticks"
             )
     if tracker_path is not None:
