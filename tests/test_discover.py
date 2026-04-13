@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+import time
 
 from fleet_watch import discover, events, registry
+from fleet_watch import syshealth
 
 
 def _patch_paths(monkeypatch, tmp_path):
@@ -318,3 +320,64 @@ def test_clean_stale_session_leases_skips_alive_owner():
     assert cleaned == 0
     lease = registry.get_session_lease(conn, "alive-sess")
     assert lease["status"] == "ACTIVE"
+
+
+def test_gpu_memory_monitor_logs_transition_alerts(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = _fresh_conn()
+
+    prior = {
+        "timestamp_s": time.time() - 60,
+        "memory": syshealth.MemoryState(
+            8192, 4000, 1000, 2000, 0, 1000, pageouts=100, swapins=0
+        ).to_dict(),
+        "overcommit_pids": [],
+        "thrashing": False,
+    }
+    discover.gpu_monitor_state_path().write_text(json.dumps(prior) + "\n")
+
+    monkeypatch.setattr(
+        discover.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(
+            8192, 4500, 900, 1800, 0, 1000, pageouts=70000, swapins=100
+        ),
+    )
+    monkeypatch.setattr(
+        discover.syshealth,
+        "get_gpu_workload_footprints",
+        lambda processes: [
+            syshealth.ProcessFootprint(
+                pid=1234, name="cake", resident_mb=7000, dirty_mb=5000, swapped_mb=512
+            )
+        ],
+    )
+
+    snapshot = discover._run_gpu_memory_monitor(
+        conn,
+        [
+            discover.DiscoveredProcess(
+                pid=1234,
+                port=None,
+                listener_owned=False,
+                name="cake",
+                workstream="inference",
+                model="qwen2.5-7B-Q4_K_M.gguf",
+                gpu_mb=4096,
+                priority=3,
+                restart_policy="ALERT_ONLY",
+                command="./cake --model qwen2.5-7B-Q4_K_M.gguf",
+            )
+        ],
+        config={},
+    )
+
+    alerts = snapshot["alerts"]
+    assert len(alerts) == 2
+    assert {alert["type"] for alert in alerts} == {
+        "pageout_thrashing",
+        "process_footprint_overcommit",
+    }
+
+    logged = events.get_events(conn, hours=1, event_type="GPU_MEMORY_PRESSURE")
+    assert len(logged) == 2

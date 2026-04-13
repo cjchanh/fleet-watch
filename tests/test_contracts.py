@@ -28,10 +28,12 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         port=8100,
         repo_dir=tmp_path,
         gpu_mb=1024,
+        framework="candle",
+        model_hint="qwen2.5-7B-Q4_K_M.gguf",
     )
 
     assert set(payload.keys()) == {"allowed", "request", "checks", "state"}
-    assert set(payload["request"].keys()) == {"port", "repo_dir", "gpu_mb"}
+    assert set(payload["request"].keys()) == {"port", "repo_dir", "gpu_mb", "framework", "model"}
     assert set(payload["checks"].keys()) == {"port", "repo", "gpu"}
     assert set(payload["checks"]["port"].keys()) == {
         "allowed",
@@ -46,6 +48,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "requested_mb",
         "available_mb",
         "suggested_max_mb",
+        "working_set",
     }
     assert set(payload["state"].keys()) == {
         "process_count",
@@ -133,6 +136,7 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
         "system_memory",
         "sessions",
         "idle_processes",
+        "gpu_memory_monitor",
     }
     assert set(state["gpu_budget"].keys()) == {
         "total_mb",

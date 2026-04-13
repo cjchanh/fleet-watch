@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from fleet_watch import registry
@@ -59,6 +61,8 @@ class MemoryState:
     free_mb: int
     compressed_mb: int
     wired_mb: int
+    pageouts: int = 0
+    swapins: int = 0
 
     @property
     def available_mb(self) -> int:
@@ -88,6 +92,8 @@ class MemoryState:
             "wired_mb": self.wired_mb,
             "available_mb": self.available_mb,
             "pressure_pct": self.pressure_pct,
+            "pageouts": self.pageouts,
+            "swapins": self.swapins,
         }
 
 
@@ -128,6 +134,8 @@ def get_memory_state() -> MemoryState:
         free_mb=mb("Pages free"),
         compressed_mb=mb("Pages stored in compressor"),
         wired_mb=mb("Pages wired down"),
+        pageouts=pages.get("Pageouts", 0),
+        swapins=pages.get("Swapins", 0),
     )
 
 
@@ -390,6 +398,177 @@ def _ps_aux_lines() -> list[list[str]]:
         if len(parts) >= 11:
             result.append(parts)
     return result
+
+
+# --- Pageout rate tracking ---
+
+@dataclass
+class PageoutRate:
+    """Delta between two vm_stat snapshots."""
+    pageout_delta: int
+    swapin_delta: int
+    interval_seconds: float
+    pageouts_per_sec: float
+    swapins_per_sec: float
+    thrashing: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pageout_delta": self.pageout_delta,
+            "swapin_delta": self.swapin_delta,
+            "interval_seconds": round(self.interval_seconds, 1),
+            "pageouts_per_sec": round(self.pageouts_per_sec, 1),
+            "swapins_per_sec": round(self.swapins_per_sec, 1),
+            "thrashing": self.thrashing,
+        }
+
+
+# Threshold: >1000 pageouts/sec during a GPU workload signals swap thrashing.
+DEFAULT_PAGEOUT_THRASH_THRESHOLD = 1000
+
+
+def compute_pageout_rate(
+    prev: MemoryState,
+    current: MemoryState,
+    interval_seconds: float,
+    threshold: int = DEFAULT_PAGEOUT_THRASH_THRESHOLD,
+) -> PageoutRate:
+    """Compute pageout rate between two snapshots.
+
+    Both snapshots must have been collected via get_memory_state().
+    interval_seconds is the wall-clock time between them.
+    """
+    if interval_seconds <= 0:
+        return PageoutRate(0, 0, 0.0, 0.0, 0.0, False)
+
+    po_delta = max(0, current.pageouts - prev.pageouts)
+    si_delta = max(0, current.swapins - prev.swapins)
+    po_rate = po_delta / interval_seconds
+    si_rate = si_delta / interval_seconds
+
+    return PageoutRate(
+        pageout_delta=po_delta,
+        swapin_delta=si_delta,
+        interval_seconds=interval_seconds,
+        pageouts_per_sec=po_rate,
+        swapins_per_sec=si_rate,
+        thrashing=po_rate > threshold,
+    )
+
+
+# --- Per-process footprint ---
+
+@dataclass
+class ProcessFootprint:
+    """Memory footprint for a single process."""
+    pid: int
+    name: str
+    resident_mb: int
+    dirty_mb: int
+    swapped_mb: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "name": self.name,
+            "resident_mb": self.resident_mb,
+            "dirty_mb": self.dirty_mb,
+            "swapped_mb": self.swapped_mb,
+        }
+
+
+def get_process_footprint(pid: int, name: str = "") -> ProcessFootprint | None:
+    """Get memory footprint for a process via macOS footprint command.
+
+    Returns None if the process doesn't exist or footprint fails.
+    """
+    tmp_path: Path | None = None
+    try:
+        fd, raw_path = tempfile.mkstemp(prefix="fleet-footprint-", suffix=".json")
+        Path(raw_path).unlink(missing_ok=True)
+        tmp_path = Path(raw_path)
+        out = subprocess.run(
+            ["footprint", "-p", str(pid), "-f", "bytes", "--noCategories", "-j", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+        return None
+    finally:
+        try:
+            if "fd" in locals():
+                import os
+                os.close(fd)
+        except OSError:
+            pass
+
+    if out.returncode != 0:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        return None
+
+    import json
+    try:
+        if tmp_path is None or not tmp_path.exists():
+            return None
+        data = json.loads(tmp_path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+    process_entries = data.get("processes", []) if isinstance(data, dict) else []
+    entry = next(
+        (item for item in process_entries if int(item.get("pid", -1)) == pid),
+        process_entries[0] if process_entries else {},
+    )
+    aux = entry.get("auxiliary", {}) if isinstance(entry, dict) else {}
+    summary_total = data.get("summary", {}).get("total", {}) if isinstance(data, dict) else {}
+
+    resident = int(
+        aux.get("phys_footprint")
+        or entry.get("footprint", 0)
+        or data.get("total footprint", 0)
+    )
+    dirty = int(summary_total.get("dirty", 0))
+    swapped = int(summary_total.get("swapped", 0))
+
+    return ProcessFootprint(
+        pid=pid,
+        name=name,
+        resident_mb=resident // (1024 * 1024),
+        dirty_mb=dirty // (1024 * 1024),
+        swapped_mb=swapped // (1024 * 1024),
+    )
+
+
+def get_gpu_workload_footprints(
+    processes: list[dict[str, Any]],
+) -> list[ProcessFootprint]:
+    """Poll memory footprint for all registered GPU workload processes.
+
+    Filters to processes with gpu_mb > 0 (inference workloads).
+    """
+    footprints: list[ProcessFootprint] = []
+    for proc in processes:
+        if proc.get("gpu_mb", 0) <= 0:
+            continue
+        fp = get_process_footprint(proc["pid"], proc.get("name", ""))
+        if fp is not None:
+            footprints.append(fp)
+    return footprints
+
+
+def check_footprint_overcommit(
+    footprints: list[ProcessFootprint],
+    total_ram_mb: int,
+    reserve_mb: int = 2048,
+) -> list[ProcessFootprint]:
+    """Return processes whose resident memory exceeds available RAM."""
+    available = total_ram_mb - reserve_mb
+    return [fp for fp in footprints if fp.resident_mb > available]
 
 
 def load_health_config(config: dict[str, Any] | None = None) -> dict[str, Any]:

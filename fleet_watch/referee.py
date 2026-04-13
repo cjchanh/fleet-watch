@@ -15,6 +15,7 @@ from fleet_watch import events, registry
 
 @dataclass
 class Decision:
+    """Outcome of a claim or guard decision."""
     allowed: bool
     reason: str
     holder: dict[str, Any] | None = None
@@ -34,6 +35,7 @@ def _session_holder_from_lease(lease: dict[str, Any]) -> dict[str, Any]:
 
 
 def check_port(conn: sqlite3.Connection, port: int) -> Decision:
+    """Return whether a port is currently available."""
     holder = registry.get_process_by_port(conn, port)
     if holder is None:
         return Decision(allowed=True, reason="port available")
@@ -45,6 +47,7 @@ def check_port(conn: sqlite3.Connection, port: int) -> Decision:
 
 
 def check_repo(conn: sqlite3.Connection, repo_dir: str) -> Decision:
+    """Return whether a repo path is available without session context."""
     return check_repo_with_session(conn, repo_dir, current_session_id=None)
 
 
@@ -53,6 +56,7 @@ def check_repo_with_session(
     repo_dir: str,
     current_session_id: str | None,
 ) -> Decision:
+    """Return whether a repo path is available for the current session."""
     resolved_repo_dir = str(Path(repo_dir).resolve())
     holder = registry.get_process_by_repo(conn, resolved_repo_dir)
     if holder is None:
@@ -123,6 +127,7 @@ def check_repo_with_session(
 
 
 def check_gpu_budget(conn: sqlite3.Connection, gpu_mb: int) -> Decision:
+    """Return whether a raw GPU budget claim fits the current ledger."""
     if gpu_mb <= 0:
         return Decision(allowed=True, reason="no GPU claim")
     budget = registry.get_gpu_budget(conn)
@@ -140,6 +145,7 @@ def check_gpu_budget(conn: sqlite3.Connection, gpu_mb: int) -> Decision:
 
 
 def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Reduce a holder record to the stable public JSON contract shape."""
     if holder is None:
         return None
     return {
@@ -159,6 +165,7 @@ def suggest_ports(
     requested_port: int | None = None,
     limit: int = 5,
 ) -> list[int]:
+    """Suggest candidate ports that are currently unclaimed."""
     occupied = set(registry.get_claimed_ports(conn).keys())
     suggestions: list[int] = []
 

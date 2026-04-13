@@ -69,6 +69,7 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
         patterns=health_config["idle_patterns"],
         threshold_cpu=health_config["idle_cpu_threshold"],
     )
+    gpu_monitor = discover.load_gpu_monitor_state()
 
     state.update({
         "session_leases": registry.list_session_leases(conn),
@@ -99,6 +100,7 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
             for s in sessions
         ],
         "idle_processes": idle,
+        "gpu_memory_monitor": gpu_monitor,
     })
     return state
 
@@ -254,6 +256,40 @@ def generate_markdown(state: dict[str, Any]) -> str:
                          f"Compressed: {mem['compressed_mb']:,} MB")
             lines.append(f"- Free: {mem['free_mb']:,} MB | Inactive: {mem['inactive_mb']:,} MB | "
                          f"Available: {mem['available_mb']:,} MB")
+            lines.append(f"- Pageouts: {mem.get('pageouts', 0):,} | Swapins: {mem.get('swapins', 0):,}")
+        lines.append("")
+
+    gpu_monitor = state.get("gpu_memory_monitor") or {}
+    if gpu_monitor:
+        lines.append("## GPU Memory Watch")
+        lines.append("")
+        pageout_rate = gpu_monitor.get("pageout_rate")
+        if pageout_rate:
+            lines.append(
+                f"- Pageouts/sec: {pageout_rate['pageouts_per_sec']} | "
+                f"Swapins/sec: {pageout_rate['swapins_per_sec']}"
+            )
+        footprints = gpu_monitor.get("gpu_process_footprints", [])
+        if footprints:
+            total_fp = sum(item.get("resident_mb", 0) for item in footprints)
+            lines.append(
+                f"- GPU workload footprint: {total_fp:,} MB across {len(footprints)} process(es)"
+            )
+        alerts = gpu_monitor.get("alerts", [])
+        if alerts:
+            lines.append("- Alerts:")
+            for alert in alerts[:5]:
+                if alert["type"] == "pageout_thrashing":
+                    rate = alert["pageout_rate"]["pageouts_per_sec"]
+                    lines.append(f"  - pageout thrashing detected at {rate} pageouts/sec")
+                elif alert["type"] == "process_footprint_overcommit":
+                    proc = alert["process"]
+                    lines.append(
+                        f"  - PID {proc['pid']} ({proc['name']}) at {proc['resident_mb']} MB "
+                        f"with {alert['available_mb']} MB available"
+                    )
+        else:
+            lines.append("- Alerts: none")
         lines.append("")
 
     # --- Sessions ---

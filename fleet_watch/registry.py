@@ -117,6 +117,7 @@ def _now_iso() -> str:
 
 
 def ensure_dir() -> Path:
+    """Create the Fleet Watch state directory if needed and return it."""
     FLEET_DIR.mkdir(parents=True, exist_ok=True)
     return FLEET_DIR
 
@@ -275,6 +276,7 @@ def _configured_budget_defaults() -> tuple[int, int]:
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
+    """Open the registry database and ensure the schema is initialized."""
     path = db_path or DB_PATH
     ensure_dir()
     total_mb, reserve_mb = _configured_budget_defaults()
@@ -305,6 +307,7 @@ def upsert_session_lease(
     repo_dir: str | None = None,
     status: str = "ACTIVE",
 ) -> None:
+    """Create or refresh a session lease with current owner metadata."""
     if status not in SESSION_LEASE_STATUSES:
         raise ValueError(f"Invalid session lease status: {status}")
 
@@ -354,6 +357,7 @@ def heartbeat_session_lease(
     owner_pid: int | None = None,
     repo_dir: str | None = None,
 ) -> bool:
+    """Refresh an existing session lease or create it when owner_pid is given."""
     lease = get_session_lease(conn, session_id)
     if lease is None:
         if owner_pid is None:
@@ -396,6 +400,7 @@ def heartbeat_session_lease(
 
 
 def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
+    """Mark a session lease as closed."""
     now = _now_iso()
     cursor = conn.execute(
         """
@@ -412,6 +417,7 @@ def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
 
 
 def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+    """Return one session lease by id, if present."""
     row = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
@@ -427,6 +433,7 @@ def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, An
 
 
 def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all session leases ordered by creation time."""
     rows = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
@@ -439,6 +446,7 @@ def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def list_active_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return only active, non-shutdown session leases."""
     rows = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
@@ -467,6 +475,7 @@ def register_process(
     expected_duration_min: int | None = None,
     manage_session_lease: bool = True,
 ) -> None:
+    """Register a process row and update related budget/session state."""
     if restart_policy not in RESTART_POLICIES:
         raise ValueError(f"Invalid restart policy: {restart_policy}")
     if not 1 <= priority <= 5:
@@ -518,6 +527,7 @@ def register_process(
 
 
 def release_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None:
+    """Release a registered process and decrement its GPU budget claim."""
     row = conn.execute(
         "SELECT pid, session_id, name, workstream, gpu_mb FROM processes WHERE pid = ?", (pid,)
     ).fetchone()
@@ -558,6 +568,7 @@ def release_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None
 
 
 def release_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] | None:
+    """Release the process currently holding a given port, if any."""
     row = conn.execute(
         "SELECT pid, name, workstream, gpu_mb FROM processes WHERE port = ?", (port,)
     ).fetchone()
@@ -567,6 +578,7 @@ def release_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] | None:
 
 
 def heartbeat(conn: sqlite3.Connection, pid: int) -> bool:
+    """Refresh a process heartbeat and its owned lease when applicable."""
     now = _now_iso()
     row = conn.execute(
         "SELECT session_id, repo_dir FROM processes WHERE pid = ?",
@@ -606,6 +618,7 @@ def heartbeat(conn: sqlite3.Connection, pid: int) -> bool:
 
 
 def get_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None:
+    """Return one registered process by pid."""
     row = conn.execute("SELECT * FROM processes WHERE pid = ?", (pid,)).fetchone()
     if not row:
         return None
@@ -613,11 +626,13 @@ def get_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None:
 
 
 def get_all_processes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all registered processes ordered by priority and age."""
     rows = conn.execute("SELECT * FROM processes ORDER BY priority DESC, start_time ASC").fetchall()
     return [_row_to_dict(r, conn) for r in rows]
 
 
 def get_process_by_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] | None:
+    """Return the registered process claiming a port, if any."""
     row = conn.execute("SELECT * FROM processes WHERE port = ?", (port,)).fetchone()
     if not row:
         return None
@@ -625,6 +640,7 @@ def get_process_by_port(conn: sqlite3.Connection, port: int) -> dict[str, Any] |
 
 
 def get_process_by_repo(conn: sqlite3.Connection, repo_dir: str) -> dict[str, Any] | None:
+    """Return the registered process locking a repo path, if any."""
     resolved = str(Path(repo_dir).resolve())
     row = conn.execute("SELECT * FROM processes WHERE repo_dir = ?", (resolved,)).fetchone()
     if not row:
@@ -633,6 +649,7 @@ def get_process_by_repo(conn: sqlite3.Connection, repo_dir: str) -> dict[str, An
 
 
 def get_gpu_budget(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return the current total, reserve, allocated, and available GPU budget."""
     row = conn.execute("SELECT total_mb, reserve_mb, allocated_mb FROM gpu_budget WHERE id = 1").fetchone()
     total, reserve, allocated = row
     return {
@@ -647,6 +664,7 @@ def get_stale_processes(
     conn: sqlite3.Connection,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
+    """Return processes whose heartbeat age exceeds the stale threshold."""
     return [
         proc
         for proc in get_process_classifications(conn, stale_seconds=stale_seconds)
@@ -658,6 +676,7 @@ def get_reapable_processes(
     conn: sqlite3.Connection,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
+    """Return processes classified as safe to reap."""
     return [
         proc
         for proc in get_process_classifications(conn, stale_seconds=stale_seconds)
@@ -718,6 +737,7 @@ def get_active_session_leases_by_repo(
     repo_dir: str,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
+    """Return active session leases that currently block a repo path."""
     resolved = str(Path(repo_dir).resolve())
     rows = conn.execute(
         """
@@ -741,6 +761,7 @@ def get_effective_locked_repos(
     conn: sqlite3.Connection,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> dict[str, int | None]:
+    """Return repo locks from processes plus active blocking session leases."""
     locks = get_locked_repos(conn)
     for lease in list_session_leases(conn):
         repo_dir = lease.get("repo_dir")
@@ -755,6 +776,7 @@ def get_process_classifications(
     conn: sqlite3.Connection,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
+    """Classify each registered process by liveness and ownership evidence."""
     results: list[dict[str, Any]] = []
     for proc in get_all_processes(conn):
         process_alive = _pid_exists(proc["pid"])
@@ -866,6 +888,7 @@ def register_external_resource(
     safe_to_delete: bool = False,
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    """Register or refresh an external non-local resource row."""
     if not provider:
         raise ValueError("provider is required")
     if not resource_type:
@@ -956,6 +979,7 @@ def heartbeat_external_resource(
     status: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
+    """Refresh last-seen state for an external resource."""
     now = _now_iso()
     fields = ["last_seen = ?"]
     params: list[Any] = [now]
@@ -980,6 +1004,7 @@ def release_external_resource(
     provider: str,
     external_id: str,
 ) -> dict[str, Any] | None:
+    """Release an external resource and close its synthetic lease if needed."""
     row = conn.execute(
         """SELECT provider, resource_type, external_id, session_id, workstream, name,
                   priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
@@ -1026,6 +1051,7 @@ def get_external_resource(
     provider: str,
     external_id: str,
 ) -> dict[str, Any] | None:
+    """Return one external resource by provider/id."""
     row = conn.execute(
         """SELECT provider, resource_type, external_id, session_id, workstream, name,
                   priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
@@ -1040,6 +1066,7 @@ def get_external_resource(
 
 
 def get_all_external_resources(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all tracked external resources ordered by priority and age."""
     rows = conn.execute(
         """SELECT provider, resource_type, external_id, session_id, workstream, name,
                   priority, gpu_mb, repo_dir, model, status, started_by, owner_tool,
@@ -1054,6 +1081,7 @@ def get_external_resources_by_repo(
     conn: sqlite3.Connection,
     repo_dir: str,
 ) -> list[dict[str, Any]]:
+    """Return all external resources associated with a repo path."""
     resolved = str(Path(repo_dir).resolve())
     rows = conn.execute(
         """SELECT provider, resource_type, external_id, session_id, workstream, name,
@@ -1073,6 +1101,7 @@ def replace_provider_resources(
     provider: str,
     resources: list[dict[str, Any]],
 ) -> None:
+    """Replace one provider's discovered resource set with the latest snapshot."""
     existing = {
         item["external_id"]: item
         for item in get_all_external_resources(conn)

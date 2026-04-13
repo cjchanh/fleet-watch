@@ -171,6 +171,85 @@ def test_guard_repo_allows_current_external_owner_session(tmp_path, monkeypatch)
     assert payload["checks"]["repo"]["allowed"] is True
 
 
+def test_guard_gpu_without_model_does_not_false_deny(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--gpu", "1024", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["checks"]["gpu"]["allowed"] is True
+    assert "working_set" not in payload["checks"]["gpu"]
+
+
+def test_guard_logs_working_set_denial_event(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "guard",
+            "--gpu",
+            "4096",
+            "--framework",
+            "candle",
+            "--model",
+            "qwen2.5-7B-Q4_K_M.gguf",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["checks"]["gpu"]["reason"] == "working_set_exceeds_physical_ram"
+
+    conn = registry.connect()
+    try:
+        events = cli_module.events.get_events(conn, hours=1, event_type="GPU_WORKING_SET_DENY")
+    finally:
+        conn.close()
+    assert events
+
+
+def test_guard_human_output_disambiguates_budget_vs_physical_ram(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "guard",
+            "--gpu",
+            "4096",
+            "--framework",
+            "candle",
+            "--model",
+            "qwen2.5-7B-Q4_K_M.gguf",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Physical RAM available after reserve: 6144MB" in result.output
+    assert "GPU budget available:" in result.output
+
+
 def test_health_json_reports_session_attention(monkeypatch):
     monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
     monkeypatch.setattr(

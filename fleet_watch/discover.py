@@ -6,12 +6,13 @@ import json
 import re
 import sqlite3
 import subprocess
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import events, referee, registry
+from fleet_watch import events, gpu_estimator, referee, registry, syshealth
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "gpu_total_mb": registry.DEFAULT_GPU_TOTAL_MB,
@@ -75,6 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 @dataclass
 class DiscoveredProcess:
+    """Process candidate found by the discovery scan."""
     pid: int
     port: int | None
     listener_owned: bool
@@ -88,10 +90,12 @@ class DiscoveredProcess:
 
 
 def config_path() -> Path:
+    """Return the on-disk path for the Fleet Watch config file."""
     return registry.FLEET_DIR / "config.json"
 
 
 def load_config() -> dict[str, Any]:
+    """Load config.json, merging user overrides onto built-in defaults."""
     path = config_path()
     if path.exists():
         with open(path) as f:
@@ -109,6 +113,7 @@ def load_config() -> dict[str, Any]:
 
 
 def save_default_config() -> Path:
+    """Write the default config if it does not already exist."""
     registry.ensure_dir()
     path = config_path()
     if not path.exists():
@@ -117,6 +122,7 @@ def save_default_config() -> Path:
 
 
 def preferred_ports(config: dict[str, Any] | None = None) -> list[int]:
+    """Return the preferred port list from config as integers."""
     loaded = config or load_config()
     ports = loaded.get("preferred_ports", DEFAULT_CONFIG["preferred_ports"])
     return [int(port) for port in ports]
@@ -299,6 +305,7 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
 
 
 _MAX_LEASE_CLEANUP_PER_CYCLE = 50
+_GPU_MONITOR_STATE_FILE = "gpu_memory_monitor.json"
 
 
 def _clean_stale_session_leases(conn: sqlite3.Connection) -> int:
@@ -336,6 +343,169 @@ def _clean_stale_session_leases(conn: sqlite3.Connection) -> int:
         except (sqlite3.Error, OSError):
             continue
     return cleaned
+
+
+def gpu_monitor_state_path() -> Path:
+    """Return the persisted discovery-cycle GPU monitor snapshot path."""
+    return registry.FLEET_DIR / _GPU_MONITOR_STATE_FILE
+
+
+def load_gpu_monitor_state() -> dict[str, Any] | None:
+    """Load the most recent persisted GPU monitor snapshot, if present."""
+    path = gpu_monitor_state_path()
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _memory_state_from_dict(payload: dict[str, Any] | None) -> syshealth.MemoryState | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return syshealth.MemoryState(
+            total_mb=int(payload.get("total_mb", 0)),
+            active_mb=int(payload.get("active_mb", 0)),
+            inactive_mb=int(payload.get("inactive_mb", 0)),
+            free_mb=int(payload.get("free_mb", 0)),
+            compressed_mb=int(payload.get("compressed_mb", 0)),
+            wired_mb=int(payload.get("wired_mb", 0)),
+            pageouts=int(payload.get("pageouts", 0)),
+            swapins=int(payload.get("swapins", 0)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _gpu_monitor_targets(
+    discovered: list[DiscoveredProcess],
+    registered: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    targets: dict[int, dict[str, Any]] = {}
+
+    for proc in registered:
+        if proc.get("gpu_mb", 0) <= 0:
+            continue
+        targets[int(proc["pid"])] = {
+            "pid": int(proc["pid"]),
+            "name": proc["name"],
+            "gpu_mb": int(proc.get("gpu_mb", 0) or 0),
+            "workstream": proc.get("workstream"),
+            "command": proc.get("start_cmd"),
+        }
+
+    for proc in discovered:
+        if proc.gpu_mb <= 0:
+            continue
+        targets[proc.pid] = {
+            "pid": proc.pid,
+            "name": proc.name,
+            "gpu_mb": proc.gpu_mb,
+            "workstream": proc.workstream,
+            "command": proc.command,
+        }
+
+    return sorted(targets.values(), key=lambda item: item["pid"])
+
+
+def _run_gpu_memory_monitor(
+    conn: sqlite3.Connection,
+    discovered: list[DiscoveredProcess],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    mem = syshealth.get_memory_state()
+    prior = load_gpu_monitor_state() or {}
+    previous_mem = _memory_state_from_dict(prior.get("memory"))
+    previous_ts = float(prior.get("timestamp_s", 0) or 0)
+    targets = _gpu_monitor_targets(discovered, registry.get_all_processes(conn))
+    reserve_mb = gpu_estimator.resolve_effective_reserve_mb(
+        mem.total_mb if mem.is_available else 0,
+        config.get("gpu_reserve_mb", registry.DEFAULT_GPU_RESERVE_MB),
+    )
+
+    pageout_rate = None
+    if mem.is_available and previous_mem is not None and previous_ts > 0:
+        pageout_rate = syshealth.compute_pageout_rate(
+            previous_mem,
+            mem,
+            interval_seconds=max(time.time() - previous_ts, 1.0),
+            threshold=int(
+                config.get(
+                    "gpu_pageout_thrash_threshold",
+                    syshealth.DEFAULT_PAGEOUT_THRASH_THRESHOLD,
+                )
+            ),
+        )
+
+    footprints = syshealth.get_gpu_workload_footprints(targets) if targets else []
+    overcommit = (
+        syshealth.check_footprint_overcommit(
+            footprints,
+            total_ram_mb=mem.total_mb,
+            reserve_mb=reserve_mb,
+        )
+        if mem.is_available and footprints
+        else []
+    )
+
+    alerts: list[dict[str, Any]] = []
+    if pageout_rate is not None and pageout_rate.thrashing and targets:
+        alerts.append({
+            "type": "pageout_thrashing",
+            "pageout_rate": pageout_rate.to_dict(),
+        })
+        if not prior.get("thrashing", False):
+            events.log_event(
+                conn,
+                "GPU_MEMORY_PRESSURE",
+                workstream="gpu",
+                detail={
+                    "reason": "pageout_thrashing",
+                    "pageout_rate": pageout_rate.to_dict(),
+                    "target_pids": [target["pid"] for target in targets],
+                },
+            )
+
+    previous_overcommit = {int(pid) for pid in prior.get("overcommit_pids", [])}
+    current_overcommit = {fp.pid for fp in overcommit}
+    available_mb = max(mem.total_mb - reserve_mb, 0) if mem.is_available else 0
+
+    for fp in overcommit:
+        alerts.append({
+            "type": "process_footprint_overcommit",
+            "process": fp.to_dict(),
+            "available_mb": available_mb,
+        })
+        if fp.pid not in previous_overcommit:
+            events.log_event(
+                conn,
+                "GPU_MEMORY_PRESSURE",
+                pid=fp.pid,
+                workstream="gpu",
+                detail={
+                    "reason": "process_footprint_overcommit",
+                    "available_mb": available_mb,
+                    "process": fp.to_dict(),
+                },
+            )
+
+    snapshot = {
+        "timestamp_s": time.time(),
+        "memory": mem.to_dict(),
+        "pageout_rate": pageout_rate.to_dict() if pageout_rate is not None else None,
+        "effective_reserve_mb": reserve_mb,
+        "target_pids": [target["pid"] for target in targets],
+        "gpu_process_footprints": [fp.to_dict() for fp in footprints],
+        "overcommit_pids": sorted(current_overcommit),
+        "thrashing": bool(pageout_rate and pageout_rate.thrashing),
+        "alerts": alerts,
+    }
+    registry.ensure_dir()
+    gpu_monitor_state_path().write_text(json.dumps(snapshot, indent=2) + "\n")
+    return snapshot
 
 
 def _prefer_listener_owned_processes(found: list[DiscoveredProcess]) -> list[DiscoveredProcess]:
@@ -547,6 +717,7 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
 
     # Close stale session leases with dead owners
     session_leases_cleaned = _clean_stale_session_leases(conn)
+    gpu_memory_monitor = _run_gpu_memory_monitor(conn, discovered, config)
 
     if close_conn:
         conn.close()
@@ -557,4 +728,5 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
         "skipped": skipped,
         "thunder_synced": thunder_synced,
         "session_leases_cleaned": session_leases_cleaned,
+        "gpu_memory_monitor": gpu_memory_monitor,
     }

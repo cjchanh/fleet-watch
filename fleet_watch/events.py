@@ -6,7 +6,6 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 GENESIS_HASH = "genesis"
@@ -31,6 +30,8 @@ EVENT_TYPES = frozenset({
     "REAP_SESSION",
     "FUSE_TRIPPED",
     "GPU_BUDGET_DENY",
+    "GPU_MEMORY_PRESSURE",
+    "GPU_WORKING_SET_DENY",
     "RUNAWAY_DETECTED",
     "RUNAWAY_KILL",
     "RUNAWAY_KILL_FAILED",
@@ -47,6 +48,7 @@ def _now_iso() -> str:
 
 
 def get_last_hash(conn: sqlite3.Connection) -> str:
+    """Return the hash of the most recent event, or the genesis hash."""
     row = conn.execute(
         "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -60,6 +62,7 @@ def log_event(
     workstream: str | None = None,
     detail: dict[str, Any] | None = None,
 ) -> int:
+    """Append one event to the hash-chained audit log."""
     if event_type not in EVENT_TYPES:
         raise ValueError(f"Unknown event type: {event_type}")
 
@@ -83,6 +86,7 @@ def get_events(
     event_type: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
+    """Return recent events filtered by age and optional event type."""
     query = "SELECT id, timestamp, event_type, pid, workstream, detail, hash FROM events"
     conditions: list[str] = []
     params: list[Any] = []

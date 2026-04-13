@@ -82,6 +82,7 @@ STATE_KEYS = {
     "system_memory",
     "sessions",
     "idle_processes",
+    "gpu_memory_monitor",
 }
 
 

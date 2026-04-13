@@ -17,7 +17,7 @@ from typing import Any
 import click
 
 from fleet_watch import discover as discover_mod
-from fleet_watch import events, referee, registry, reporter, runaway, syshealth
+from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 
 
 def _get_conn():
@@ -204,6 +204,8 @@ def _build_guard_payload(
     port: int | None = None,
     repo_dir: str | None = None,
     gpu_mb: int | None = None,
+    framework: str | None = None,
+    model_hint: str | None = None,
     current_session_id: str | None = None,
     runaway_tracker: runaway.DaemonRunawayTracker | None = None,
 ) -> dict[str, Any]:
@@ -215,6 +217,8 @@ def _build_guard_payload(
             "port": port,
             "repo_dir": str(Path(repo_dir).resolve()) if repo_dir else None,
             "gpu_mb": gpu_mb,
+            "framework": framework,
+            "model": model_hint,
         },
         "checks": {},
         "state": {
@@ -262,14 +266,45 @@ def _build_guard_payload(
 
     if gpu_mb is not None:
         decision = referee.check_gpu_budget(conn, gpu_mb)
-        payload["checks"]["gpu"] = {
+        gpu_check: dict[str, Any] = {
             "allowed": decision.allowed,
             "reason": decision.reason,
             "requested_mb": gpu_mb,
             "available_mb": max(0, budget["available_mb"]),
             "suggested_max_mb": max(0, budget["available_mb"]),
         }
-        payload["allowed"] = payload["allowed"] and decision.allowed
+
+        # Working set estimation — catches memory overcommit
+        mem = syshealth.get_memory_state()
+        physical_ram = mem.total_mb if mem.is_available else 0
+        config = discover_mod.load_config()
+        reserve = gpu_estimator.resolve_effective_reserve_mb(
+            physical_ram,
+            config.get("gpu_reserve_mb", registry.DEFAULT_GPU_RESERVE_MB),
+        )
+
+        estimate = gpu_estimator.estimate_working_set(
+            framework=framework,
+            command=model_hint,
+            physical_ram_mb=physical_ram,
+            reserve_mb=reserve,
+            config_overrides=config.get("gpu_estimator"),
+            allow_model_fallback=False,
+        )
+        if estimate.source != "insufficient_input":
+            gpu_check["working_set"] = estimate.to_dict()
+
+        if estimate.grounded and not estimate.fits:
+            gpu_check["allowed"] = False
+            gpu_check["reason"] = "working_set_exceeds_physical_ram"
+            gpu_check["detail"] = (
+                f"working set {estimate.total_mb}MB exceeds "
+                f"physical RAM ({physical_ram}MB) minus "
+                f"reserve ({estimate.available_after_reserve_mb}MB available)"
+            )
+
+        payload["checks"]["gpu"] = gpu_check
+        payload["allowed"] = payload["allowed"] and gpu_check["allowed"]
 
     return payload
 
@@ -300,17 +335,41 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
     if "gpu" in checks:
         gpu_check = checks["gpu"]
         requested_mb = gpu_check["requested_mb"]
+        ws = gpu_check.get("working_set")
         if gpu_check["allowed"]:
             lines.append(
                 f"GPU {requested_mb}MB: available "
                 f"({gpu_check['available_mb']}MB free)"
             )
+            if ws:
+                lines.append(
+                    f"  Working set: {ws['total_mb']}MB "
+                    f"(weights {ws['weights_mb']} + kv {ws['kv_cache_mb']} "
+                    f"+ act {ws['activations_mb']}) × {ws['overhead_multiplier']}x"
+                )
+                lines.append(
+                    f"  Physical RAM available after reserve: {ws['available_after_reserve_mb']}MB"
+                )
         else:
-            lines.append(f"GPU {requested_mb}MB: {gpu_check['reason']}")
+            lines.append(f"GPU {requested_mb}MB: {gpu_check.get('detail', gpu_check['reason'])}")
+            if ws:
+                lines.append(
+                    f"  Breakdown: weights {ws['weights_mb']}MB + "
+                    f"kv_cache {ws['kv_cache_mb']}MB + "
+                    f"activations {ws['activations_mb']}MB "
+                    f"× {ws['overhead_multiplier']}x ({ws['framework']})"
+                )
+                lines.append(
+                    f"  Physical RAM available after reserve: {ws['available_after_reserve_mb']}MB"
+                )
+                if not ws.get("grounded", True):
+                    lines.append("  Note: advisory only; provide explicit framework/model for enforcement")
+                if ws.get("suggestion"):
+                    lines.append(f"  Suggestion: {ws['suggestion']}")
 
     state = payload["state"]
     lines.append(
-        f"GPU available: {max(0, state['gpu_budget']['available_mb'])}MB "
+        f"GPU budget available: {max(0, state['gpu_budget']['available_mb'])}MB "
         f"({state['gpu_budget']['allocated_mb']}MB allocated)"
     )
     if state["safe_ports"]:
@@ -565,12 +624,16 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
 @click.option("--port", type=int, default=None, help="Port to guard")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to guard")
 @click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to guard")
+@click.option("--framework", default=None, help="Inference framework (candle, mlx, ollama, vllm)")
+@click.option("--model", "model_hint", default=None, help="Model name/path for working set estimation")
 @click.option("--session-id", default=None, help="Current session ID for owned-resource bypass")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
 def guard(
     port: int | None,
     repo_dir: str | None,
     gpu_mb: int | None,
+    framework: str | None,
+    model_hint: str | None,
     session_id: str | None,
     as_json: bool,
 ):
@@ -591,8 +654,31 @@ def guard(
         port=port,
         repo_dir=repo_dir,
         gpu_mb=gpu_mb,
+        framework=framework,
+        model_hint=model_hint,
         current_session_id=current_session_id,
     )
+
+    gpu_check = payload["checks"].get("gpu")
+    if gpu_check and not gpu_check.get("allowed", True):
+        event_type = (
+            "GPU_WORKING_SET_DENY"
+            if gpu_check.get("reason") == "working_set_exceeds_physical_ram"
+            else "GPU_BUDGET_DENY"
+        )
+        events.log_event(
+            conn,
+            event_type,
+            workstream="guard",
+            detail={
+                "requested_mb": gpu_check.get("requested_mb"),
+                "reason": gpu_check.get("reason"),
+                "detail": gpu_check.get("detail"),
+                "framework": framework,
+                "model": model_hint,
+                "working_set": gpu_check.get("working_set"),
+            },
+        )
     conn.close()
 
     # Advisory: scan for active runaway processes (never crash the guard)
@@ -614,9 +700,9 @@ def guard(
 
 # Keep 'claim' as alias for backward compat
 @cli.command(hidden=True)
-@click.option("--port", type=int, default=None)
-@click.option("--repo", "repo_dir", default=None)
-@click.option("--gpu", "gpu_mb", type=int, default=None)
+@click.option("--port", type=int, default=None, help="Port to check")
+@click.option("--repo", "repo_dir", default=None, help="Repo directory to check")
+@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to check")
 @click.pass_context
 def claim(ctx, port, repo_dir, gpu_mb):
     """Alias for 'check' (deprecated)."""
@@ -839,9 +925,9 @@ def session_close(session_id: str):
 
 
 @cli.command()
-@click.option("--port", type=int, required=True)
-@click.option("--priority", type=click.IntRange(1, 5), required=True)
-@click.option("--reason", required=True)
+@click.option("--port", type=int, required=True, help="Port to preempt")
+@click.option("--priority", type=click.IntRange(1, 5), required=True, help="Priority of the requesting workload")
+@click.option("--reason", required=True, help="Audit reason for the preemption")
 @click.option("--grace", type=int, default=30, help="Grace period in seconds")
 def preempt(port: int, priority: int, reason: str, grace: int):
     """Preempt a resource from a lower-priority holder."""
@@ -1134,7 +1220,16 @@ def clean():
 @click.pass_context
 def context(ctx):
     """Backward-compatible alias for `fleet guard --json`."""
-    ctx.invoke(guard, port=None, repo_dir=None, gpu_mb=None, session_id=None, as_json=True)
+    ctx.invoke(
+        guard,
+        port=None,
+        repo_dir=None,
+        gpu_mb=None,
+        framework=None,
+        model_hint=None,
+        session_id=None,
+        as_json=True,
+    )
 
 
 @cli.command()
@@ -1290,6 +1385,7 @@ def health(as_json: bool):
     health_config = syshealth.load_health_config(config)
 
     mem = syshealth.get_memory_state()
+    gpu_monitor = discover_mod.load_gpu_monitor_state()
     sessions = syshealth.get_session_processes(
         patterns=health_config["session_patterns"],
     )
@@ -1323,6 +1419,7 @@ def health(as_json: bool):
                 for s in sessions
             ],
             "idle": idle,
+            "gpu_memory_monitor": gpu_monitor,
         }, indent=2))
         return
 
@@ -1379,6 +1476,25 @@ def health(as_json: bool):
             click.echo(f"  PID {p['pid']:>7}  {p['rss_mb']:>6} MB  CPU {p['cpu_pct']:>5.1f}%  {cmd_short}")
     else:
         click.echo("Idle processes: none detected")
+
+    if gpu_monitor:
+        click.echo("")
+        alerts = gpu_monitor.get("alerts", [])
+        footprints = gpu_monitor.get("gpu_process_footprints", [])
+        click.echo(
+            f"GPU memory watch: {len(footprints)} workload(s), {len(alerts)} alert(s)"
+        )
+        for alert in alerts[:5]:
+            if alert["type"] == "pageout_thrashing":
+                click.echo(
+                    f"  Pageout thrashing: {alert['pageout_rate']['pageouts_per_sec']} pageouts/sec"
+                )
+            elif alert["type"] == "process_footprint_overcommit":
+                proc = alert["process"]
+                click.echo(
+                    f"  PID {proc['pid']:>7}  {proc['resident_mb']:>6} MB  "
+                    f"{proc['name']} exceeds {alert['available_mb']} MB available"
+                )
 
     flagged = [s for s in sessions if s.attention]
     if flagged:
@@ -1467,14 +1583,14 @@ def thunder_sync():
 @click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the instance")
 @click.option("--workstream", default="thunder", help="Owning workstream")
 @click.option("--name", default=None, help="Human-readable resource name")
-@click.option("--priority", type=click.IntRange(1, 5), default=3)
+@click.option("--priority", type=click.IntRange(1, 5), default=3, help="Priority 1-5 for arbitration")
 @click.option("--started-by", default=None, help="Human or tool that started the instance")
 @click.option("--owner-tool", default=None, help="Owning tool (e.g. codex, claude)")
 @click.option("--model", default=None, help="Model ID or family")
 @click.option("--endpoint", default=None, help="Primary model endpoint")
 @click.option("--status", default="RUNNING", help="Resource status")
 @click.option("--cleanup-cmd", default=None, help="Cleanup command to remove the instance")
-@click.option("--safe-to-delete/--unsafe-to-delete", default=False)
+@click.option("--safe-to-delete/--unsafe-to-delete", default=False, help="Mark whether the instance is safe to delete automatically")
 def thunder_claim(
     external_id: str,
     session_id: str,
@@ -1661,10 +1777,8 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
     for entry in failed:
         click.echo(f"FAIL: PID {entry['pid']} ({entry['name']}) — {entry.get('reason', 'unknown')}", err=True)
     sys.exit(1 if failed else 0)
-
-
-
 def main():
+    """Run the Fleet Watch CLI entrypoint."""
     cli()
 
 
