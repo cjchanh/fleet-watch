@@ -47,6 +47,53 @@ def test_detect_model_size_none():
     assert gpu_estimator.detect_model_size("--model custom-model") is None
 
 
+# --- Ollama tag alias resolution ---
+
+def test_detect_model_size_gemma4_e4b():
+    assert gpu_estimator.detect_model_size("gemma4:e4b") == "9B"
+
+
+def test_detect_model_size_gemma4_e2b():
+    assert gpu_estimator.detect_model_size("gemma4:e2b") == "9B"
+
+
+def test_detect_model_size_gemma4_latest():
+    assert gpu_estimator.detect_model_size("gemma4:latest") == "9B"
+
+
+def test_detect_model_size_gemma4_26b():
+    assert gpu_estimator.detect_model_size("gemma4:26b") == "26B"
+
+
+def test_detect_model_size_gemma4_31b():
+    assert gpu_estimator.detect_model_size("gemma4:31b") == "32B"
+
+
+def test_ollama_tag_and_explicit_size_produce_same_estimate():
+    """Regression: gemma4:e4b and gemma4-9B-4bit must produce the same working set."""
+    tag_est = gpu_estimator.estimate_working_set(
+        framework="ollama", command="gemma4:e4b",
+        physical_ram_mb=8192, reserve_mb=2048,
+    )
+    explicit_est = gpu_estimator.estimate_working_set(
+        framework="ollama", model_size="9B", quantization="4bit",
+        physical_ram_mb=8192, reserve_mb=2048,
+    )
+    assert tag_est.model_size == explicit_est.model_size == "9B"
+    assert tag_est.total_mb == explicit_est.total_mb
+    assert tag_est.fits == explicit_est.fits
+
+
+def test_gemma4_e4b_does_not_fit_8gb():
+    """Gemma 4 E4B (9B total) should NOT fit on 8 GB with Ollama."""
+    est = gpu_estimator.estimate_working_set(
+        framework="ollama", command="gemma4:e4b",
+        physical_ram_mb=8192, reserve_mb=2048,
+    )
+    assert est.fits is False, f"Expected deny on 8GB, got total={est.total_mb}MB"
+    assert est.total_mb > 6000
+
+
 # --- Quantization detection ---
 
 def test_detect_quant_q4_k_m():

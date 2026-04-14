@@ -41,6 +41,23 @@ MODEL_SPECS: dict[str, tuple[float, int, int]] = {
     "122B": (122.0, 96, 12288),
 }
 
+# Ollama and common model tag aliases that don't follow the NB convention.
+# Maps tag fragments to total parameter sizes (not effective/active params).
+# Gemma 4 E4B is 9B total params with 4B effective (MoE); memory use is 9B.
+# Gemma 4 E2B is 9B total params with 2B effective (PLE); memory use is 9B.
+MODEL_TAG_ALIASES: dict[str, str] = {
+    "e4b": "9B",     # Gemma 4 E4B — 9B total, 4B effective
+    "e2b": "9B",     # Gemma 4 E2B — 9B total, 2B effective
+    "gemma4:e4b": "9B",
+    "gemma4:e2b": "9B",
+    "gemma4:latest": "9B",
+    "gemma4:26b": "26B",
+    "gemma4:31b": "32B",  # Gemma 4 31B maps to 32B spec (closest)
+    "gemma3:4b": "3B",
+    "phi-4": "14B",
+    "phi4": "14B",
+}
+
 # Quantization: bytes per parameter
 QUANT_BYTES: dict[str, float] = {
     "f32": 4.0,
@@ -124,7 +141,19 @@ def detect_framework(command: str) -> str:
 
 
 def detect_model_size(command: str) -> str | None:
-    """Extract model size like '7B' from a command line or model path."""
+    """Extract model size like '7B' from a command line or model path.
+
+    Checks MODEL_TAG_ALIASES first for Ollama-style tags (e4b, e2b, etc.)
+    that don't follow the standard NB convention.
+    """
+    cmd_lower = command.lower()
+
+    # Check tag aliases first (exact and substring match)
+    for tag, size in sorted(MODEL_TAG_ALIASES.items(), key=lambda x: len(x[0]), reverse=True):
+        if tag in cmd_lower:
+            return size
+
+    # Standard NB pattern
     match = re.search(r"(\d+)[Bb]", command)
     if match:
         return f"{match.group(1)}B"
