@@ -3,7 +3,7 @@
 import os
 
 from fleet_watch import cli as cli_module
-from fleet_watch import registry, reporter
+from fleet_watch import registry, reporter, syshealth
 
 
 def _patch_paths(monkeypatch, tmp_path):
@@ -13,6 +13,11 @@ def _patch_paths(monkeypatch, tmp_path):
 
 def test_guard_json_contract_shape(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
+    )
     conn = registry.connect()
     registry.register_process(
         conn,
@@ -49,6 +54,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "available_mb",
         "suggested_max_mb",
         "working_set",
+        "detail",
     }
     assert set(payload["state"].keys()) == {
         "process_count",
