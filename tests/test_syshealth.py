@@ -7,9 +7,9 @@ from fleet_watch import registry, syshealth
 
 
 def test_memory_state_returns_valid_data():
-    """get_memory_state is populated on macOS and unavailable elsewhere."""
+    """get_memory_state is populated when telemetry is supported."""
     mem = syshealth.get_memory_state()
-    if sys.platform == "darwin":
+    if sys.platform in {"darwin", "linux"}:
         assert mem.total_mb > 0
         assert 0 <= mem.pressure_pct <= 100
         assert mem.available_mb >= 0
