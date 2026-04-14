@@ -1,16 +1,23 @@
 """Tests for system health monitoring."""
 
 import json
+import sys
 
 from fleet_watch import registry, syshealth
 
 
 def test_memory_state_returns_valid_data():
-    """get_memory_state returns a populated MemoryState on macOS."""
+    """get_memory_state is populated on macOS and unavailable elsewhere."""
     mem = syshealth.get_memory_state()
-    assert mem.total_mb > 0
-    assert 0 <= mem.pressure_pct <= 100
-    assert mem.available_mb >= 0
+    if sys.platform == "darwin":
+        assert mem.total_mb > 0
+        assert 0 <= mem.pressure_pct <= 100
+        assert mem.available_mb >= 0
+    else:
+        assert mem.total_mb == 0
+        assert not mem.is_available
+        assert mem.pressure_pct == -1
+        assert mem.available_mb == 0
 
 
 def test_memory_state_dict():

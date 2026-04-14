@@ -33,6 +33,28 @@ def test_load_config_writes_default_when_missing(tmp_path, monkeypatch):
     assert config["preferred_ports"]
 
 
+def test_get_process_commands_prefers_wide_ps_output(monkeypatch):
+    class Result:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["ps", "axww", "-o", "pid=", "-o", "args="]:
+            return Result("123 python -u -c long command adversarial_fleet_test server\n")
+        raise AssertionError(f"unexpected fallback invocation: {cmd}")
+
+    monkeypatch.setattr(discover.subprocess, "run", fake_run)
+
+    commands = discover._get_process_commands()
+
+    assert commands == {123: "python -u -c long command adversarial_fleet_test server"}
+    assert calls == [["ps", "axww", "-o", "pid=", "-o", "args="]]
+
+
 def test_sync_reports_skipped_conflict(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = _fresh_conn()
@@ -88,6 +110,7 @@ def test_sync_thunder_auto_sync(tmp_path, monkeypatch):
     )
     # Stub local discovery to return nothing
     monkeypatch.setattr(discover, "discover", lambda config=None: [])
+    monkeypatch.setattr(discover, "_run_gpu_memory_monitor", lambda *args, **kwargs: None)
 
     result = discover.sync(conn)
 
@@ -236,6 +259,7 @@ def test_sync_thunder_empty_clears_stale(tmp_path, monkeypatch):
         lambda *args, **kwargs: FakeResult(),
     )
     monkeypatch.setattr(discover, "discover", lambda config=None: [])
+    monkeypatch.setattr(discover, "_run_gpu_memory_monitor", lambda *args, **kwargs: None)
 
     result = discover.sync(conn)
 

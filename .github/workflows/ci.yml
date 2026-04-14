@@ -60,6 +60,7 @@ jobs:
               "safe_ports",
               "locked_repos",
               "gpu_budget",
+              "external_resources",
           }
 
           state = json.loads((Path(os.environ["HOME"]) / ".fleet-watch" / "state.json").read_text())

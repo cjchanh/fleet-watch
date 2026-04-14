@@ -396,12 +396,6 @@ def test_thunder_sync_and_claim_surface(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     runner = CliRunner()
 
-    class Result:
-        def __init__(self, stdout: str, returncode: int = 0):
-            self.stdout = stdout
-            self.stderr = ""
-            self.returncode = returncode
-
     payload = [
         {
             "id": "1",
@@ -416,11 +410,8 @@ def test_thunder_sync_and_claim_surface(tmp_path, monkeypatch):
         }
     ]
 
-    monkeypatch.setattr(
-        cli_module.subprocess,
-        "run",
-        lambda *args, **kwargs: Result("Fetching instances...\n" + json.dumps(payload)),
-    )
+    monkeypatch.setattr(cli_module, "_load_tnr_instances", lambda: payload)
+    monkeypatch.setattr(cli_module.syshealth, "get_memory_state", lambda: cli_module.syshealth.MemoryState(0, 0, 0, 0, 0, 0))
 
     sync_result = runner.invoke(cli_module.cli, ["thunder", "sync"])
     assert sync_result.exit_code == 0

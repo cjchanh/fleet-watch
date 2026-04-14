@@ -102,8 +102,15 @@ def get_memory_state() -> MemoryState:
 
     Returns zeroed MemoryState on non-macOS or on failure.
     """
-    total_mb = _get_total_memory_mb()
+    try:
+        total_mb = _get_total_memory_mb()
+    except (FileNotFoundError, PermissionError):
+        return MemoryState(0, 0, 0, 0, 0, 0)
+
     if total_mb == 0:
+        linux_state = _get_linux_memory_state()
+        if linux_state is not None:
+            return linux_state
         return MemoryState(0, 0, 0, 0, 0, 0)
 
     pages: dict[str, int] = {}
@@ -141,16 +148,66 @@ def get_memory_state() -> MemoryState:
 
 def _get_total_memory_mb() -> int:
     """Get total physical memory in MB. Returns 0 on failure."""
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if out.returncode == 0:
-            return int(out.stdout.strip()) // (1024 * 1024)
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, ValueError):
-        pass
+    out = subprocess.run(
+        ["sysctl", "-n", "hw.memsize"],
+        capture_output=True, text=True, timeout=3,
+    )
+    if out.returncode == 0:
+        return int(out.stdout.strip()) // (1024 * 1024)
     return 0
+
+
+def _get_linux_memory_state() -> MemoryState | None:
+    """Read Linux memory state from /proc without subprocess calls."""
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        return None
+
+    try:
+        values: dict[str, int] = {}
+        for line in meminfo_path.read_text().splitlines():
+            key, _, rest = line.partition(":")
+            match = re.search(r"(\d+)\s+kB", rest)
+            if match:
+                values[key] = int(match.group(1))
+    except OSError:
+        return None
+
+    total_kb = values.get("MemTotal", 0)
+    if total_kb <= 0:
+        return None
+
+    free_kb = values.get("MemFree", 0)
+    available_kb = values.get("MemAvailable")
+    if available_kb is None:
+        cached_kb = values.get("Cached", 0)
+        buffers_kb = values.get("Buffers", 0)
+        sreclaimable_kb = values.get("SReclaimable", 0)
+        shmem_kb = values.get("Shmem", 0)
+        available_kb = free_kb + buffers_kb + cached_kb + sreclaimable_kb - shmem_kb
+    available_kb = max(0, min(total_kb, available_kb))
+
+    vmstat_values: dict[str, int] = {}
+    vmstat_path = Path("/proc/vmstat")
+    if vmstat_path.exists():
+        try:
+            for line in vmstat_path.read_text().splitlines():
+                key, _, value = line.partition(" ")
+                if key in {"pswpin", "pswpout"}:
+                    vmstat_values[key] = int(value.strip())
+        except OSError:
+            vmstat_values = {}
+
+    return MemoryState(
+        total_mb=total_kb // 1024,
+        active_mb=max((total_kb - available_kb) // 1024, 0),
+        inactive_mb=max((available_kb - free_kb) // 1024, 0),
+        free_mb=free_kb // 1024,
+        compressed_mb=0,
+        wired_mb=0,
+        pageouts=vmstat_values.get("pswpout", 0),
+        swapins=vmstat_values.get("pswpin", 0),
+    )
 
 
 # --- Session discovery ---

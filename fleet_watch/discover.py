@@ -130,13 +130,87 @@ def preferred_ports(config: dict[str, Any] | None = None) -> list[int]:
 
 def _get_listeners() -> dict[int, int]:
     """Return {pid: port} for all TCP listeners."""
+    result = _get_listeners_from_ss()
+    if result:
+        return result
+
+    result = _get_listeners_from_netstat()
+    if result:
+        return result
+
+    return _get_listeners_from_lsof()
+
+
+def _get_listeners_from_ss() -> dict[int, int]:
+    """Fallback TCP listener discovery for platforms where lsof is unavailable."""
+    result: dict[int, int] = {}
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        return result
+    if out.returncode != 0:
+        return result
+
+    for line in out.stdout.splitlines():
+        if "LISTEN" not in line or "pid=" not in line:
+            continue
+        port_match = re.search(r":(\d+)\s", line)
+        pid_match = re.search(r"pid=(\d+)", line)
+        if not port_match or not pid_match:
+            continue
+        pid = int(pid_match.group(1))
+        port = int(port_match.group(1))
+        result.setdefault(pid, port)
+    return result
+
+
+def _get_listeners_from_netstat() -> dict[int, int]:
+    """Parse macOS netstat output into a pid->port mapping."""
+    result: dict[int, int] = {}
+    try:
+        out = subprocess.run(
+            ["netstat", "-anv", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        return result
+    if out.returncode != 0:
+        return result
+
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 11 or parts[0] not in {"tcp4", "tcp6", "tcp46"}:
+            continue
+        if parts[5] != "LISTEN":
+            continue
+        port_match = re.search(r"\.(\d+)$", parts[3])
+        pid_match = re.search(r":(\d+)$", parts[10])
+        if not port_match or not pid_match:
+            continue
+        pid = int(pid_match.group(1))
+        port = int(port_match.group(1))
+        result.setdefault(pid, port)
+    return result
+
+
+def _get_listeners_from_lsof() -> dict[int, int]:
+    """System-wide lsof fallback for platforms without ss/netstat support."""
     result: dict[int, int] = {}
     try:
         out = subprocess.run(
             ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        return result
+    if out.returncode != 0:
         return result
 
     current_pid = None
@@ -145,7 +219,7 @@ def _get_listeners() -> dict[int, int]:
             current_pid = int(line[1:])
         elif line.startswith("n") and current_pid is not None:
             # Parse "n127.0.0.1:8100" or "n*:8100"
-            match = re.search(r":(\d+)$", line)
+            match = re.search(r":(\d+)\b", line)
             if match:
                 port = int(match.group(1))
                 if current_pid not in result:
@@ -155,23 +229,38 @@ def _get_listeners() -> dict[int, int]:
 
 def _get_process_commands() -> dict[int, str]:
     """Return {pid: command} for all running processes."""
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid,command"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return {}
-
+    commands = (
+        ["ps", "axww", "-o", "pid=", "-o", "args="],
+        ["ps", "-eo", "pid,command"],
+    )
     result: dict[int, str] = {}
-    for line in out.stdout.splitlines()[1:]:
-        line = line.strip()
-        parts = line.split(None, 1)
-        if len(parts) == 2:
+
+    for cmd in commands:
+        try:
+            out = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+            continue
+        if out.returncode != 0:
+            continue
+
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
             try:
                 result[int(parts[0])] = parts[1]
             except ValueError:
-                pass
+                continue
+        if result:
+            return result
     return result
 
 
