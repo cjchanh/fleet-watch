@@ -1,3 +1,7 @@
+[![CI](https://github.com/cjchanh/fleet-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/cjchanh/fleet-watch/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/fleet-watch)](https://pypi.org/project/fleet-watch/)
+
 # Fleet Watch
 
 Process governance for AI workloads on a single machine.
