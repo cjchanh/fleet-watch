@@ -18,7 +18,14 @@ Fleet Watch prevents these collisions by maintaining a shared registry of what's
 pipx install fleet-watch
 ```
 
-Or from source:
+Verify it works:
+
+```bash
+fleet --version
+fleet status
+```
+
+Or install from source:
 
 ```bash
 pipx install ~/path/to/fleet-watch/
@@ -308,6 +315,16 @@ States: `live` > `disconnected` > `stale_candidate` > `orphan_confirmed` > `exit
 2. **One honest verb per action.** `guard` decides, `check` probes, `discover` observes.
 3. **Single machine.** No distributed consensus. SQLite is sufficient.
 4. **Observe first.** Default to alerting, not killing.
+
+## Platform Support
+
+| Platform | Auto-discovery | GPU estimation | Manual registration |
+|----------|---------------|----------------|-------------------|
+| macOS (Apple Silicon) | Full | Full | Full |
+| macOS (Intel) | Full | Partial | Full |
+| Linux | Memory/health only | Full | Full |
+
+Auto-discovery uses `lsof` for port scanning and `ps` for process matching. On Linux, process discovery works but port-to-PID mapping may require `ss` (not yet integrated). Use `fleet register` for explicit registration on any platform.
 
 ## Limitations
 

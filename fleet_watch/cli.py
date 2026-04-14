@@ -461,6 +461,7 @@ def _render_launchd_plist(executable: str, interval: int) -> str:
 
 
 @click.group()
+@click.version_option(package_name="fleet-watch")
 def cli():
     """Fleet Watch — Process governance for AI workloads."""
     pass
