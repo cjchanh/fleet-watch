@@ -1,7 +1,7 @@
 """System health — RAM pressure, session inventory, idle detection.
 
-All detection patterns are config-driven via ~/.fleet-watch/config.json.
-No product names, tool names, or install paths are hardcoded.
+Built-in default patterns exist for common local tools and are user-overridable
+via ~/.fleet-watch/config.json.
 """
 
 from __future__ import annotations
