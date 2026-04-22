@@ -37,7 +37,7 @@ Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, Cand
 
 **You don't register anything manually.** Run `fleet discover` or let the launchd agent do it every 60 seconds.
 
-**GPU memory guard** estimates total working set (weights + KV cache + activations + framework overhead) and compares it against physical RAM. A Candle-based 7B model with Q4_K_M quantization needs ~10 GB of working set due to buffer pool overhead — Fleet Watch catches that on an 8 GB machine before you start the process.
+**GPU memory guard** estimates total working set (weights + KV cache + activations + framework overhead) and compares it against physical RAM. A Candle-based 7B model with Q4_K_M quantization is estimated at about 7 GB under Fleet Watch's default estimator assumptions.
 
 ## Quick Start
 
@@ -324,13 +324,13 @@ States: `live` > `disconnected` > `stale_candidate` > `orphan_confirmed` > `exit
 | macOS (Intel) | Full | Partial | Full |
 | Linux | Memory/health only | Full | Full |
 
-Auto-discovery uses `lsof` for port scanning and `ps` for process matching. On Linux, process discovery works but port-to-PID mapping may require `ss` (not yet integrated). Use `fleet register` for explicit registration on any platform.
+Auto-discovery uses `ps` for process matching. On Linux, listener-to-PID mapping uses `ss` when available, then falls back to `netstat` and `lsof`. Use `fleet register` for explicit registration on any platform.
 
 ## Limitations
 
 - Discovery is heuristic and pattern-based. Unknown workloads are invisible until registered.
 - GPU working set estimation uses architecture tables and framework multipliers, not kernel-level Metal accounting.
-- Auto-discovery uses macOS `lsof`. On Linux, use manual registration via `fleet register`.
+- Auto-discovery is heuristic and uses `ps` plus platform listener probes such as `ss`, `netstat`, or `lsof`. Use `fleet register` when explicit claims are more reliable than discovery.
 - Fleet Watch is advisory for human use. For AI agent sessions, a PreToolUse hook can make it fail-closed.
 - Single-machine by design. No distributed coordination.
 
