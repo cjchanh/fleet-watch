@@ -127,6 +127,7 @@ Top-level keys:
 `checks.repo` contains:
 
 - `allowed`, `reason`, `holder`
+- `unblock_command` when denied by a process or session holder Fleet can name directly
 
 `checks.gpu` contains:
 
@@ -206,6 +207,7 @@ Top-level keys:
 | `fleet session heartbeat` | Refresh session lease heartbeat |
 | `fleet session ensure` | Idempotent session management with retry |
 | `fleet session close` | Close a session lease |
+| `fleet share-repo PATH` | Close active session leases for a `~/Documents/*` editorial handoff |
 
 ### Process Management
 

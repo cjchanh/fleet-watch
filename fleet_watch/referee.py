@@ -148,7 +148,7 @@ def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
     """Reduce a holder record to the stable public JSON contract shape."""
     if holder is None:
         return None
-    return {
+    summary = {
         "pid": holder.get("pid"),
         "name": holder["name"],
         "workstream": holder["workstream"],
@@ -157,6 +157,10 @@ def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
         "repo_dir": holder["repo_dir"],
         "gpu_mb": holder["gpu_mb"],
     }
+    for key in ("session_id", "provider", "external_id", "resource_type"):
+        if key in holder:
+            summary[key] = holder.get(key)
+    return summary
 
 
 def suggest_ports(

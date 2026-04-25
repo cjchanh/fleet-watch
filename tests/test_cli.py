@@ -104,6 +104,97 @@ def test_session_start_and_close_updates_lease(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_guard_repo_denied_by_session_lease_includes_unblock_command(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-editor",
+        owner_pid=None,
+        repo_dir=str(repo),
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--repo", str(repo), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is False
+    assert repo_check["holder"]["session_id"] == "sess-editor"
+    assert repo_check["unblock_command"] == "fleet session close --session-id sess-editor"
+
+
+def test_share_repo_closes_documents_session_lease_and_logs_event(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    docs_root = tmp_path / "Documents"
+    repo = docs_root / "Substack"
+    repo.mkdir(parents=True)
+    monkeypatch.setattr(cli_module, "_documents_root", lambda: docs_root.resolve())
+
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-editor",
+        owner_pid=None,
+        repo_dir=str(repo),
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["share-repo", str(repo)])
+
+    assert result.exit_code == 0
+    assert "Released session lease sess-editor" in result.output
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-editor")
+    session_close_events = cli_module.events.get_events(conn, hours=1, event_type="SESSION_CLOSE")
+    conn.close()
+
+    assert lease is not None
+    assert lease["status"] == "CLOSED"
+    assert session_close_events
+    assert session_close_events[0]["detail"]["source"] == "share-repo"
+
+    guard = runner.invoke(cli_module.cli, ["guard", "--repo", str(repo), "--json"])
+    assert guard.exit_code == 0
+    payload = json.loads(guard.output)
+    assert payload["allowed"] is True
+
+
+def test_share_repo_rejects_non_documents_paths(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    docs_root = tmp_path / "Documents"
+    repo = tmp_path / "Workspace" / "active" / "engineering"
+    repo.mkdir(parents=True)
+    monkeypatch.setattr(cli_module, "_documents_root", lambda: docs_root.resolve())
+
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-engineering",
+        owner_pid=None,
+        repo_dir=str(repo),
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["share-repo", str(repo)])
+
+    assert result.exit_code == 2
+    assert "share-repo is limited" in result.output
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-engineering")
+    conn.close()
+    assert lease is not None
+    assert lease["status"] == "ACTIVE"
+
+
 def test_reconcile_json_reports_process_classification(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()

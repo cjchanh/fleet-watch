@@ -44,6 +44,28 @@ def _holder_conflict_text(holder: dict[str, Any] | None) -> str:
     return holder["name"]
 
 
+def _documents_root() -> Path:
+    return (Path.home() / "Documents").resolve()
+
+
+def _is_documents_path(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_documents_root())
+    except ValueError:
+        return False
+    return True
+
+
+def _repo_unblock_command(holder: dict[str, Any] | None) -> str | None:
+    if holder is None:
+        return None
+    if holder.get("workstream") == "session" and holder.get("session_id"):
+        return f"fleet session close --session-id {holder['session_id']}"
+    if holder.get("pid") is not None:
+        return f"fleet release --pid {holder['pid']}"
+    return None
+
+
 def _resolved_session_id(session_id: str | None) -> str | None:
     if session_id:
         return session_id
@@ -257,11 +279,15 @@ def _build_guard_payload(
             repo_dir,
             current_session_id=current_session_id,
         )
-        payload["checks"]["repo"] = {
+        repo_check = {
             "allowed": decision.allowed,
             "reason": decision.reason,
             "holder": referee.summarize_holder(decision.holder),
         }
+        unblock_command = _repo_unblock_command(decision.holder)
+        if not decision.allowed and unblock_command:
+            repo_check["unblock_command"] = unblock_command
+        payload["checks"]["repo"] = repo_check
         payload["allowed"] = payload["allowed"] and decision.allowed
 
     if gpu_mb is not None:
@@ -331,6 +357,8 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
             lines.append(f"Repo {repo_dir}: available")
         else:
             lines.append(f"Repo {repo_dir}: locked by {_holder_text(repo_check['holder'])}")
+            if repo_check.get("unblock_command"):
+                lines.append(f"Unblock: {repo_check['unblock_command']}")
 
     if "gpu" in checks:
         gpu_check = checks["gpu"]
@@ -744,6 +772,52 @@ def release(pid: int | None, port: int | None):
             sys.exit(2)
 
     conn.close()
+
+
+@cli.command("share-repo")
+@click.argument("repo_dir")
+def share_repo(repo_dir: str):
+    """Close active editorial session leases for a Documents path."""
+    resolved_repo = Path(repo_dir).expanduser().resolve()
+    if not _is_documents_path(resolved_repo):
+        click.echo(
+            f"DENY: share-repo is limited to {_documents_root()} paths",
+            err=True,
+        )
+        sys.exit(2)
+
+    conn = _get_conn()
+    leases = registry.get_active_session_leases_by_repo(conn, str(resolved_repo))
+    if not leases:
+        click.echo(f"No active session lease found for {resolved_repo}", err=True)
+        conn.close()
+        sys.exit(1)
+
+    released: list[dict[str, Any]] = []
+    for lease in leases:
+        if registry.close_session_lease(conn, lease["session_id"]):
+            events.log_event(
+                conn,
+                "SESSION_CLOSE",
+                pid=lease.get("owner_pid"),
+                workstream="session",
+                detail={
+                    "session_id": lease["session_id"],
+                    "repo_dir": str(resolved_repo),
+                    "source": "share-repo",
+                },
+            )
+            released.append(lease)
+
+    if not released:
+        click.echo(f"No active session lease found for {resolved_repo}", err=True)
+        conn.close()
+        sys.exit(1)
+
+    reporter.write_report(conn)
+    conn.close()
+    for lease in released:
+        click.echo(f"Released session lease {lease['session_id']} for {resolved_repo}")
 
 
 @cli.command()
