@@ -74,7 +74,7 @@ def test_repo_allowed_for_current_external_owner_session():
     assert d.allowed is True
 
 
-def test_repo_denied_by_active_session_lease():
+def test_repo_allows_active_cooperative_session_lease():
     conn = _fresh_conn()
     registry.upsert_session_lease(
         conn,
@@ -83,9 +83,66 @@ def test_repo_denied_by_active_session_lease():
         repo_dir="/tmp/test-repo",
     )
     d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+    assert d.allowed is True
+    assert d.holders[0]["session_id"] == "sess-other"
+    assert d.safe_mode == "declare --write-scope before editing"
+
+
+def test_repo_denied_by_exclusive_session_lease():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-exclusive",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+        repo_lock_mode="exclusive",
+    )
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
     assert d.allowed is False
     assert d.holder is not None
-    assert d.holder["session_id"] == "sess-other"
+    assert d.holder["session_id"] == "sess-exclusive"
+    assert d.holder["repo_lock_mode"] == "exclusive"
+
+
+def test_repo_denied_by_overlapping_write_scope():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-tools",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+        write_scopes=["tools/playwright"],
+    )
+    d = referee.check_repo_with_session(
+        conn,
+        "/tmp/test-repo",
+        current_session_id="sess-mine",
+        write_scopes=["tools/playwright/edit_post.py"],
+    )
+    assert d.allowed is False
+    assert d.holder is not None
+    assert d.holder["session_id"] == "sess-tools"
+    assert any(path.endswith("tools/playwright") for path in d.overlap_paths)
+
+
+def test_repo_allows_disjoint_write_scope():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-docs",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+        write_scopes=["docs"],
+    )
+    d = referee.check_repo_with_session(
+        conn,
+        "/tmp/test-repo",
+        current_session_id="sess-mine",
+        write_scopes=["tools/playwright"],
+    )
+    assert d.allowed is True
+    assert d.holders[0]["session_id"] == "sess-docs"
+    assert d.safe_mode == "cooperative-write"
 
 
 def test_repo_allowed_for_current_session_lease():
@@ -101,8 +158,8 @@ def test_repo_allowed_for_current_session_lease():
     assert "owned by current session" in d.reason
 
 
-def test_repo_denied_by_session_lease_with_dead_owner_but_fresh_heartbeat(monkeypatch):
-    """A lease whose owner PID is dead but heartbeat is fresh still blocks."""
+def test_repo_allows_cooperative_lease_with_dead_owner_but_fresh_heartbeat(monkeypatch):
+    """A fresh cooperative lease with a dead owner is advisory, not an exclusive block."""
     conn = _fresh_conn()
     monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
     registry.upsert_session_lease(
@@ -112,9 +169,8 @@ def test_repo_denied_by_session_lease_with_dead_owner_but_fresh_heartbeat(monkey
         repo_dir="/tmp/test-repo",
     )
     d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
-    assert d.allowed is False
-    assert d.holder is not None
-    assert d.holder["session_id"] == "sess-dead-owner"
+    assert d.allowed is True
+    assert d.holders[0]["session_id"] == "sess-dead-owner"
     lease = registry.get_session_lease(conn, "sess-dead-owner")
     assert lease["status"] == "ACTIVE"
 
@@ -132,6 +188,25 @@ def test_repo_allowed_when_owner_dead_and_heartbeat_stale(monkeypatch):
     )
     d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
     assert d.allowed is True
+    assert d.stale_holders[0]["session_id"] == "sess-dead-stale"
+
+
+def test_repo_cleans_ownerless_stale_session_lease(monkeypatch):
+    conn = _fresh_conn()
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+    registry.upsert_session_lease(
+        conn,
+        "sess-ownerless-stale",
+        owner_pid=None,
+        repo_dir="/tmp/test-repo",
+    )
+
+    d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
+
+    assert d.allowed is True
+    assert d.stale_holders[0]["session_id"] == "sess-ownerless-stale"
+    lease = registry.get_session_lease(conn, "sess-ownerless-stale")
+    assert lease["status"] == "CLOSED"
 
 
 def test_repo_allowed_for_current_local_owner_session():

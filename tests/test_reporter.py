@@ -50,13 +50,26 @@ def test_build_state_with_process():
     assert len(state["external_resources"]) == 1
 
 
-def test_build_guard_state_includes_active_session_repo_lock():
+def test_build_guard_state_excludes_cooperative_session_repo():
     conn = _fresh_conn()
     registry.upsert_session_lease(
         conn,
         "sess-1",
         owner_pid=os.getpid(),
         repo_dir="/tmp/fleet-watch",
+    )
+    state = reporter.build_guard_state(conn)
+    assert str(Path("/tmp/fleet-watch").resolve()) not in state["repos_locked"]
+
+
+def test_build_guard_state_includes_exclusive_session_repo_lock():
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "sess-1",
+        owner_pid=os.getpid(),
+        repo_dir="/tmp/fleet-watch",
+        repo_lock_mode="exclusive",
     )
     state = reporter.build_guard_state(conn)
     assert state["repos_locked"][str(Path("/tmp/fleet-watch").resolve())] == os.getpid()

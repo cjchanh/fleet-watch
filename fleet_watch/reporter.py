@@ -224,8 +224,11 @@ def generate_markdown(state: dict[str, Any]) -> str:
                 owner_pid = lease["owner_pid"] if lease["owner_pid"] is not None else "-"
                 owner_tty = lease["owner_tty"] or "-"
                 repo = lease["repo_dir"] or "-"
+                lock_mode = lease.get("repo_lock_mode", "cooperative")
+                scope_count = len(lease.get("write_scopes", []))
                 lines.append(
-                    f"**{sid}** — {lease['status']} | owner PID {owner_pid} | tty {owner_tty} | repo {repo}"
+                    f"**{sid}** — {lease['status']} | owner PID {owner_pid} | tty {owner_tty} | "
+                    f"repo {repo} | lock {lock_mode} | scopes {scope_count}"
                 )
             else:
                 lines.append(f"**{sid}** — UNLEASED")

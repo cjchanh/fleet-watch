@@ -225,6 +225,8 @@ def _build_guard_payload(
     conn,
     port: int | None = None,
     repo_dir: str | None = None,
+    write_scopes: tuple[str, ...] | list[str] | None = None,
+    exclusive_repo_lock: bool = False,
     gpu_mb: int | None = None,
     framework: str | None = None,
     model_hint: str | None = None,
@@ -233,11 +235,14 @@ def _build_guard_payload(
 ) -> dict[str, Any]:
     state = reporter.build_guard_state(conn)
     budget = state["gpu_budget"]
+    normalized_write_scopes = referee.normalize_write_scopes(repo_dir, write_scopes)
     payload: dict[str, Any] = {
         "allowed": True,
         "request": {
             "port": port,
             "repo_dir": str(Path(repo_dir).resolve()) if repo_dir else None,
+            "write_scopes": normalized_write_scopes,
+            "exclusive_repo_lock": exclusive_repo_lock,
             "gpu_mb": gpu_mb,
             "framework": framework,
             "model": model_hint,
@@ -278,11 +283,17 @@ def _build_guard_payload(
             conn,
             repo_dir,
             current_session_id=current_session_id,
+            write_scopes=normalized_write_scopes,
+            exclusive=exclusive_repo_lock,
         )
         repo_check = {
             "allowed": decision.allowed,
             "reason": decision.reason,
             "holder": referee.summarize_holder(decision.holder),
+            "holders": [referee.summarize_holder(holder) for holder in decision.holders],
+            "overlap_paths": decision.overlap_paths,
+            "stale_holders": [referee.summarize_holder(holder) for holder in decision.stale_holders],
+            "safe_mode": decision.safe_mode,
         }
         unblock_command = _repo_unblock_command(decision.holder)
         if not decision.allowed and unblock_command:
@@ -354,9 +365,17 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
         repo_dir = payload["request"]["repo_dir"]
         repo_check = checks["repo"]
         if repo_check["allowed"]:
-            lines.append(f"Repo {repo_dir}: available")
+            lines.append(f"Repo {repo_dir}: {repo_check['reason']}")
+            if repo_check.get("safe_mode"):
+                lines.append(f"Safe mode: {repo_check['safe_mode']}")
+            holders = repo_check.get("holders", [])
+            if holders:
+                lines.append(f"Active cooperative sessions: {len(holders)}")
         else:
-            lines.append(f"Repo {repo_dir}: locked by {_holder_text(repo_check['holder'])}")
+            lines.append(f"Repo {repo_dir}: {repo_check['reason']} by {_holder_text(repo_check['holder'])}")
+            overlaps = repo_check.get("overlap_paths", [])
+            if overlaps:
+                lines.append("Overlaps: " + ", ".join(overlaps))
             if repo_check.get("unblock_command"):
                 lines.append(f"Unblock: {repo_check['unblock_command']}")
 
@@ -605,12 +624,24 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
 @cli.command()
 @click.option("--port", type=int, default=None, help="Port to check")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to check")
+@click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this command may edit")
+@click.option("--exclusive-repo-lock", is_flag=True, help="Require exclusive repo ownership")
 @click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to check")
 @click.option("--session-id", default=None, help="Current session ID for owned-resource bypass")
-def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id: str | None):
+def check(
+    port: int | None,
+    repo_dir: str | None,
+    write_scopes: tuple[str, ...],
+    exclusive_repo_lock: bool,
+    gpu_mb: int | None,
+    session_id: str | None,
+):
     """Check if a resource is available. Exit 0=available, 1=taken."""
     if port is None and repo_dir is None and gpu_mb is None:
         click.echo("Specify --port, --repo, or --gpu", err=True)
+        sys.exit(2)
+    if write_scopes and repo_dir is None:
+        click.echo("--write-scope requires --repo", err=True)
         sys.exit(2)
 
     current_session_id = _resolved_session_id(session_id)
@@ -630,9 +661,11 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
             conn,
             repo_dir,
             current_session_id=current_session_id,
+            write_scopes=write_scopes,
+            exclusive=exclusive_repo_lock,
         )
         if decision.allowed:
-            click.echo(f"Repo {repo_dir}: available")
+            click.echo(f"Repo {repo_dir}: {decision.reason}")
         else:
             click.echo(f"Repo {repo_dir}: LOCKED by {_holder_conflict_text(decision.holder)}", err=True)
             failed = True
@@ -652,6 +685,8 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
 @cli.command()
 @click.option("--port", type=int, default=None, help="Port to guard")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to guard")
+@click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this command may edit")
+@click.option("--exclusive-repo-lock", is_flag=True, help="Require exclusive repo ownership")
 @click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to guard")
 @click.option("--framework", default=None, help="Inference framework (candle, mlx, ollama, vllm)")
 @click.option("--model", "model_hint", default=None, help="Model name/path for working set estimation")
@@ -660,6 +695,8 @@ def check(port: int | None, repo_dir: str | None, gpu_mb: int | None, session_id
 def guard(
     port: int | None,
     repo_dir: str | None,
+    write_scopes: tuple[str, ...],
+    exclusive_repo_lock: bool,
     gpu_mb: int | None,
     framework: str | None,
     model_hint: str | None,
@@ -667,6 +704,8 @@ def guard(
     as_json: bool,
 ):
     """Canonical pre-flight interface for agents and operators."""
+    if write_scopes and repo_dir is None:
+        raise click.UsageError("--write-scope requires --repo")
     current_session_id = _resolved_session_id(session_id)
     conn = _get_conn()
     for cleaned in registry.clean_dead_pids(conn):
@@ -682,6 +721,8 @@ def guard(
         conn,
         port=port,
         repo_dir=repo_dir,
+        write_scopes=write_scopes,
+        exclusive_repo_lock=exclusive_repo_lock,
         gpu_mb=gpu_mb,
         framework=framework,
         model_hint=model_hint,
@@ -735,7 +776,15 @@ def guard(
 @click.pass_context
 def claim(ctx, port, repo_dir, gpu_mb):
     """Alias for 'check' (deprecated)."""
-    ctx.invoke(check, port=port, repo_dir=repo_dir, gpu_mb=gpu_mb, session_id=None)
+    ctx.invoke(
+        check,
+        port=port,
+        repo_dir=repo_dir,
+        write_scopes=(),
+        exclusive_repo_lock=False,
+        gpu_mb=gpu_mb,
+        session_id=None,
+    )
 
 
 @cli.command()
@@ -845,13 +894,25 @@ def session():
 @click.option("--session-id", required=True, help="Session identifier")
 @click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
-def session_start(session_id: str, owner_pid: int | None, repo_dir: str | None):
+@click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this session may edit")
+@click.option("--exclusive-repo-lock", is_flag=True, help="Make this session an exclusive repo holder")
+def session_start(
+    session_id: str,
+    owner_pid: int | None,
+    repo_dir: str | None,
+    write_scopes: tuple[str, ...],
+    exclusive_repo_lock: bool,
+):
     """Open or refresh a session lease."""
+    if write_scopes and repo_dir is None:
+        raise click.UsageError("--write-scope requires --repo")
     conn = _get_conn()
     failures = referee.preflight_register(
         conn,
         repo_dir=repo_dir,
         current_session_id=session_id,
+        write_scopes=write_scopes,
+        exclusive_repo_lock=exclusive_repo_lock,
     )
     if failures:
         for failure in failures:
@@ -865,12 +926,19 @@ def session_start(session_id: str, owner_pid: int | None, repo_dir: str | None):
         session_id,
         owner_pid=resolved_owner_pid,
         repo_dir=repo_dir,
+        repo_lock_mode="exclusive" if exclusive_repo_lock else "cooperative",
+        write_scopes=write_scopes,
     )
     events.log_event(
         conn,
         "SESSION_START",
         pid=resolved_owner_pid,
-        detail={"session_id": session_id, "repo_dir": repo_dir},
+        detail={
+            "session_id": session_id,
+            "repo_dir": repo_dir,
+            "repo_lock_mode": "exclusive" if exclusive_repo_lock else "cooperative",
+            "write_scopes": list(write_scopes),
+        },
     )
     reporter.write_report(conn)
     click.echo(f"Session {session_id} active (owner PID {resolved_owner_pid})")
@@ -881,8 +949,18 @@ def session_start(session_id: str, owner_pid: int | None, repo_dir: str | None):
 @click.option("--session-id", required=True, help="Session identifier")
 @click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
-def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | None):
+@click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this session may edit")
+@click.option("--exclusive-repo-lock", is_flag=True, help="Make this session an exclusive repo holder")
+def session_heartbeat(
+    session_id: str,
+    owner_pid: int | None,
+    repo_dir: str | None,
+    write_scopes: tuple[str, ...],
+    exclusive_repo_lock: bool,
+):
     """Refresh a session lease heartbeat."""
+    if write_scopes and repo_dir is None:
+        raise click.UsageError("--write-scope requires --repo")
     conn = _get_conn()
     resolved_owner_pid = owner_pid or _default_owner_pid()
     ok = registry.heartbeat_session_lease(
@@ -890,6 +968,8 @@ def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | No
         session_id,
         owner_pid=resolved_owner_pid,
         repo_dir=repo_dir,
+        repo_lock_mode="exclusive" if exclusive_repo_lock else None,
+        write_scopes=write_scopes if write_scopes else None,
     )
     if not ok:
         click.echo(f"Session {session_id} not found", err=True)
@@ -899,7 +979,12 @@ def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | No
         conn,
         "SESSION_HEARTBEAT",
         pid=resolved_owner_pid,
-        detail={"session_id": session_id, "repo_dir": repo_dir},
+        detail={
+            "session_id": session_id,
+            "repo_dir": repo_dir,
+            "repo_lock_mode": "exclusive" if exclusive_repo_lock else None,
+            "write_scopes": list(write_scopes),
+        },
     )
     reporter.write_report(conn)
     click.echo(f"Session heartbeat updated for {session_id}")
@@ -910,12 +995,16 @@ def session_heartbeat(session_id: str, owner_pid: int | None, repo_dir: str | No
 @click.option("--session-id", required=True, help="Session identifier")
 @click.option("--owner-pid", type=int, default=None, help="Owning shell/launcher PID")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory associated with the session")
+@click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this session may edit")
+@click.option("--exclusive-repo-lock", is_flag=True, help="Make this session an exclusive repo holder")
 @click.option("--retries", type=int, default=3, help="Max retry attempts on transient failure")
 @click.option("--retry-delay", type=float, default=2.0, help="Seconds between retries")
 def session_ensure(
     session_id: str,
     owner_pid: int | None,
     repo_dir: str | None,
+    write_scopes: tuple[str, ...],
+    exclusive_repo_lock: bool,
     retries: int,
     retry_delay: float,
 ):
@@ -924,6 +1013,8 @@ def session_ensure(
     Fail-open: on final failure, exits 0 with a stderr warning so the
     calling process (e.g. Codex bootstrap) is never blocked.
     """
+    if write_scopes and repo_dir is None:
+        raise click.UsageError("--write-scope requires --repo")
     resolved_owner_pid = owner_pid or _default_owner_pid()
     last_err: Exception | None = None
 
@@ -935,6 +1026,8 @@ def session_ensure(
                 conn,
                 repo_dir=repo_dir,
                 current_session_id=session_id,
+                write_scopes=write_scopes,
+                exclusive_repo_lock=exclusive_repo_lock,
             )
             if failures:
                 for failure in failures:
@@ -947,12 +1040,20 @@ def session_ensure(
                 session_id,
                 owner_pid=resolved_owner_pid,
                 repo_dir=repo_dir,
+                repo_lock_mode="exclusive" if exclusive_repo_lock else None,
+                write_scopes=write_scopes if write_scopes else None,
             )
             events.log_event(
                 conn,
                 "SESSION_START",
                 pid=resolved_owner_pid,
-                detail={"session_id": session_id, "repo_dir": repo_dir, "source": "ensure"},
+                detail={
+                    "session_id": session_id,
+                    "repo_dir": repo_dir,
+                    "source": "ensure",
+                    "repo_lock_mode": "exclusive" if exclusive_repo_lock else "cooperative",
+                    "write_scopes": list(write_scopes),
+                },
             )
             reporter.write_report(conn)
             conn.close()

@@ -33,7 +33,7 @@ pipx install ~/path/to/fleet-watch/
 
 ## How It Works
 
-Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, Candle/Cake, etc.) by scanning `lsof` and `ps`. It registers them in a local SQLite database with their port claims, GPU memory estimates, and repo locks. Any tool — human or AI — can call `fleet guard --json` before taking resource actions.
+Fleet Watch auto-discovers running AI processes (MLX servers, Ollama, vLLM, Candle/Cake, etc.) by scanning `lsof` and `ps`. It registers them in a local SQLite database with their port claims, GPU memory estimates, and repo/session ownership. Any tool — human or AI — can call `fleet guard --json` before taking resource actions.
 
 **You don't register anything manually.** Run `fleet discover` or let the launchd agent do it every 60 seconds.
 
@@ -51,8 +51,11 @@ fleet discover
 # Pre-flight: will this model fit?
 fleet guard --gpu 4096 --framework candle --model "qwen2.5-7B-Q4_K_M" --json
 
-# Check port and repo availability
+# Check port and cooperative repo availability
 fleet guard --port 8899 --repo ~/projects/my-app --json
+
+# Check same-repo write intent before editing concrete paths
+fleet guard --repo ~/projects/my-app --write-scope tools/playwright --json
 
 # System health: memory pressure, sessions, GPU memory watch
 fleet health
@@ -99,7 +102,7 @@ Fleet Watch will auto-discover processes and monitor GPU memory pressure every 6
 
 Add this to your AI tool's system prompt or config:
 
-> Before binding a port, starting a model server, or writing to a repo: run `fleet guard --json` with the relevant `--port`, `--repo`, `--gpu`, `--framework`, and `--model` flags. If `"allowed": false`, do not proceed. Use `~/.fleet-watch/state.json` only as a fallback artifact when the CLI is unavailable.
+> Before binding a port, starting a model server, or writing to a repo: run `fleet guard --json` with the relevant `--port`, `--repo`, `--write-scope`, `--gpu`, `--framework`, and `--model` flags. If `"allowed": false`, do not proceed. A plain `--repo` check is cooperative and reports active sessions; use `--write-scope` for concrete edit intent and `--exclusive-repo-lock` only for operations that require sole ownership. Use `~/.fleet-watch/state.json` only as a fallback artifact when the CLI is unavailable.
 
 ## JSON Contract
 
@@ -116,6 +119,8 @@ Top-level keys:
 
 - `port` — requested port or `null`
 - `repo_dir` — absolute repo path or `null`
+- `write_scopes` — absolute paths this command may edit
+- `exclusive_repo_lock` — whether the caller requested sole repo ownership
 - `gpu_mb` — requested GPU claim or `null`
 - `framework` — inference framework hint or `null`
 - `model` — model name/path hint or `null`
@@ -127,6 +132,10 @@ Top-level keys:
 `checks.repo` contains:
 
 - `allowed`, `reason`, `holder`
+- `holders` — advisory cooperative session holders for allowed same-repo work
+- `overlap_paths` — paths that caused a write-scope denial
+- `stale_holders` — dead/stale session leases cleaned during the check
+- `safe_mode` — suggested operating mode such as `cooperative-write`
 - `unblock_command` when denied by a process or session holder Fleet can name directly
 
 `checks.gpu` contains:
@@ -182,6 +191,7 @@ Top-level keys:
 | `fleet status --json` | Machine-readable process and budget state |
 | `fleet guard --json` | Canonical pre-flight contract for agents |
 | `fleet guard --gpu MB --framework FW --model MODEL` | Working set estimation + allow/deny |
+| `fleet guard --repo PATH --write-scope RELPATH --json` | Cooperative same-repo write-scope check |
 | `fleet check --port N --repo PATH --gpu MB` | Honest availability probe (exit 0/1) |
 | `fleet discover` | Scan and register running AI processes |
 | `fleet report` | Write STATE_REPORT.md + state.json |
@@ -302,6 +312,8 @@ print(f"Chain valid: {valid}, events: {count}")
 ## Ownership Model
 
 Fleet Watch uses **session leases** to track who owns what. Process classification requires three independent signals before marking a process as safe to reap:
+
+Repo session leases are cooperative by default. `fleet guard --repo PATH --json` reports active sessions but does not deny solely because another session is in the same repo. Add `--write-scope RELPATH` when a command may edit files; Fleet denies only when another cooperative session has an overlapping declared scope. Use `--exclusive-repo-lock` for destructive git operations, whole-repo rewrites, or other work that truly requires sole repo ownership.
 
 1. **Heartbeat expired** — not seen by discovery in >180 seconds
 2. **Session lease missing or closed** — no active owner

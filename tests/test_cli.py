@@ -104,7 +104,39 @@ def test_session_start_and_close_updates_lease(tmp_path, monkeypatch):
     conn.close()
 
 
-def test_guard_repo_denied_by_session_lease_includes_unblock_command(tmp_path, monkeypatch):
+def test_session_start_records_write_scope(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runner = CliRunner()
+
+    start = runner.invoke(
+        cli_module.cli,
+        [
+            "session",
+            "start",
+            "--session-id",
+            "sess-scope",
+            "--owner-pid",
+            str(os.getpid()),
+            "--repo",
+            str(repo),
+            "--write-scope",
+            "tools/playwright",
+        ],
+    )
+    assert start.exit_code == 0
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-scope")
+    conn.close()
+
+    assert lease is not None
+    assert lease["repo_lock_mode"] == "cooperative"
+    assert lease["write_scopes"] == [str((repo / "tools/playwright").resolve())]
+
+
+def test_guard_repo_allows_cooperative_session_lease_and_reports_holder(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -120,12 +152,95 @@ def test_guard_repo_denied_by_session_lease_includes_unblock_command(tmp_path, m
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["guard", "--repo", str(repo), "--json"])
 
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is True
+    assert repo_check["holder"] is None
+    assert repo_check["holders"][0]["session_id"] == "sess-editor"
+    assert repo_check["safe_mode"] == "declare --write-scope before editing"
+
+
+def test_guard_repo_denied_by_exclusive_session_lease_includes_unblock_command(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-editor",
+        owner_pid=None,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--repo", str(repo), "--json"])
+
     assert result.exit_code == 1
     payload = json.loads(result.output)
     repo_check = payload["checks"]["repo"]
     assert repo_check["allowed"] is False
     assert repo_check["holder"]["session_id"] == "sess-editor"
+    assert repo_check["holder"]["repo_lock_mode"] == "exclusive"
     assert repo_check["unblock_command"] == "fleet session close --session-id sess-editor"
+
+
+def test_guard_repo_denies_overlapping_write_scope(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-tools",
+        owner_pid=None,
+        repo_dir=str(repo),
+        write_scopes=["tools/playwright"],
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        ["guard", "--repo", str(repo), "--write-scope", "tools/playwright/edit_post.py", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is False
+    assert repo_check["holder"]["session_id"] == "sess-tools"
+    assert any(path.endswith("tools/playwright") for path in repo_check["overlap_paths"])
+
+
+def test_guard_repo_allows_disjoint_write_scope(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-docs",
+        owner_pid=None,
+        repo_dir=str(repo),
+        write_scopes=["docs"],
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        ["guard", "--repo", str(repo), "--write-scope", "tools/playwright", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is True
+    assert repo_check["holders"][0]["session_id"] == "sess-docs"
+    assert repo_check["safe_mode"] == "cooperative-write"
 
 
 def test_share_repo_closes_documents_session_lease_and_logs_event(tmp_path, monkeypatch):
@@ -538,7 +653,7 @@ def test_reap_sessions_confirm_kills_member_pids(tmp_path, monkeypatch):
     assert sorted(terminated_pids) == [99901, 99902]
 
 
-def test_guard_repo_denied_by_active_session_lease(tmp_path, monkeypatch):
+def test_guard_repo_allows_active_cooperative_session_lease(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()
     registry.upsert_session_lease(
@@ -552,9 +667,10 @@ def test_guard_repo_denied_by_active_session_lease(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["guard", "--repo", str(tmp_path), "--json"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     payload = json.loads(result.output)
-    assert payload["checks"]["repo"]["allowed"] is False
+    assert payload["checks"]["repo"]["allowed"] is True
+    assert payload["checks"]["repo"]["holders"][0]["session_id"] == "sess-other"
 
 
 def test_session_ensure_retries_on_db_locked(tmp_path, monkeypatch):

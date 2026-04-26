@@ -38,7 +38,15 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
     )
 
     assert set(payload.keys()) == {"allowed", "request", "checks", "state"}
-    assert set(payload["request"].keys()) == {"port", "repo_dir", "gpu_mb", "framework", "model"}
+    assert set(payload["request"].keys()) == {
+        "port",
+        "repo_dir",
+        "write_scopes",
+        "exclusive_repo_lock",
+        "gpu_mb",
+        "framework",
+        "model",
+    }
     assert set(payload["checks"].keys()) == {"port", "repo", "gpu"}
     assert set(payload["checks"]["port"].keys()) == {
         "allowed",
@@ -46,7 +54,15 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "holder",
         "suggested_ports",
     }
-    assert set(payload["checks"]["repo"].keys()) == {"allowed", "reason", "holder"}
+    assert set(payload["checks"]["repo"].keys()) == {
+        "allowed",
+        "reason",
+        "holder",
+        "holders",
+        "overlap_paths",
+        "stale_holders",
+        "safe_mode",
+    }
     assert set(payload["checks"]["gpu"].keys()) == {
         "allowed",
         "reason",
@@ -95,7 +111,22 @@ def test_guard_state_contract_shape(tmp_path, monkeypatch):
     assert "idle_processes" not in state
 
 
-def test_guard_state_surfaces_session_locked_repos(tmp_path, monkeypatch):
+def test_guard_state_surfaces_exclusive_session_locked_repos(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-other",
+        owner_pid=None,
+        repo_dir=tmp_path,
+        repo_lock_mode="exclusive",
+    )
+
+    state = reporter.build_guard_state(conn)
+    assert str(tmp_path.resolve()) in state["repos_locked"]
+
+
+def test_guard_state_does_not_mark_cooperative_session_as_locked_repo(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     conn = registry.connect()
     registry.upsert_session_lease(
@@ -106,7 +137,7 @@ def test_guard_state_surfaces_session_locked_repos(tmp_path, monkeypatch):
     )
 
     state = reporter.build_guard_state(conn)
-    assert str(tmp_path.resolve()) in state["repos_locked"]
+    assert str(tmp_path.resolve()) not in state["repos_locked"]
 
 
 def test_state_json_contract_shape(tmp_path, monkeypatch):

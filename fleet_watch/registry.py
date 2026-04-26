@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS session_leases (
     owner_pgid          INTEGER,
     owner_tty           TEXT,
     repo_dir            TEXT,
+    repo_lock_mode      TEXT NOT NULL DEFAULT 'cooperative',
+    write_scopes        TEXT,
     started_at          TEXT NOT NULL,
     last_heartbeat_at   TEXT NOT NULL,
     shutdown_at         TEXT,
@@ -103,6 +105,11 @@ SESSION_LEASE_STATUSES = frozenset({
     "CLOSED",
 })
 
+SESSION_REPO_LOCK_MODES = frozenset({
+    "cooperative",
+    "exclusive",
+})
+
 PROCESS_STATES = frozenset({
     "live",
     "disconnected",
@@ -124,6 +131,43 @@ def ensure_dir() -> Path:
 
 def _resolve_repo_dir(repo_dir: str | None) -> str | None:
     return str(Path(repo_dir).resolve()) if repo_dir else None
+
+
+def _resolve_write_scopes(repo_dir: str | None, write_scopes: list[str] | tuple[str, ...] | None) -> list[str]:
+    if not write_scopes:
+        return []
+    base = Path(repo_dir).expanduser().resolve() if repo_dir else None
+    resolved: list[str] = []
+    for raw in write_scopes:
+        path = Path(raw).expanduser()
+        if not path.is_absolute() and base is not None:
+            path = base / path
+        value = str(path.resolve())
+        if value not in resolved:
+            resolved.append(value)
+    return resolved
+
+
+def _encode_write_scopes(scopes: list[str]) -> str | None:
+    return json.dumps(scopes, separators=(",", ":")) if scopes else None
+
+
+def _decode_write_scopes(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, str)]
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _age_seconds(iso_ts: str | None) -> int | None:
@@ -285,6 +329,8 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "session_leases", "repo_lock_mode", "TEXT NOT NULL DEFAULT 'cooperative'")
+    _ensure_column(conn, "session_leases", "write_scopes", "TEXT")
     # Ensure gpu_budget singleton exists
     conn.execute(
         "INSERT OR IGNORE INTO gpu_budget (id, total_mb, reserve_mb, allocated_mb) "
@@ -306,13 +352,25 @@ def upsert_session_lease(
     owner_pid: int | None = None,
     repo_dir: str | None = None,
     status: str = "ACTIVE",
+    repo_lock_mode: str | None = None,
+    write_scopes: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Create or refresh a session lease with current owner metadata."""
     if status not in SESSION_LEASE_STATUSES:
         raise ValueError(f"Invalid session lease status: {status}")
+    if repo_lock_mode is not None and repo_lock_mode not in SESSION_REPO_LOCK_MODES:
+        raise ValueError(f"Invalid repo lock mode: {repo_lock_mode}")
 
     now = _now_iso()
     resolved_repo = _resolve_repo_dir(repo_dir)
+    prior = get_session_lease(conn, session_id)
+    resolved_mode = repo_lock_mode or (prior.get("repo_lock_mode") if prior else "cooperative")
+    prior_scopes = prior.get("write_scopes", []) if prior else []
+    resolved_scopes = (
+        _resolve_write_scopes(resolved_repo, write_scopes)
+        if write_scopes is not None
+        else prior_scopes
+    )
     inspect = _inspect_process(owner_pid)
     owner_ppid = inspect.get("ppid") if inspect else None
     owner_pgid = inspect.get("pgid") if inspect else None
@@ -322,15 +380,18 @@ def upsert_session_lease(
         """
         INSERT INTO session_leases (
             session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+            repo_lock_mode, write_scopes,
             started_at, last_heartbeat_at, shutdown_at, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(session_id) DO UPDATE SET
             owner_pid = COALESCE(excluded.owner_pid, session_leases.owner_pid),
             owner_ppid = COALESCE(excluded.owner_ppid, session_leases.owner_ppid),
             owner_pgid = COALESCE(excluded.owner_pgid, session_leases.owner_pgid),
             owner_tty = COALESCE(excluded.owner_tty, session_leases.owner_tty),
             repo_dir = COALESCE(excluded.repo_dir, session_leases.repo_dir),
+            repo_lock_mode = excluded.repo_lock_mode,
+            write_scopes = excluded.write_scopes,
             last_heartbeat_at = excluded.last_heartbeat_at,
             shutdown_at = NULL,
             status = excluded.status
@@ -342,6 +403,8 @@ def upsert_session_lease(
             owner_pgid,
             owner_tty,
             resolved_repo,
+            resolved_mode,
+            _encode_write_scopes(resolved_scopes),
             now,
             now,
             status,
@@ -356,13 +419,24 @@ def heartbeat_session_lease(
     *,
     owner_pid: int | None = None,
     repo_dir: str | None = None,
+    repo_lock_mode: str | None = None,
+    write_scopes: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
     """Refresh an existing session lease or create it when owner_pid is given."""
+    if repo_lock_mode is not None and repo_lock_mode not in SESSION_REPO_LOCK_MODES:
+        raise ValueError(f"Invalid repo lock mode: {repo_lock_mode}")
     lease = get_session_lease(conn, session_id)
     if lease is None:
         if owner_pid is None:
             return False
-        upsert_session_lease(conn, session_id, owner_pid=owner_pid, repo_dir=repo_dir)
+        upsert_session_lease(
+            conn,
+            session_id,
+            owner_pid=owner_pid,
+            repo_dir=repo_dir,
+            repo_lock_mode=repo_lock_mode,
+            write_scopes=write_scopes,
+        )
         return True
 
     now = _now_iso()
@@ -372,6 +446,12 @@ def heartbeat_session_lease(
     owner_pgid = inspect.get("pgid") if inspect else lease.get("owner_pgid")
     owner_tty = inspect.get("tty") if inspect else lease.get("owner_tty")
     resolved_repo = _resolve_repo_dir(repo_dir) or lease.get("repo_dir")
+    resolved_mode = repo_lock_mode or lease.get("repo_lock_mode", "cooperative")
+    resolved_scopes = (
+        _resolve_write_scopes(resolved_repo, write_scopes)
+        if write_scopes is not None
+        else lease.get("write_scopes", [])
+    )
     cursor = conn.execute(
         """
         UPDATE session_leases
@@ -380,6 +460,8 @@ def heartbeat_session_lease(
             owner_pgid = ?,
             owner_tty = ?,
             repo_dir = COALESCE(?, repo_dir),
+            repo_lock_mode = ?,
+            write_scopes = ?,
             last_heartbeat_at = ?,
             shutdown_at = NULL,
             status = 'ACTIVE'
@@ -391,6 +473,8 @@ def heartbeat_session_lease(
             owner_pgid,
             owner_tty,
             resolved_repo,
+            resolved_mode,
+            _encode_write_scopes(resolved_scopes),
             now,
             session_id,
         ),
@@ -421,7 +505,7 @@ def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, An
     row = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               started_at, last_heartbeat_at, shutdown_at, status
+               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         WHERE session_id = ?
         """,
@@ -437,7 +521,7 @@ def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               started_at, last_heartbeat_at, shutdown_at, status
+               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         ORDER BY started_at ASC
         """
@@ -450,7 +534,7 @@ def list_active_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]
     rows = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               started_at, last_heartbeat_at, shutdown_at, status
+               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         WHERE status = 'ACTIVE' AND shutdown_at IS NULL
         ORDER BY last_heartbeat_at DESC
@@ -737,24 +821,19 @@ def get_active_session_leases_by_repo(
     repo_dir: str,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Return active session leases that currently block a repo path."""
+    """Return active session leases associated with a repo path."""
     resolved = str(Path(repo_dir).resolve())
     rows = conn.execute(
         """
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               started_at, last_heartbeat_at, shutdown_at, status
+               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
-        WHERE repo_dir = ?
+        WHERE repo_dir = ? AND status = 'ACTIVE' AND shutdown_at IS NULL
         ORDER BY last_heartbeat_at DESC
         """,
         (resolved,),
     ).fetchall()
-    leases = [_session_lease_row_to_dict(row) for row in rows]
-    return [
-        lease
-        for lease in leases
-        if _session_lease_blocks_repo(lease, stale_seconds=stale_seconds)
-    ]
+    return [_session_lease_row_to_dict(row) for row in rows]
 
 
 def get_effective_locked_repos(
@@ -767,7 +846,7 @@ def get_effective_locked_repos(
         repo_dir = lease.get("repo_dir")
         if not repo_dir or repo_dir in locks:
             continue
-        if _session_lease_blocks_repo(lease, stale_seconds=stale_seconds):
+        if lease.get("repo_lock_mode") == "exclusive" and _session_lease_blocks_repo(lease, stale_seconds=stale_seconds):
             locks[repo_dir] = lease.get("owner_pid")
     return locks
 
@@ -1155,12 +1234,17 @@ def _session_lease_row_to_dict(row: tuple) -> dict[str, Any]:
         "owner_pgid",
         "owner_tty",
         "repo_dir",
+        "repo_lock_mode",
+        "write_scopes",
         "started_at",
         "last_heartbeat_at",
         "shutdown_at",
         "status",
     ]
-    return dict(zip(cols, row))
+    data = dict(zip(cols, row))
+    data["repo_lock_mode"] = data.get("repo_lock_mode") or "cooperative"
+    data["write_scopes"] = _decode_write_scopes(data.get("write_scopes"))
+    return data
 
 
 def _external_row_to_dict(row: tuple) -> dict[str, Any]:
