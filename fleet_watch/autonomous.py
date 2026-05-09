@@ -276,8 +276,15 @@ def write_receipt(repo: Path, kind: str, payload: dict[str, Any], policy: dict[s
     if not root.is_absolute():
         root = repo / root
     root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = root / f"{stamp}-{kind}.json"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    subject = str(payload.get("spec") or payload.get("spec_id") or payload.get("verdict") or "").strip()
+    safe_subject = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in subject)[:80].strip("-")
+    suffix = f"-{safe_subject}" if safe_subject else ""
+    path = root / f"{stamp}-{kind}{suffix}.json"
+    counter = 1
+    while path.exists():
+        path = root / f"{stamp}-{kind}{suffix}-{counter}.json"
+        counter += 1
     body = {
         "schema_version": "fleet-watch-autonomous-v1",
         "kind": kind,

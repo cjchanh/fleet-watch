@@ -493,6 +493,49 @@ claim_state: implemented+tested
     assert spec.is_file()
 
 
+def test_autonomous_writes_unique_receipts_for_multiple_skipped_lifecycle_debts(tmp_path):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    receipt_dir = tmp_path / "receipts"
+    policy = write_policy_payload(
+        repo,
+        {
+            "require_post_session": False,
+            "receipt_dir": str(receipt_dir),
+            "baseline_command": [sys.executable, "-c", "pass"],
+        },
+    )
+    write_fake_autopilot_cli(
+        repo,
+        {"verdict": "BLOCKED:NO_MATCHING_SPEC", "reason": "NO_DISPATCHABLE_AUTOPILOT_SPEC"},
+        returncode=3,
+    )
+    queue = repo / "specs" / "queue"
+    queue.mkdir(parents=True)
+    for spec_id in ("316-fleet-watch-autonomous-reconciler-bootstrap", "317-fleet-watch-autonomous-launch-stage"):
+        (queue / f"{spec_id}.md").write_text(
+            f"""---
+spec_id: {spec_id}
+class: governance_writes
+autopilot_eligible: false
+status: STAGE1_IMPLEMENTED_TESTED
+claim_state: implemented+tested
+---
+""",
+            encoding="utf-8",
+        )
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "seed multiple ineligible debts")
+
+    result = autonomous.run_once(repo, policy)
+
+    receipt_paths = [Path(item["receipt"]) for item in result["skipped_lifecycle_debt"]]
+    assert result["verdict"] == "NO_DISPATCHABLE_CANDIDATE"
+    assert len(receipt_paths) == 2
+    assert len(set(receipt_paths)) == 2
+    assert all(path.is_file() for path in receipt_paths)
+
+
 def test_autonomous_refuses_launch_when_fleet_pressure_blocks(tmp_path):
     repo = tmp_path / "repo"
     init_repo(repo)
