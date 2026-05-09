@@ -213,6 +213,42 @@ def test_pressure_critical():
     assert mem.pressure_pct > 85
 
 
+def test_launch_pressure_allows_shrunk_dynamic_swap_below_free_floor():
+    mem = syshealth.MemoryState(
+        total_mb=131072,
+        active_mb=23000,
+        inactive_mb=20000,
+        free_mb=70000,
+        compressed_mb=9000,
+        wired_mb=5000,
+    )
+    swap = syshealth.SwapState(total_mb=3072, used_mb=2062, free_mb=1010, encrypted=True)
+
+    assert syshealth.launch_pressure_blockers(mem, swap) == []
+
+
+def test_launch_pressure_blocks_low_free_swap_when_pool_can_satisfy_floor():
+    mem = syshealth.MemoryState(
+        total_mb=131072,
+        active_mb=23000,
+        inactive_mb=20000,
+        free_mb=70000,
+        compressed_mb=9000,
+        wired_mb=5000,
+    )
+    swap = syshealth.SwapState(total_mb=8192, used_mb=6144, free_mb=2048, encrypted=True)
+
+    blockers = syshealth.launch_pressure_blockers(mem, swap)
+
+    assert blockers == [
+        {
+            "code": "SWAP_FREE_LOW",
+            "swap_free_mb": 2048,
+            "required_min_free_mb": 4096,
+        }
+    ]
+
+
 def test_pressure_label():
     assert syshealth.pressure_label(-1) == "UNAVAILABLE"
     assert syshealth.pressure_label(50) == "OK"

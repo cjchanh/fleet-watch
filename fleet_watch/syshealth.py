@@ -200,7 +200,11 @@ def launch_pressure_blockers(
             "swap_used_mb": swap.used_mb,
             "swap_total_mb": swap.total_mb,
         })
-    if swap.is_available and swap.free_mb < t["min_swap_free_mb"]:
+    if (
+        swap.is_available
+        and swap.total_mb >= t["min_swap_free_mb"]
+        and swap.free_mb < t["min_swap_free_mb"]
+    ):
         blockers.append({
             "code": "SWAP_FREE_LOW",
             "swap_free_mb": swap.free_mb,
