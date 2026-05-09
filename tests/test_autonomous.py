@@ -105,6 +105,50 @@ print(json.dumps({"receipt": str(receipt), **payload}))
     )
 
 
+def write_fake_autopilot_cli(repo: Path, payload: dict, returncode: int = 0) -> None:
+    target = repo / "scripts" / "autopilot_cli.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        f"""#!/usr/bin/env python3
+import json, sys
+print(json.dumps({payload!r}))
+raise SystemExit({returncode})
+""",
+        encoding="utf-8",
+    )
+
+
+def write_fake_fleet_guard(repo: Path, payload: dict, returncode: int = 0) -> Path:
+    target = repo / "fake_fleet_guard.py"
+    target.write_text(
+        f"""#!/usr/bin/env python3
+import json
+print(json.dumps({payload!r}))
+raise SystemExit({returncode})
+""",
+        encoding="utf-8",
+    )
+    return target
+
+
+def write_fake_monitored_dispatch_path(repo: Path, returncode: int = 0) -> None:
+    cycle = repo / "tools" / "cost-aware-autopilot" / "cycle.py"
+    cycle.parent.mkdir(parents=True, exist_ok=True)
+    cycle.write_text(
+        f"""#!/usr/bin/env python3
+import json
+print(json.dumps({{"verdict": "READY_FOR_OPERATOR_REVIEW", "via": "cycle.py"}}))
+raise SystemExit({returncode})
+""",
+        encoding="utf-8",
+    )
+    dispatch = repo / "tools" / "cost-aware-autopilot" / "dispatch_opencode.py"
+    dispatch.write_text("# offline_coder_subprocess_monitor.py\n", encoding="utf-8")
+    monitor = repo / "scripts" / "offline_coder_subprocess_monitor.py"
+    monitor.parent.mkdir(parents=True, exist_ok=True)
+    monitor.write_text("# monitor\n", encoding="utf-8")
+
+
 def test_autonomous_once_closes_lifecycle_debt(tmp_path):
     repo = tmp_path / "repo"
     init_repo(repo)
@@ -404,3 +448,107 @@ def test_safe_proof_rejects_unittest_discover_outside_test_roots():
     assert not autonomous.is_safe_proof_command(
         "python3 -m unittest discover -s /tmp -p 'test_*.py' -v"
     )
+
+
+def test_autonomous_skips_ineligible_lifecycle_debt_and_receipts(tmp_path):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    receipt_dir = tmp_path / "receipts"
+    policy = write_policy_payload(
+        repo,
+        {
+            "require_post_session": False,
+            "receipt_dir": str(receipt_dir),
+            "baseline_command": [sys.executable, "-c", "pass"],
+        },
+    )
+    write_fake_autopilot_cli(
+        repo,
+        {"verdict": "BLOCKED:NO_MATCHING_SPEC", "reason": "NO_DISPATCHABLE_AUTOPILOT_SPEC"},
+        returncode=3,
+    )
+    queue = repo / "specs" / "queue"
+    queue.mkdir(parents=True)
+    spec = queue / "316-fleet-watch-autonomous-reconciler-bootstrap.md"
+    spec.write_text(
+        """---
+spec_id: 316-fleet-watch-autonomous-reconciler-bootstrap
+class: governance_writes
+autopilot_eligible: false
+status: STAGE1_IMPLEMENTED_TESTED
+claim_state: implemented+tested
+---
+""",
+        encoding="utf-8",
+    )
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "seed ineligible debt")
+
+    result = autonomous.run_once(repo, policy)
+
+    assert result["verdict"] == "NO_DISPATCHABLE_CANDIDATE"
+    assert result["skipped_lifecycle_debt"][0]["spec"] == spec.name
+    assert result["skipped_lifecycle_debt"][0]["reason"] == "autopilot_eligible_not_true"
+    assert Path(result["skipped_lifecycle_debt"][0]["receipt"]).is_file()
+    assert spec.is_file()
+
+
+def test_autonomous_refuses_launch_when_fleet_pressure_blocks(tmp_path):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    receipt_dir = tmp_path / "receipts"
+    fleet_guard = write_fake_fleet_guard(
+        repo,
+        {
+            "allowed": False,
+            "checks": {"memory_pressure": {"allowed": False, "blockers": [{"code": "SWAP_PRESSURE_HIGH"}]}},
+        },
+        returncode=1,
+    )
+    policy = write_policy_payload(
+        repo,
+        {
+            "require_post_session": False,
+            "receipt_dir": str(receipt_dir),
+            "baseline_command": [sys.executable, "-c", "pass"],
+            "fleet_guard_command": [sys.executable, str(fleet_guard)],
+        },
+    )
+    write_fake_autopilot_cli(repo, {"verdict": "DRY_RUN", "spec_id": "317-demo", "command": ["ignored"]})
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "seed launch state")
+
+    result = autonomous.run_once(repo, policy)
+
+    assert result["verdict"] == "BLOCKED_FLEET_PRESSURE"
+    assert result["spec_id"] == "317-demo"
+    assert result["fleet_guard"]["payload"]["allowed"] is False
+    assert len(result["receipts"]) == 2
+
+
+def test_autonomous_launches_one_candidate_through_monitored_cycle_path(tmp_path):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    receipt_dir = tmp_path / "receipts"
+    fleet_guard = write_fake_fleet_guard(repo, {"allowed": True, "checks": {}}, returncode=0)
+    policy = write_policy_payload(
+        repo,
+        {
+            "require_post_session": False,
+            "receipt_dir": str(receipt_dir),
+            "baseline_command": [sys.executable, "-c", "pass"],
+            "fleet_guard_command": [sys.executable, str(fleet_guard)],
+        },
+    )
+    write_fake_autopilot_cli(repo, {"verdict": "DRY_RUN", "spec_id": "317-demo", "command": ["ignored"]})
+    write_fake_monitored_dispatch_path(repo)
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "seed launch path")
+
+    result = autonomous.run_once(repo, policy)
+
+    assert result["verdict"] == "LAUNCH_COMPLETE"
+    assert result["spec_id"] == "317-demo"
+    assert "tools/cost-aware-autopilot/cycle.py" in " ".join(result["launch"]["command"])
+    assert result["launch"]["payload"]["via"] == "cycle.py"
+    assert len(result["receipts"]) == 2

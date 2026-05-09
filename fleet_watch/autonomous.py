@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,10 +66,32 @@ def run_once(repo: Path, policy_path: Path | None = None) -> dict[str, Any]:
 
     dirty = git_dirty_paths(repo)
     if not dirty:
-        debt = find_lifecycle_debt(repo)
-        if debt is not None:
-            return close_lifecycle_debt(repo, debt, policy)
-        return {"allowed": True, "verdict": "NO_ACTION", "repo": str(repo)}
+        skipped_debts: list[dict[str, Any]] = []
+        skipped_paths: set[Path] = set()
+        while True:
+            debt = find_lifecycle_debt(repo, skipped_paths=skipped_paths)
+            if debt is None:
+                break
+            policy_error = validate_lifecycle_policy(debt, policy)
+            if policy_error:
+                receipt = write_receipt(
+                    repo,
+                    "reconcile",
+                    {
+                        "verdict": "LIFECYCLE_DEBT_SKIPPED",
+                        "spec": debt.name,
+                        "reason": policy_error,
+                    },
+                    policy,
+                )
+                skipped_debts.append({"spec": debt.name, "reason": policy_error, "receipt": str(receipt)})
+                skipped_paths.add(debt.resolve())
+                continue
+            result = close_lifecycle_debt(repo, debt, policy)
+            if skipped_debts:
+                result["skipped_lifecycle_debt"] = skipped_debts
+            return result
+        return launch_stage(repo, policy, skipped_debts)
 
     if git_staged_paths(repo):
         return {
@@ -100,6 +123,10 @@ def load_policy(path: Path | None) -> dict[str, Any]:
         "allowed_executors": ["opencode", "local"],
         "max_scope_files": 3,
         "require_post_session": True,
+        "launch_enabled": True,
+        "launch_gpu_mb": 8192,
+        "baseline_command": None,
+        "receipt_dir": "data/fleet-watch-autonomous",
         "commit_policy": {"implementation_commit": True, "lifecycle_closeout_commit": True},
     }
     if path is None or not path.exists():
@@ -135,6 +162,17 @@ def merge_policy(base: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]
 
 def run(cmd: list[str], repo: Path, *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def run_env(
+    cmd: list[str],
+    repo: Path,
+    *,
+    timeout: int = 60,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
     return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env)
 
 
@@ -216,11 +254,14 @@ def parse_frontmatter(path: Path) -> dict[str, Any]:
     return data
 
 
-def find_lifecycle_debt(repo: Path) -> Path | None:
+def find_lifecycle_debt(repo: Path, skipped_paths: set[Path] | None = None) -> Path | None:
     queue_dir = repo / "specs" / "queue"
     if not queue_dir.is_dir():
         return None
+    skipped = skipped_paths or set()
     for spec in sorted(queue_dir.glob("*.md")):
+        if spec.resolve() in skipped:
+            continue
         fm = parse_frontmatter(spec)
         if (
             str(fm.get("status")) in IMPLEMENTED_STATUSES
@@ -228,6 +269,24 @@ def find_lifecycle_debt(repo: Path) -> Path | None:
         ):
             return spec
     return None
+
+
+def write_receipt(repo: Path, kind: str, payload: dict[str, Any], policy: dict[str, Any]) -> Path:
+    root = Path(str(policy.get("receipt_dir") or "data/fleet-watch-autonomous")).expanduser()
+    if not root.is_absolute():
+        root = repo / root
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = root / f"{stamp}-{kind}.json"
+    body = {
+        "schema_version": "fleet-watch-autonomous-v1",
+        "kind": kind,
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repo": str(repo),
+        **payload,
+    }
+    path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def find_dirty_scope_candidate(repo: Path, dirty_paths: list[str], policy: dict[str, Any]) -> CandidateResult:
@@ -703,6 +762,302 @@ def rollback_lifecycle_mutation(
             receipt.unlink()
         except OSError:
             pass
+
+
+def launch_stage(repo: Path, policy: dict[str, Any], skipped_debts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run the bounded launch stage after reconciliation finds no eligible closeout."""
+    if not policy.get("launch_enabled", True):
+        receipt = write_receipt(
+            repo,
+            "closeout",
+            {"verdict": "NO_ACTION", "reason": "launch_disabled", "skipped_lifecycle_debt": skipped_debts},
+            policy,
+        )
+        return {
+            "allowed": True,
+            "verdict": "NO_ACTION",
+            "repo": str(repo),
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(receipt)],
+        }
+
+    dirty = git_dirty_paths(repo)
+    if dirty:
+        receipt = write_receipt(
+            repo,
+            "closeout",
+            {"verdict": "BLOCKED_DIRTY_REPO", "dirty_paths": dirty, "skipped_lifecycle_debt": skipped_debts},
+            policy,
+        )
+        return {
+            "allowed": False,
+            "verdict": "BLOCKED_DIRTY_REPO",
+            "dirty_paths": dirty,
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(receipt)],
+        }
+
+    dry_run = run_fire_next_dry_run(repo)
+    if dry_run["returncode"] != 0:
+        receipt = write_receipt(
+            repo,
+            "closeout",
+            {
+                "verdict": "NO_DISPATCHABLE_CANDIDATE",
+                "fire_next": dry_run,
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        return {
+            "allowed": True,
+            "verdict": "NO_DISPATCHABLE_CANDIDATE",
+            "fire_next": dry_run,
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(receipt)],
+        }
+
+    spec_id = str(dry_run["payload"].get("spec_id") or "").strip()
+    if dry_run["payload"].get("verdict") != "DRY_RUN" or not spec_id:
+        receipt = write_receipt(
+            repo,
+            "closeout",
+            {
+                "verdict": "BLOCKED_FIRE_NEXT_INVALID",
+                "fire_next": dry_run,
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        return {
+            "allowed": False,
+            "verdict": "BLOCKED_FIRE_NEXT_INVALID",
+            "fire_next": dry_run,
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(receipt)],
+        }
+
+    baseline = run_baseline(repo, policy)
+    if baseline["returncode"] != 0:
+        receipt = write_receipt(
+            repo,
+            "closeout",
+            {
+                "verdict": "BLOCKED_BASELINE_REGRESSION",
+                "spec_id": spec_id,
+                "baseline": baseline,
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        return {
+            "allowed": False,
+            "verdict": "BLOCKED_BASELINE_REGRESSION",
+            "spec_id": spec_id,
+            "baseline": baseline,
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(receipt)],
+        }
+
+    pressure = run_fleet_launch_guard(repo, policy)
+    if pressure["returncode"] != 0 or pressure["payload"].get("allowed") is not True:
+        pressure_receipt = write_receipt(
+            repo,
+            "pressure",
+            {
+                "verdict": "BLOCKED_FLEET_PRESSURE",
+                "spec_id": spec_id,
+                "fleet_guard": pressure,
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        closeout_receipt = write_receipt(
+            repo,
+            "closeout",
+            {
+                "verdict": "BLOCKED_FLEET_PRESSURE",
+                "spec_id": spec_id,
+                "pressure_receipt": str(pressure_receipt),
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        return {
+            "allowed": False,
+            "verdict": "BLOCKED_FLEET_PRESSURE",
+            "spec_id": spec_id,
+            "fleet_guard": pressure,
+            "baseline": baseline,
+            "skipped_lifecycle_debt": skipped_debts,
+            "receipts": [str(pressure_receipt), str(closeout_receipt)],
+        }
+
+    monitored_path_error = validate_monitored_dispatch_path(repo)
+    if monitored_path_error:
+        closeout_receipt = write_receipt(
+            repo,
+            "closeout",
+            {
+                "verdict": "BLOCKED_MONITORED_PATH_MISSING",
+                "spec_id": spec_id,
+                "reason": monitored_path_error,
+                "skipped_lifecycle_debt": skipped_debts,
+            },
+            policy,
+        )
+        return {
+            "allowed": False,
+            "verdict": "BLOCKED_MONITORED_PATH_MISSING",
+            "spec_id": spec_id,
+            "reason": monitored_path_error,
+            "receipts": [str(closeout_receipt)],
+        }
+
+    launch = run_monitored_local_launch(repo, spec_id, policy)
+    launch_receipt = write_receipt(
+        repo,
+        "launch",
+        {
+            "verdict": "LAUNCH_ATTEMPTED",
+            "spec_id": spec_id,
+            "launch": launch,
+            "baseline": baseline,
+            "fleet_guard": pressure,
+            "skipped_lifecycle_debt": skipped_debts,
+        },
+        policy,
+    )
+    closeout_receipt = write_receipt(
+        repo,
+        "closeout",
+        {
+            "verdict": "LAUNCH_COMPLETE" if launch["returncode"] == 0 else "LAUNCH_FAILED",
+            "spec_id": spec_id,
+            "launch_receipt": str(launch_receipt),
+            "skipped_lifecycle_debt": skipped_debts,
+        },
+        policy,
+    )
+    return {
+        "allowed": launch["returncode"] == 0,
+        "verdict": "LAUNCH_COMPLETE" if launch["returncode"] == 0 else "LAUNCH_FAILED",
+        "spec_id": spec_id,
+        "fire_next": dry_run,
+        "baseline": baseline,
+        "fleet_guard": pressure,
+        "launch": launch,
+        "skipped_lifecycle_debt": skipped_debts,
+        "receipts": [str(launch_receipt), str(closeout_receipt)],
+    }
+
+
+def run_fire_next_dry_run(repo: Path) -> dict[str, Any]:
+    cli = repo / "scripts" / "autopilot_cli.py"
+    if not cli.is_file():
+        return {"returncode": 2, "payload": {"verdict": "BLOCKED", "reason": "autopilot_cli_missing"}}
+    proc = run([sys.executable, str(cli), "fire-next", "--dry-run"], repo, timeout=60)
+    return completed_json(proc)
+
+
+def run_baseline(repo: Path, policy: dict[str, Any]) -> dict[str, Any]:
+    command = policy.get("baseline_command")
+    if isinstance(command, str):
+        cmd = shlex.split(command)
+    elif isinstance(command, list) and all(isinstance(item, str) for item in command):
+        cmd = command
+    else:
+        cmd = default_baseline_command(repo)
+    if not cmd:
+        return {"returncode": 0, "command": [], "stdout_tail": "", "stderr_tail": "", "skipped": True}
+    proc = run(cmd, repo, timeout=int(policy.get("baseline_timeout_seconds", 300)))
+    payload = completed_json(proc)
+    payload["command"] = cmd
+    return payload
+
+
+def default_baseline_command(repo: Path) -> list[str]:
+    if (repo / "tests").is_dir():
+        return [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+    return []
+
+
+def run_fleet_launch_guard(repo: Path, policy: dict[str, Any]) -> dict[str, Any]:
+    configured = policy.get("fleet_guard_command")
+    if isinstance(configured, list) and all(isinstance(item, str) for item in configured):
+        cmd = configured
+    else:
+        cmd = [
+            "fleet",
+            "guard",
+            "--json",
+            "--repo",
+            str(repo),
+            "--gpu",
+            str(int(policy.get("launch_gpu_mb", 8192))),
+        ]
+    try:
+        proc = run(cmd, repo, timeout=30)
+    except FileNotFoundError:
+        return {"returncode": 2, "payload": {"allowed": False, "reason": "fleet_cli_missing"}}
+    return completed_json(proc)
+
+
+def validate_monitored_dispatch_path(repo: Path) -> str | None:
+    required = [
+        repo / "tools" / "cost-aware-autopilot" / "cycle.py",
+        repo / "tools" / "cost-aware-autopilot" / "dispatch_opencode.py",
+        repo / "scripts" / "offline_coder_subprocess_monitor.py",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        return "missing:" + ",".join(missing)
+    try:
+        text = (repo / "tools" / "cost-aware-autopilot" / "dispatch_opencode.py").read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"dispatch_opencode_unreadable:{exc}"
+    if "offline_coder_subprocess_monitor.py" not in text:
+        return "dispatch_opencode_not_monitor_wrapped"
+    return None
+
+
+def run_monitored_local_launch(repo: Path, spec_id: str, policy: dict[str, Any]) -> dict[str, Any]:
+    cycle = repo / "tools" / "cost-aware-autopilot" / "cycle.py"
+    command = [
+        sys.executable,
+        str(cycle),
+        "--ai-root",
+        str(repo),
+        "--mode",
+        "local-only",
+        "--target-spec",
+        spec_id,
+    ]
+    env = {
+        "COST_AWARE_MODE": "local-only",
+        "COST_AWARE_AUTO_COMMIT": "1" if policy.get("commit_policy", {}).get("implementation_commit", False) else "0",
+        "COST_AWARE_AUTO_COMMIT_CRAFT_SKIP_REASON": "deterministic_micro_skip",
+    }
+    proc = run_env(command, repo, timeout=int(policy.get("launch_timeout_seconds", 1200)), extra_env=env)
+    payload = completed_json(proc)
+    payload["command"] = command
+    return payload
+
+
+def completed_json(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    try:
+        payload = json.loads(proc.stdout)
+    except (TypeError, json.JSONDecodeError):
+        payload = {
+            "stdout_tail": (proc.stdout or "")[-1000:],
+            "stderr_tail": (proc.stderr or "")[-1000:],
+        }
+    return {
+        "returncode": proc.returncode,
+        "payload": payload,
+        "stdout_tail": (proc.stdout or "")[-1000:],
+        "stderr_tail": (proc.stderr or "")[-1000:],
+    }
 
 
 def git_head(repo: Path) -> str | None:
