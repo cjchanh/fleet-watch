@@ -18,6 +18,11 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "get_memory_state",
         lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
     )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(8192, 1024, 7168),
+    )
     conn = registry.connect()
     registry.register_process(
         conn,
@@ -47,7 +52,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "framework",
         "model",
     }
-    assert set(payload["checks"].keys()) == {"port", "repo", "gpu"}
+    assert set(payload["checks"].keys()) == {"port", "repo", "gpu", "memory_pressure"}
     assert set(payload["checks"]["port"].keys()) == {
         "allowed",
         "reason",
@@ -72,12 +77,21 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "working_set",
         "detail",
     }
+    assert set(payload["checks"]["memory_pressure"].keys()) == {
+        "allowed",
+        "reason",
+        "blockers",
+        "memory",
+        "swap",
+    }
     assert set(payload["state"].keys()) == {
         "process_count",
         "occupied_ports",
         "safe_ports",
         "locked_repos",
         "gpu_budget",
+        "system_memory",
+        "swap",
         "external_resources",
     }
     assert set(payload["state"]["gpu_budget"].keys()) == {

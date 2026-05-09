@@ -16,6 +16,7 @@ from typing import Any
 
 import click
 
+from fleet_watch import autonomous as autonomous_mod
 from fleet_watch import discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 
@@ -254,6 +255,8 @@ def _build_guard_payload(
             "safe_ports": state.get("safe_ports", []),
             "locked_repos": sorted(state["repos_locked"].keys()),
             "gpu_budget": budget,
+            "system_memory": syshealth.get_memory_state().to_dict(),
+            "swap": syshealth.get_swap_state().to_dict(),
             "external_resources": state.get("external_resources", []),
         },
     }
@@ -302,6 +305,19 @@ def _build_guard_payload(
         payload["allowed"] = payload["allowed"] and decision.allowed
 
     if gpu_mb is not None:
+        mem = syshealth.get_memory_state()
+        swap = syshealth.get_swap_state()
+        pressure_blockers = syshealth.launch_pressure_blockers(mem, swap)
+        pressure_check = {
+            "allowed": not pressure_blockers,
+            "reason": "memory pressure within launch limits" if not pressure_blockers else "worker launch blocked by memory pressure",
+            "blockers": pressure_blockers,
+            "memory": mem.to_dict(),
+            "swap": swap.to_dict(),
+        }
+        payload["checks"]["memory_pressure"] = pressure_check
+        payload["allowed"] = payload["allowed"] and pressure_check["allowed"]
+
         decision = referee.check_gpu_budget(conn, gpu_mb)
         gpu_check: dict[str, Any] = {
             "allowed": decision.allowed,
@@ -312,7 +328,6 @@ def _build_guard_payload(
         }
 
         # Working set estimation — catches memory overcommit
-        mem = syshealth.get_memory_state()
         physical_ram = mem.total_mb if mem.is_available else 0
         config = discover_mod.load_config()
         reserve = gpu_estimator.resolve_effective_reserve_mb(
@@ -413,6 +428,30 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
                     lines.append("  Note: advisory only; provide explicit framework/model for enforcement")
                 if ws.get("suggestion"):
                     lines.append(f"  Suggestion: {ws['suggestion']}")
+
+    if "memory_pressure" in checks:
+        pressure_check = checks["memory_pressure"]
+        if not pressure_check["allowed"]:
+            for blocker in pressure_check.get("blockers", []):
+                code = blocker.get("code")
+                if code == "SWAP_PRESSURE_HIGH":
+                    lines.append(
+                        "Memory pressure: swap "
+                        f"{blocker['swap_used_pct']}% used; "
+                        f"requires < {blocker['required_below_pct']}%"
+                    )
+                elif code == "SWAP_FREE_LOW":
+                    lines.append(
+                        "Memory pressure: swap free "
+                        f"{blocker['swap_free_mb']}MB; "
+                        f"requires >= {blocker['required_min_free_mb']}MB"
+                    )
+                elif code == "MEMORY_PRESSURE_HIGH":
+                    lines.append(
+                        "Memory pressure: "
+                        f"{blocker['pressure_pct']}%; "
+                        f"requires < {blocker['required_below_pct']}%"
+                    )
 
     state = payload["state"]
     lines.append(
@@ -1459,10 +1498,26 @@ def discover(no_auto_kill: bool):
 @click.option("--interval", type=int, default=60, help="Seconds between scans")
 @click.option("--no-auto-kill", is_flag=True, default=False,
               help="Log runaway processes without killing them")
-def watch(interval: int, no_auto_kill: bool):
+@click.option("--autonomous", is_flag=True, help="Run bounded autopilot reconciler instead of passive discovery")
+@click.option("--once", is_flag=True, help="Run one autonomous reconciliation cycle and exit")
+@click.option("--repo", "repo_dir", default=None, help="Repo root for autonomous reconciliation")
+@click.option("--policy", "policy_path", default=None, help="Autonomous reconciler policy path")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable autonomous result")
+def watch(interval: int, no_auto_kill: bool, autonomous: bool, once: bool,
+          repo_dir: str | None, policy_path: str | None, as_json: bool):
     """Run continuous discovery loop (foreground daemon)."""
     import signal
     import time
+
+    if autonomous:
+        repo = Path(repo_dir).expanduser() if repo_dir else Path.cwd()
+        policy = Path(policy_path).expanduser() if policy_path else None
+        result = autonomous_mod.run_once(repo=repo, policy_path=policy)
+        if as_json or once:
+            click.echo(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            click.echo(f"{result['verdict']}: {result.get('reason') or result.get('action')}")
+        sys.exit(0 if result.get("allowed", False) else 1)
 
     click.echo(f"Fleet Watch running. Scanning every {interval}s. Ctrl-C to stop.")
 

@@ -384,6 +384,11 @@ def test_guard_gpu_without_model_does_not_false_deny(tmp_path, monkeypatch):
         "get_memory_state",
         lambda: syshealth.MemoryState(8192, 4000, 1000, 2000, 0, 1000),
     )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(8192, 1024, 7168),
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["guard", "--gpu", "1024", "--json"])
@@ -392,6 +397,31 @@ def test_guard_gpu_without_model_does_not_false_deny(tmp_path, monkeypatch):
     payload = json.loads(result.output)
     assert payload["checks"]["gpu"]["allowed"] is True
     assert "working_set" not in payload["checks"]["gpu"]
+
+
+def test_guard_blocks_worker_launch_on_swap_pressure(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(131072, 10000, 10000, 80000, 10000, 10000),
+    )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(34560, 33459, 1101, encrypted=True),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--repo", str(tmp_path), "--gpu", "8192", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["allowed"] is False
+    pressure = payload["checks"]["memory_pressure"]
+    assert pressure["allowed"] is False
+    assert pressure["blockers"][0]["code"] == "SWAP_PRESSURE_HIGH"
+    assert pressure["blockers"][0]["required_below_pct"] == 85
 
 
 def test_guard_logs_working_set_denial_event(tmp_path, monkeypatch):

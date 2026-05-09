@@ -49,6 +49,12 @@ DEFAULT_PRESSURE_THRESHOLDS = {
     "critical": 85,
 }
 
+DEFAULT_LAUNCH_GUARD_THRESHOLDS = {
+    "max_swap_used_pct": 85,
+    "min_swap_free_mb": 4096,
+    "max_pressure_pct": 80,
+}
+
 
 # --- Memory ---
 
@@ -95,6 +101,118 @@ class MemoryState:
             "pageouts": self.pageouts,
             "swapins": self.swapins,
         }
+
+
+@dataclass
+class SwapState:
+    """Swap snapshot in MB. Zero totals mean telemetry is unavailable."""
+    total_mb: int
+    used_mb: int
+    free_mb: int
+    encrypted: bool = False
+
+    @property
+    def is_available(self) -> bool:
+        return self.total_mb > 0
+
+    @property
+    def used_pct(self) -> int:
+        if not self.is_available:
+            return -1
+        return int(self.used_mb / max(self.total_mb, 1) * 100)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.is_available,
+            "total_mb": self.total_mb,
+            "used_mb": self.used_mb,
+            "free_mb": self.free_mb,
+            "used_pct": self.used_pct,
+            "encrypted": self.encrypted,
+        }
+
+
+def get_swap_state() -> SwapState:
+    """Read swap state on macOS or Linux. Returns unavailable on failure."""
+    mac = _get_macos_swap_state()
+    if mac is not None:
+        return mac
+    linux = _get_linux_swap_state()
+    if linux is not None:
+        return linux
+    return SwapState(0, 0, 0)
+
+
+def _get_macos_swap_state() -> SwapState | None:
+    try:
+        out = subprocess.run(
+            ["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.strip()
+    match = re.search(
+        r"total\s*=\s*([0-9.]+)M\s+used\s*=\s*([0-9.]+)M\s+free\s*=\s*([0-9.]+)M",
+        text,
+    )
+    if not match:
+        return None
+    total, used, free = (int(float(group)) for group in match.groups())
+    return SwapState(total, used, free, encrypted="encrypted" in text.lower())
+
+
+def _get_linux_swap_state() -> SwapState | None:
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        return None
+    try:
+        values: dict[str, int] = {}
+        for line in meminfo_path.read_text().splitlines():
+            key, _, rest = line.partition(":")
+            match = re.search(r"(\d+)\s+kB", rest)
+            if match:
+                values[key] = int(match.group(1))
+    except OSError:
+        return None
+    total_kb = values.get("SwapTotal", 0)
+    free_kb = values.get("SwapFree", 0)
+    if total_kb <= 0:
+        return SwapState(0, 0, 0)
+    used_kb = max(total_kb - free_kb, 0)
+    return SwapState(total_kb // 1024, used_kb // 1024, free_kb // 1024)
+
+
+def launch_pressure_blockers(
+    memory: MemoryState,
+    swap: SwapState,
+    thresholds: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return hard launch blockers for worker/model starts."""
+    t = {**DEFAULT_LAUNCH_GUARD_THRESHOLDS, **(thresholds or {})}
+    blockers: list[dict[str, Any]] = []
+    if swap.is_available and swap.used_pct >= t["max_swap_used_pct"]:
+        blockers.append({
+            "code": "SWAP_PRESSURE_HIGH",
+            "swap_used_pct": swap.used_pct,
+            "required_below_pct": t["max_swap_used_pct"],
+            "swap_used_mb": swap.used_mb,
+            "swap_total_mb": swap.total_mb,
+        })
+    if swap.is_available and swap.free_mb < t["min_swap_free_mb"]:
+        blockers.append({
+            "code": "SWAP_FREE_LOW",
+            "swap_free_mb": swap.free_mb,
+            "required_min_free_mb": t["min_swap_free_mb"],
+        })
+    if memory.is_available and memory.pressure_pct >= t["max_pressure_pct"]:
+        blockers.append({
+            "code": "MEMORY_PRESSURE_HIGH",
+            "pressure_pct": memory.pressure_pct,
+            "required_below_pct": t["max_pressure_pct"],
+        })
+    return blockers
 
 
 def get_memory_state() -> MemoryState:
