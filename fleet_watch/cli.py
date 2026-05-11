@@ -17,8 +17,12 @@ from typing import Any
 import click
 
 from fleet_watch import autonomous as autonomous_mod
-from fleet_watch import discover as discover_mod
+from fleet_watch import boot_coverage as boot_coverage_mod
+from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
+from fleet_watch import pkill as pkill_mod
+from fleet_watch.discovery import ollama_runners, orphan_detector
+from fleet_watch.guards import memory_pressure
 
 
 def _get_conn():
@@ -237,6 +241,12 @@ def _build_guard_payload(
     state = reporter.build_guard_state(conn)
     budget = state["gpu_budget"]
     normalized_write_scopes = referee.normalize_write_scopes(repo_dir, write_scopes)
+
+    # H1: discover ollama runners for guard decisions
+    runner_reports = ollama_runners.discover_ollama_runners()
+    runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
+    actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
+
     payload: dict[str, Any] = {
         "allowed": True,
         "request": {
@@ -258,6 +268,9 @@ def _build_guard_payload(
             "system_memory": syshealth.get_memory_state().to_dict(),
             "swap": syshealth.get_swap_state().to_dict(),
             "external_resources": state.get("external_resources", []),
+            "ollama_runners": [r.to_dict() for r in runner_reports],
+            "ollama_runner_entries": runner_entries,
+            "actual_ollama_gpu_mb": actual_gpu,
         },
     }
 
@@ -266,6 +279,28 @@ def _build_guard_payload(
         warnings = runaway_tracker.get_active_warnings()
         if warnings:
             payload["runaways"] = warnings
+
+    # H2: swap-pressure budget gate (fires before port/repo/GPU checks)
+    gate_counters = counters.load_counters()
+    gate_counters.increment("memory_pressure_gate")
+    counters.save_counters(gate_counters)
+
+    swap_verdict = memory_pressure.check_swap_pressure()
+    swap_decision = memory_pressure.guard_decision(
+        swap_verdict,
+        gpu_requested=(gpu_mb is not None and gpu_mb > 0),
+        audit_cycles=gate_counters.memory_pressure_gate,
+    )
+    if swap_verdict.warning:
+        events.log_event(
+            conn,
+            "MEMORY_PRESSURE_RISING",
+            workstream="guard",
+            detail=swap_verdict.to_dict(),
+        )
+    payload["checks"]["swap_pressure"] = swap_decision
+    if not swap_decision["allowed"]:
+        payload["allowed"] = False
 
     if port is not None:
         decision = referee.check_port(conn, port)
@@ -429,6 +464,21 @@ def _render_guard(payload: dict[str, Any]) -> list[str]:
                 if ws.get("suggestion"):
                     lines.append(f"  Suggestion: {ws['suggestion']}")
 
+    if "swap_pressure" in checks:
+        swap_check = checks["swap_pressure"]
+        verdict = swap_check.get("verdict", {})
+        if not swap_check["allowed"]:
+            lines.append(
+                f"Swap pressure: {verdict.get('swap_used_pct', 0):.0f}% used — "
+                f"{swap_check.get('reason', 'blocked')}"
+            )
+        elif swap_check.get("warning"):
+            lines.append(swap_check["warning"])
+        if swap_check.get("audit_mode"):
+            note = swap_check.get("audit_note")
+            if note:
+                lines.append(f"  [audit] {note}")
+
     if "memory_pressure" in checks:
         pressure_check = checks["memory_pressure"]
         if not pressure_check["allowed"]:
@@ -556,7 +606,7 @@ def cli():
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(as_json: bool):
-    """Show current fleet state."""
+    """Show current fleet state including discovered ollama runners and orphan detection."""
     conn = _get_conn()
     # Auto-clean dead PIDs
     cleaned = registry.clean_dead_pids(conn)
@@ -564,23 +614,60 @@ def status(as_json: bool):
         events.log_event(conn, "CLEAN", pid=c["pid"], workstream=c["workstream"],
                          detail={"reason": "dead_pid", "name": c["name"]})
 
+    # H1: discover ollama runners
+    runner_reports = ollama_runners.discover_ollama_runners()
+    runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
+    actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
+
+    # H3: detect orphan runners
+    orphan_result = orphan_detector.detect_orphans()
+    if orphan_result.orphans_detected:
+        events.log_event(
+            conn,
+            "ORPHAN_RUNNERS_DETECTED",
+            workstream="inference",
+            detail=orphan_result.to_dict(),
+        )
+
+    # Increment discovery counters
+    gate_counters = counters.load_counters()
+    gate_counters.increment("ollama_runner_discovery")
+    gate_counters.increment("orphan_detector")
+    counters.save_counters(gate_counters)
+
     if as_json:
         state = reporter.build_state(conn)
+        state["ollama_runners"] = [r.to_dict() for r in runner_reports]
+        state["ollama_runner_entries"] = runner_entries
+        state["actual_ollama_gpu_mb"] = actual_gpu
+        state["orphan_detection"] = orphan_result.to_dict()
         click.echo(json.dumps(state, indent=2, default=str))
     else:
         procs = registry.get_all_processes(conn)
         budget = registry.get_gpu_budget(conn)
 
-        if not procs:
+        if not procs and not runner_entries:
             click.echo("No active processes.")
         else:
-            click.echo(f"Active processes ({len(procs)}):")
-            click.echo(f"{'PID':>7}  {'Name':<20} {'Workstream':<18} {'Port':<6} {'GPU':>8} {'Pri':>3}")
-            click.echo("-" * 72)
+            total_count = len(procs) + len(runner_entries)
+            click.echo(f"Active processes ({total_count}):")
+            click.echo(f"{'PID':>7}  {'Name':<24} {'Workstream':<18} {'Port':<6} {'GPU':>8} {'Pri':>3}")
+            click.echo("-" * 78)
             for p in procs:
                 port = str(p["port"]) if p["port"] else "-"
                 gpu = f"{p['gpu_mb']}MB" if p["gpu_mb"] else "0MB"
-                click.echo(f"{p['pid']:>7}  {p['name']:<20} {p['workstream']:<18} {port:<6} {gpu:>8} {p['priority']:>3}")
+                click.echo(f"{p['pid']:>7}  {p['name']:<24} {p['workstream']:<18} {port:<6} {gpu:>8} {p['priority']:>3}")
+            # H1: synthetic runner entries
+            for entry in runner_entries:
+                port = str(entry["port"]) if entry.get("port") else "-"
+                gpu = f"{entry['gpu_mb']}MB"
+                click.echo(
+                    f"{entry['pid']:>7}  {entry['name']:<24} {entry['workstream']:<18} "
+                    f"{port:<6} {gpu:>8} {entry['priority']:>3}  [runner]"
+                )
+
+        if actual_gpu > 0:
+            click.echo(f"\nActual Ollama GPU: {actual_gpu:,} MB ({len(runner_reports)} serve instance(s))")
 
         external = registry.get_all_external_resources(conn)
         if external:
@@ -603,6 +690,13 @@ def status(as_json: bool):
         ports = registry.get_claimed_ports(conn)
         if ports:
             click.echo(f"Ports: {', '.join(str(p) for p in sorted(ports.keys()))}")
+
+        # H3: surface orphan detection
+        if orphan_result.orphans_detected:
+            click.echo(f"\nORPHAN_RUNNERS_DETECTED: {len(orphan_result.orphan_pids)} orphan(s)")
+            click.echo(f"  Orphan PIDs: {' '.join(str(p) for p in orphan_result.orphan_pids)}")
+            click.echo(f"  Estimated recovered: {orphan_result.estimated_recovered_mb:,} MB")
+            click.echo(f"  Suggested: {orphan_result.suggested_kill_command}")
 
     conn.close()
 
@@ -860,6 +954,83 @@ def release(pid: int | None, port: int | None):
             sys.exit(2)
 
     conn.close()
+
+
+@cli.command()
+@click.argument("pattern")
+@click.option("--confirm", is_flag=True, help="Execute kill (dry-run by default)")
+@click.option("--cascade", is_flag=True, help="Also kill child processes (depth 2)")
+def pkill(pattern: str, confirm: bool, cascade: bool):
+    """Kill processes matching PATTERN. Dry-run by default.
+
+    Requires explicit --confirm to execute. Use --cascade to also kill
+    child processes up to depth 2. Emits FLEET_PKILL_EXECUTED event.
+
+    Never invokable from other Fleet Watch code paths — operator-typed only.
+    """
+    result = pkill_mod.execute_pkill(pattern, cascade=cascade, confirm=confirm)
+
+    gate_counters = counters.load_counters()
+    gate_counters.increment("pkill_cascade")
+    counters.save_counters(gate_counters)
+
+    if result.errors and "no processes matching pattern" in result.errors[0]:
+        click.echo(f"No processes matching '{pattern}'", err=True)
+        sys.exit(1)
+
+    if not confirm:
+        click.echo(f"Dry run. {len(result.targets)} process(es) would be killed:")
+        for target in result.targets:
+            children_note = (
+                f" (+{len(target.children)} children)" if target.children else ""
+            )
+            click.echo(
+                f"  PID {target.pid:>7}  {target.rss_mb:>6} MB  {target.name}"
+                + children_note
+            )
+            if cascade and target.children:
+                for child in target.children:
+                    click.echo(
+                        f"    child PID {child.pid:>7}  {child.rss_mb:>6} MB  {child.name}"
+                    )
+        if cascade:
+            total_freed = sum(
+                t.rss_mb + sum(c.rss_mb for c in t.children)
+                for t in result.targets
+            )
+        else:
+            total_freed = sum(t.rss_mb for t in result.targets)
+        click.echo(f"Potential memory freed: {total_freed:,} MB")
+        click.echo("Run `fleet pkill --confirm [--cascade] <pattern>` to execute.")
+        return
+
+    click.echo(f"Killed {len(result.pids_killed)} process(es)")
+    if result.children_killed:
+        click.echo(f"Killed {len(result.children_killed)} child process(es)")
+    click.echo(f"Memory freed: {result.total_rss_freed_mb:,} MB")
+
+    if result.errors:
+        for err in result.errors:
+            click.echo(f"ERROR: {err}", err=True)
+
+    if result.killed_any:
+        conn = _get_conn()
+        events.log_event(
+            conn,
+            "FLEET_PKILL_EXECUTED",
+            workstream="operator",
+            detail={
+                "pattern": pattern,
+                "cascade": cascade,
+                "pids_killed": result.pids_killed,
+                "children_killed": result.children_killed,
+                "operator_authorized": True,
+                "total_rss_freed_mb": result.total_rss_freed_mb,
+            },
+        )
+        conn.close()
+
+    sys.exit(0 if not result.errors else 1)
 
 
 @cli.command("share-repo")
@@ -1730,6 +1901,48 @@ def health(as_json: bool):
     flagged = [s for s in sessions if s.attention]
     if flagged:
         _notify_attention(flagged)
+
+
+@cli.command("boot-coverage")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def boot_coverage(as_json: bool):
+    """Cross-check fleet-registered processes against launchd-loaded services."""
+    conn = _get_conn()
+    procs = registry.get_all_processes(conn)
+    conn.close()
+
+    if not procs:
+        payload = {
+            "schema_version": boot_coverage_mod.SCHEMA_VERSION,
+            "generated_utc": boot_coverage_mod._now_iso(),
+            "processes_assessed": 0,
+            "by_verdict": {},
+            "results": [],
+        }
+        if as_json:
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            click.echo("No registered processes to assess.")
+        return
+
+    payload = boot_coverage_mod.run(procs, as_json=as_json)
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+
+    click.echo(f"Boot Persistence Coverage ({payload['processes_assessed']} processes):\n")
+    for r in payload["results"]:
+        flag = {"HAS_PERSISTENCE": "PERSIST", "NO_PERSISTENCE_WILL_DIE_ON_REBOOT": "NO_PERSIST", "PLIST_PRESENT_BUT_UNLOADED": "UNLOADED"}[r["verdict"]]
+        port_str = f":{r['port']}" if r.get("port") else ""
+        click.echo(f"  [{flag}] PID {r['pid']} ({r['name']}{port_str})")
+        if r.get("suggested_plist"):
+            suggested_path = Path.home() / "Library" / "LaunchAgents" / f"{r['suggested_label']}.plist"
+            click.echo(f"         Suggested plist: {suggested_path}")
+
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(payload["by_verdict"].items()))
+    click.echo(f"\nSummary: {summary}")
+    click.echo(f"Receipt: {payload.get('receipt_path', 'N/A')}")
 
 
 @cli.command()

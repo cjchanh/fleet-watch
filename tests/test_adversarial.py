@@ -83,6 +83,12 @@ STATE_KEYS = {
     "sessions",
     "idle_processes",
     "gpu_memory_monitor",
+    "ollama_runners",
+    "ollama_runner_entries",
+    "actual_ollama_gpu_mb",
+    "swap_pressure",
+    "orphan_detection",
+    "gate_counters",
 }
 
 

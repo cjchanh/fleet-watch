@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import discover, events, referee, registry, syshealth
+from fleet_watch import counters, discover, events, referee, registry, syshealth
+from fleet_watch.discovery import ollama_runners, orphan_detector
+from fleet_watch.guards import memory_pressure
 
 
 def _now_iso() -> str:
@@ -71,6 +73,20 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     gpu_monitor = discover.load_gpu_monitor_state()
 
+    # H1: ollama runner discovery
+    runner_reports = ollama_runners.discover_ollama_runners()
+    runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
+    actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
+
+    # H2: swap pressure state
+    swap_verdict = memory_pressure.check_swap_pressure()
+
+    # H3: orphan detection
+    orphan_result = orphan_detector.detect_orphans()
+
+    # Gate counters
+    gate_counters = counters.load_counters()
+
     state.update({
         "session_leases": registry.list_session_leases(conn),
         "process_classifications": classifications,
@@ -101,6 +117,12 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
         ],
         "idle_processes": idle,
         "gpu_memory_monitor": gpu_monitor,
+        "ollama_runners": [r.to_dict() for r in runner_reports],
+        "ollama_runner_entries": runner_entries,
+        "actual_ollama_gpu_mb": actual_gpu,
+        "swap_pressure": swap_verdict.to_dict(),
+        "orphan_detection": orphan_result.to_dict(),
+        "gate_counters": gate_counters.to_dict(),
     })
     return state
 
@@ -260,6 +282,55 @@ def generate_markdown(state: dict[str, Any]) -> str:
             lines.append(f"- Free: {mem['free_mb']:,} MB | Inactive: {mem['inactive_mb']:,} MB | "
                          f"Available: {mem['available_mb']:,} MB")
             lines.append(f"- Pageouts: {mem.get('pageouts', 0):,} | Swapins: {mem.get('swapins', 0):,}")
+        lines.append("")
+
+    # H1: discovered ollama runners
+    runner_entries = state.get("ollama_runner_entries", [])
+    if runner_entries:
+        total_runner_gpu = state.get("actual_ollama_gpu_mb", 0)
+        runner_reports = state.get("ollama_runners", [])
+        serve_count = len(runner_reports)
+        lines.append(f"## Discovered Ollama Runners ({len(runner_entries)} runner(s), {total_runner_gpu:,} MB, {serve_count} serve instance(s))")
+        lines.append("")
+        lines.append("| PID | Name | Port | GPU (RSS) | Parent PID | Model |")
+        lines.append("|-----|------|------|-----------|------------|-------|")
+        for entry in runner_entries:
+            port = str(entry.get("port") or "-")
+            gpu = f"{entry.get('rss_mb', 0):,} MB"
+            parent = str(entry.get("parent_pid", "-"))
+            lines.append(
+                f"| {entry['pid']} | {entry['name']} | {port} | {gpu} | {parent} | "
+                f"{entry.get('model_hash', '?')} |"
+            )
+        lines.append("")
+
+    # H2: memory pressure state
+    swap_pressure = state.get("swap_pressure", {})
+    if swap_pressure:
+        used_pct = swap_pressure.get("swap_used_pct", 0)
+        crossings = swap_pressure.get("threshold_crossings", [])
+        if crossings:
+            lines.append(f"## Memory Pressure — {' '.join(crossings).upper()}")
+        else:
+            lines.append("## Memory Pressure — NORMAL")
+        lines.append("")
+        lines.append(f"- Swap: {swap_pressure.get('swap_used_mb', 0):,} / {swap_pressure.get('swap_total_mb', 0):,} MB ({used_pct:.0f}%)")
+        lines.append(f"- GPU workloads blocked: {'YES' if swap_pressure.get('gpu_blocked') else 'no'}")
+        lines.append(f"- All workloads blocked: {'YES' if swap_pressure.get('all_blocked') else 'no'}")
+        lines.append(f"- Thresholds: warning={swap_pressure.get('thresholds_used', {}).get('swap_warning_pct', '?')}% | "
+                     f"GPU refusal={swap_pressure.get('thresholds_used', {}).get('swap_gpu_refusal_pct', '?')}% | "
+                     f"all refusal={swap_pressure.get('thresholds_used', {}).get('swap_all_refusal_pct', '?')}%")
+        lines.append("")
+
+    # H3: orphan detection
+    orphan = state.get("orphan_detection", {})
+    if orphan.get("orphans_detected"):
+        lines.append("## Orphan Runners Detected")
+        lines.append("")
+        lines.append(f"- Known models: {orphan.get('known_model_count', 0)} | Runner processes: {orphan.get('runner_process_count', 0)}")
+        lines.append(f"- Orphan PIDs: {' '.join(str(p) for p in orphan.get('orphan_pids', []))}")
+        lines.append(f"- Estimated recovered: {orphan.get('estimated_recovered_mb', 0):,} MB")
+        lines.append(f"- Suggested command: `{orphan.get('suggested_kill_command', '')}`")
         lines.append("")
 
     gpu_monitor = state.get("gpu_memory_monitor") or {}

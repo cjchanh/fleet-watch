@@ -52,7 +52,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "framework",
         "model",
     }
-    assert set(payload["checks"].keys()) == {"port", "repo", "gpu", "memory_pressure"}
+    assert set(payload["checks"].keys()) == {"port", "repo", "gpu", "memory_pressure", "swap_pressure"}
     assert set(payload["checks"]["port"].keys()) == {
         "allowed",
         "reason",
@@ -93,6 +93,9 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "system_memory",
         "swap",
         "external_resources",
+        "ollama_runners",
+        "ollama_runner_entries",
+        "actual_ollama_gpu_mb",
     }
     assert set(payload["state"]["gpu_budget"].keys()) == {
         "total_mb",
@@ -188,6 +191,12 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
         "sessions",
         "idle_processes",
         "gpu_memory_monitor",
+        "ollama_runners",
+        "ollama_runner_entries",
+        "actual_ollama_gpu_mb",
+        "swap_pressure",
+        "orphan_detection",
+        "gate_counters",
     }
     assert set(state["gpu_budget"].keys()) == {
         "total_mb",
