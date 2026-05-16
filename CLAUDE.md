@@ -1,5 +1,3 @@
-<!-- Mirror of adjacent CLAUDE.md — kept byte-identical for OpenAI/opencode cross-tool compatibility -->
-
 # CLAUDE.md — fleet-watch
 
 ## Folder Purpose
