@@ -235,6 +235,63 @@ def test_clean_dead_pids():
     assert budget["allocated_mb"] == 0
 
 
+def test_clean_stale_session_leases_closes_dead_stale_owner_with_limit(monkeypatch):
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn,
+        "stale-a",
+        owner_pid=2147483646,
+        repo_dir="/tmp/repo-a",
+        repo_lock_mode="exclusive",
+    )
+    registry.upsert_session_lease(
+        conn,
+        "stale-b",
+        owner_pid=2147483645,
+        repo_dir="/tmp/repo-b",
+        repo_lock_mode="exclusive",
+    )
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+
+    cleaned = registry.clean_stale_session_leases(conn, limit=1)
+
+    assert cleaned == [
+        {
+            "reason": "stale_dead_session_lease",
+            "session_id": "stale-a",
+            "owner_pid": 2147483646,
+            "repo_dir": str(Path("/tmp/repo-a").resolve()),
+            "repo_lock_mode": "exclusive",
+            "heartbeat_age_seconds": 999,
+        }
+    ]
+    assert registry.get_session_lease(conn, "stale-a")["status"] == "CLOSED"
+    assert registry.get_session_lease(conn, "stale-b")["status"] == "ACTIVE"
+
+
+def test_clean_stale_session_leases_limit_order_is_deterministic(monkeypatch):
+    conn = _fresh_conn()
+    monkeypatch.setattr(registry, "_now_iso", lambda: "2026-05-23T00:00:00+00:00")
+    for index in reversed(range(55)):
+        registry.upsert_session_lease(
+            conn,
+            f"stale-{index:03d}",
+            owner_pid=90000 + index,
+            repo_dir="/tmp/repo",
+        )
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+
+    cleaned = registry.clean_stale_session_leases(conn, limit=50)
+
+    assert [row["session_id"] for row in cleaned] == [f"stale-{index:03d}" for index in range(50)]
+    assert registry.get_session_lease(conn, "stale-000")["status"] == "CLOSED"
+    assert registry.get_session_lease(conn, "stale-049")["status"] == "CLOSED"
+    assert registry.get_session_lease(conn, "stale-050")["status"] == "ACTIVE"
+    assert registry.get_session_lease(conn, "stale-054")["status"] == "ACTIVE"
+
+
 def test_invalid_priority():
     conn = _fresh_conn()
     try:

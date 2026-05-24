@@ -187,6 +187,98 @@ def test_guard_repo_denied_by_exclusive_session_lease_includes_unblock_command(t
     assert repo_check["unblock_command"] == "fleet session close --session-id sess-editor"
 
 
+def test_guard_repo_cleans_stale_dead_exclusive_session_before_payload(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dead_pid = 2147483646
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-stale",
+        owner_pid=dead_pid,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    conn.close()
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid != dead_pid)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        ["guard", "--repo", str(repo), "--exclusive-repo-lock", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert payload["allowed"] is True
+    assert repo_check["allowed"] is True
+    assert repo_check["holder"] is None
+    assert [holder["session_id"] for holder in repo_check["stale_holders"]] == ["sess-stale"]
+    assert str(repo.resolve()) not in payload["state"]["locked_repos"]
+
+    conn = registry.connect()
+    lease = registry.get_session_lease(conn, "sess-stale")
+    row = conn.execute(
+        "SELECT pid, workstream, detail FROM events WHERE event_type = 'CLEAN'"
+    ).fetchone()
+    conn.close()
+
+    assert lease is not None
+    assert lease["status"] == "CLOSED"
+    assert row is not None
+    assert row[0] == dead_pid
+    assert row[1] == "session"
+    detail = json.loads(row[2])
+    assert detail["source"] == "guard"
+    assert detail["reason"] == "stale_dead_session_lease"
+    assert detail["session_id"] == "sess-stale"
+    assert detail["repo_dir"] == str(repo.resolve())
+
+
+def test_guard_repo_reports_stale_cleaned_lease_even_when_active_holder_denies(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    stale_pid = 2147483646
+    active_pid = 2147483645
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-stale",
+        owner_pid=stale_pid,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    registry.upsert_session_lease(
+        conn,
+        "sess-active",
+        owner_pid=active_pid,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    conn.close()
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid == active_pid)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 999 if ts else None)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--repo", str(repo), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is False
+    assert repo_check["holder"]["session_id"] == "sess-active"
+    assert [holder["session_id"] for holder in repo_check["stale_holders"]] == ["sess-stale"]
+
+    conn = registry.connect()
+    assert registry.get_session_lease(conn, "sess-stale")["status"] == "CLOSED"
+    assert registry.get_session_lease(conn, "sess-active")["status"] == "ACTIVE"
+    conn.close()
+
+
 def test_guard_repo_denies_overlapping_write_scope(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     repo = tmp_path / "repo"

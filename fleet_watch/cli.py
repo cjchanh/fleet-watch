@@ -237,6 +237,7 @@ def _build_guard_payload(
     model_hint: str | None = None,
     current_session_id: str | None = None,
     runaway_tracker: runaway.DaemonRunawayTracker | None = None,
+    stale_session_leases_cleaned: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     state = reporter.build_guard_state(conn)
     budget = state["gpu_budget"]
@@ -317,6 +318,22 @@ def _build_guard_payload(
         payload["allowed"] = payload["allowed"] and decision.allowed
 
     if repo_dir is not None:
+        stale_holders = [
+            {
+                "pid": lease.get("owner_pid"),
+                "name": f"session {lease['session_id']}",
+                "workstream": "session",
+                "priority": 3,
+                "port": None,
+                "repo_dir": lease.get("repo_dir"),
+                "gpu_mb": 0,
+                "session_id": lease["session_id"],
+                "repo_lock_mode": lease.get("repo_lock_mode", "cooperative"),
+                "write_scopes": lease.get("write_scopes", []),
+            }
+            for lease in (stale_session_leases_cleaned or [])
+            if lease.get("repo_dir") == str(Path(repo_dir).resolve())
+        ]
         decision = referee.check_repo_with_session(
             conn,
             repo_dir,
@@ -330,7 +347,10 @@ def _build_guard_payload(
             "holder": referee.summarize_holder(decision.holder),
             "holders": [referee.summarize_holder(holder) for holder in decision.holders],
             "overlap_paths": decision.overlap_paths,
-            "stale_holders": [referee.summarize_holder(holder) for holder in decision.stale_holders],
+            "stale_holders": [
+                referee.summarize_holder(holder)
+                for holder in [*stale_holders, *decision.stale_holders]
+            ],
             "safe_mode": decision.safe_mode,
         }
         unblock_command = _repo_unblock_command(decision.holder)
@@ -849,6 +869,15 @@ def guard(
             workstream=cleaned["workstream"],
             detail={"reason": "dead_pid", "name": cleaned["name"]},
         )
+    stale_session_leases_cleaned = registry.clean_stale_session_leases(conn)
+    for cleaned in stale_session_leases_cleaned:
+        events.log_event(
+            conn,
+            "CLEAN",
+            pid=cleaned["owner_pid"],
+            workstream="session",
+            detail={**cleaned, "source": "guard"},
+        )
 
     payload = _build_guard_payload(
         conn,
@@ -860,6 +889,7 @@ def guard(
         framework=framework,
         model_hint=model_hint,
         current_session_id=current_session_id,
+        stale_session_leases_cleaned=stale_session_leases_cleaned,
     )
 
     gpu_check = payload["checks"].get("gpu")

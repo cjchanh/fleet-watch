@@ -393,45 +393,22 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
     return len(mapped)
 
 
-_MAX_LEASE_CLEANUP_PER_CYCLE = 50
+_MAX_LEASE_CLEANUP_PER_CYCLE = registry.DEFAULT_SESSION_LEASE_CLEANUP_LIMIT
 _GPU_MONITOR_STATE_FILE = "gpu_memory_monitor.json"
 
 
 def _clean_stale_session_leases(conn: sqlite3.Connection) -> int:
-    """Close ACTIVE session leases whose owner PID is dead and heartbeat is stale.
-
-    Bounded to _MAX_LEASE_CLEANUP_PER_CYCLE per invocation to avoid
-    monopolising a sync cycle when thousands of leases have accumulated.
-    """
-    cleaned = 0
-    for lease in registry.list_session_leases(conn):
-        if cleaned >= _MAX_LEASE_CLEANUP_PER_CYCLE:
-            break
-        if lease["status"] != "ACTIVE" or lease.get("shutdown_at") is not None:
-            continue
-        owner_pid = lease.get("owner_pid")
-        if owner_pid is None or registry._pid_exists(owner_pid):
-            continue
-        age = registry._age_seconds(lease.get("last_heartbeat_at"))
-        if age is None or age <= registry.DEFAULT_STALE_SECONDS:
-            continue
-        try:
-            registry.close_session_lease(conn, lease["session_id"])
-            events.log_event(
-                conn,
-                "CLEAN",
-                pid=owner_pid,
-                workstream="session",
-                detail={
-                    "reason": "stale_dead_session_lease",
-                    "session_id": lease["session_id"],
-                    "owner_pid": owner_pid,
-                },
-            )
-            cleaned += 1
-        except (sqlite3.Error, OSError):
-            continue
-    return cleaned
+    """Close stale dead-owner session leases during discover."""
+    cleaned = registry.clean_stale_session_leases(conn, limit=_MAX_LEASE_CLEANUP_PER_CYCLE)
+    for lease in cleaned:
+        events.log_event(
+            conn,
+            "CLEAN",
+            pid=lease["owner_pid"],
+            workstream="session",
+            detail={**lease, "source": "discover"},
+        )
+    return len(cleaned)
 
 
 def gpu_monitor_state_path() -> Path:
