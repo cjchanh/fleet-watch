@@ -15,6 +15,7 @@ DB_PATH = FLEET_DIR / "registry.db"
 DEFAULT_GPU_TOTAL_MB = 131072
 DEFAULT_GPU_RESERVE_MB = 16384
 DEFAULT_STALE_SECONDS = 180
+DEFAULT_SESSION_LEASE_CLEANUP_LIMIT = 50
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS processes (
@@ -523,7 +524,7 @@ def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
                repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
-        ORDER BY started_at ASC
+        ORDER BY started_at ASC, session_id ASC
         """
     ).fetchall()
     return [_session_lease_row_to_dict(row) for row in rows]
@@ -786,6 +787,46 @@ def clean_dead_pids(
         if not _pid_exists(pid):
             release_process(conn, pid)
             cleaned.append({"pid": pid, "name": name, "workstream": ws})
+    return cleaned
+
+
+def clean_stale_session_leases(
+    conn: sqlite3.Connection,
+    limit: int = DEFAULT_SESSION_LEASE_CLEANUP_LIMIT,
+    stale_seconds: int = DEFAULT_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    """Close ACTIVE session leases whose owner PID is dead and heartbeat is stale."""
+    if limit <= 0:
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for lease in list_session_leases(conn):
+        if len(cleaned) >= limit:
+            break
+        if lease["status"] != "ACTIVE" or lease.get("shutdown_at") is not None:
+            continue
+        owner_pid = lease.get("owner_pid")
+        if owner_pid is None or _pid_exists(owner_pid):
+            continue
+        heartbeat_age = _age_seconds(lease.get("last_heartbeat_at"))
+        if heartbeat_age is None or heartbeat_age <= stale_seconds:
+            continue
+        try:
+            closed = close_session_lease(conn, lease["session_id"])
+        except (sqlite3.Error, OSError):
+            continue
+        if not closed:
+            continue
+        cleaned.append(
+            {
+                "reason": "stale_dead_session_lease",
+                "session_id": lease["session_id"],
+                "owner_pid": owner_pid,
+                "repo_dir": lease.get("repo_dir"),
+                "repo_lock_mode": lease.get("repo_lock_mode", "cooperative"),
+                "heartbeat_age_seconds": heartbeat_age,
+            }
+        )
     return cleaned
 
 
