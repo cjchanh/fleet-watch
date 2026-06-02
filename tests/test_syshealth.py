@@ -227,7 +227,9 @@ def test_launch_pressure_allows_shrunk_dynamic_swap_below_free_floor():
     assert syshealth.launch_pressure_blockers(mem, swap) == []
 
 
-def test_launch_pressure_blocks_low_free_swap_when_pool_can_satisfy_floor():
+def test_launch_pressure_allows_low_free_swap_when_ram_abundant():
+    # 128GB host, ~90GB RAM available: a low-free swap pool must NOT block a
+    # launch. swap-free is a thrashing proxy; real memory has ample headroom.
     mem = syshealth.MemoryState(
         total_mb=131072,
         active_mb=23000,
@@ -238,15 +240,67 @@ def test_launch_pressure_blocks_low_free_swap_when_pool_can_satisfy_floor():
     )
     swap = syshealth.SwapState(total_mb=8192, used_mb=6144, free_mb=2048, encrypted=True)
 
-    blockers = syshealth.launch_pressure_blockers(mem, swap)
+    assert syshealth.launch_pressure_blockers(mem, swap) == []
 
-    assert blockers == [
-        {
-            "code": "SWAP_FREE_LOW",
-            "swap_free_mb": 2048,
-            "required_min_free_mb": 4096,
-        }
-    ]
+
+def test_launch_pressure_blocks_low_free_swap_when_memory_also_pressured():
+    # Same low-free swap, but RAM is genuinely scarce (available < floor):
+    # SWAP_FREE_LOW corroborated by real pressure -> block (protection preserved).
+    mem = syshealth.MemoryState(
+        total_mb=131072,
+        active_mb=120000,
+        inactive_mb=1000,
+        free_mb=1000,
+        compressed_mb=8000,
+        wired_mb=1072,
+    )
+    swap = syshealth.SwapState(total_mb=8192, used_mb=6144, free_mb=2048, encrypted=True)
+
+    codes = {b["code"] for b in syshealth.launch_pressure_blockers(mem, swap)}
+    assert "SWAP_FREE_LOW" in codes
+
+
+def test_launch_pressure_skips_swap_free_low_for_tiny_pool_even_when_pressured():
+    # Swap pool smaller than the free floor: SWAP_FREE_LOW must not fire even
+    # when memory is genuinely pressured (the total_mb >= floor guard still applies).
+    mem = syshealth.MemoryState(
+        total_mb=131072,
+        active_mb=120000,
+        inactive_mb=1000,
+        free_mb=1000,
+        compressed_mb=8000,
+        wired_mb=1072,
+    )
+    swap = syshealth.SwapState(total_mb=2048, used_mb=2000, free_mb=48, encrypted=True)
+
+    codes = {b["code"] for b in syshealth.launch_pressure_blockers(mem, swap)}
+    assert "SWAP_FREE_LOW" not in codes
+
+
+def test_get_total_memory_mb_returns_zero_on_malformed_sysctl(monkeypatch):
+    # Non-integer sysctl output must NOT raise (guard must never propagate an
+    # exception) — fail-closed to 0.
+    class _R:
+        returncode = 0
+        stdout = "not-a-number"
+
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **k: _R())
+    assert syshealth._get_total_memory_mb() == 0
+
+
+def test_get_memory_state_fails_closed_when_vm_stat_fails(monkeypatch):
+    # sysctl gives total RAM but vm_stat fails: the state must be unavailable
+    # (fail-closed) rather than fabricating all-RAM-free, so memory-gated guards
+    # treat partial telemetry as pressured.
+    monkeypatch.setattr(syshealth, "_get_total_memory_mb", lambda: 131072)
+
+    class _R:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **k: _R())
+    state = syshealth.get_memory_state()
+    assert state.is_available is False
 
 
 def test_pressure_label():
