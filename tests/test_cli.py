@@ -493,10 +493,13 @@ def test_guard_gpu_without_model_does_not_false_deny(tmp_path, monkeypatch):
 
 def test_guard_blocks_worker_launch_on_swap_pressure(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
+    # Memory genuinely pressured (available < floor) so the swap blockers are
+    # corroborated and fire. swap pressure ALONE no longer blocks (recalibrated
+    # for big-RAM hosts where a small dynamic swapfile fills without real pressure).
     monkeypatch.setattr(
         cli_module.syshealth,
         "get_memory_state",
-        lambda: syshealth.MemoryState(131072, 10000, 10000, 80000, 10000, 10000),
+        lambda: syshealth.MemoryState(131072, 118000, 2000, 2000, 8000, 1072),
     )
     monkeypatch.setattr(
         cli_module.syshealth,

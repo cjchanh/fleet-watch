@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from fleet_watch.guards.memory_pressure import (
     SwapPressureVerdict,
     check_swap_pressure,
@@ -131,3 +133,75 @@ class TestLoadThresholds:
         assert t["swap_warning_pct"] == DEFAULT_THRESHOLDS["swap_warning_pct"]
         assert t["swap_gpu_refusal_pct"] == DEFAULT_THRESHOLDS["swap_gpu_refusal_pct"]
         assert t["swap_all_refusal_pct"] == DEFAULT_THRESHOLDS["swap_all_refusal_pct"]
+
+
+def _swap(pct, total=4096, used=3354, free=742, avail=True):
+    return SimpleNamespace(is_available=avail, used_pct=pct,
+                           total_mb=total, used_mb=used, free_mb=free)
+
+
+def _mem(available_mb, pressure_pct, avail=True):
+    return SimpleNamespace(is_available=avail, available_mb=available_mb,
+                           pressure_pct=pressure_pct)
+
+
+class TestMemoryCorroboration:
+    """GPU/ALL refusal require real-memory pressure, not swap-% alone."""
+
+    def test_high_swap_pct_but_ample_ram_allows_gpu(self):
+        # 128GB host: swap 81% of a 4GB swapfile, 78GB RAM free, 41% pressure.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(81.0),
+                                mem_state=_mem(78000, 41))
+        assert v.warning            # swap-% warning still fires (advisory)
+        assert not v.gpu_blocked    # but GPU is NOT refused — memory is fine
+        assert not v.all_blocked
+        assert v.mem_pressured is False
+        assert guard_decision(v, gpu_requested=True, audit_cycles=20)["allowed"]
+
+    def test_high_swap_and_low_ram_blocks_gpu(self):
+        # genuine thrashing: swap 85% AND only 2GB available.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(85.0),
+                                mem_state=_mem(2048, 90))
+        assert v.gpu_blocked        # protection preserved
+        assert v.mem_pressured is True
+
+    def test_high_swap_and_high_pressure_blocks_gpu(self):
+        # pressure ceiling (>=75%) corroborates even with some free RAM.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(85.0),
+                                mem_state=_mem(20000, 80))
+        assert v.gpu_blocked
+
+    def test_missing_mem_telemetry_fails_closed(self):
+        # memory unavailable => assume pressured => keep swap-only block.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(85.0),
+                                mem_state=_mem(0, -1, avail=False))
+        assert v.gpu_blocked
+        assert v.mem_pressured is True
+
+    def test_invalid_pressure_reading_fails_closed(self):
+        # is_available True but pressure_pct=-1 (invalid/unknown) with ample RAM:
+        # must fail-closed (treat as pressured), not silently allow GPU.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(85.0),
+                                mem_state=_mem(90000, -1))
+        assert v.gpu_blocked
+        assert v.mem_pressured is True
+
+    def test_critical_swap_with_ample_ram_does_not_all_block(self):
+        # swap 96% but 78GB free: ALL-refusal also requires corroboration.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(96.0),
+                                mem_state=_mem(78000, 41))
+        assert not v.all_blocked
+        assert not v.gpu_blocked
+
+
+class TestLoadThresholdsMemoryKeys:
+    def test_corroboration_thresholds_loaded(self):
+        t = load_thresholds()
+        assert "swap_refusal_min_avail_mb" in t
+        assert "swap_refusal_min_pressure_pct" in t

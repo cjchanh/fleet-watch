@@ -53,6 +53,11 @@ DEFAULT_LAUNCH_GUARD_THRESHOLDS = {
     "max_swap_used_pct": 85,
     "min_swap_free_mb": 4096,
     "max_pressure_pct": 80,
+    # Swap-based launch blockers only apply when memory is genuinely pressured:
+    # available RAM below this floor (or pressure >= max_pressure_pct). Prevents
+    # a small, proactively-used dynamic swapfile from false-blocking launches on
+    # big-RAM hosts (e.g. 741MB free of a 4GB swap while 76GB RAM is free).
+    "min_avail_mb_for_swap_block": 8192,
 }
 
 
@@ -189,10 +194,28 @@ def launch_pressure_blockers(
     swap: SwapState,
     thresholds: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return hard launch blockers for worker/model starts."""
+    """Return hard launch blockers for worker/model starts.
+
+    Swap-based blockers (SWAP_PRESSURE_HIGH, SWAP_FREE_LOW) require real-memory
+    corroboration — swap-% and free-swap are thrashing proxies that over-fire on
+    big-RAM hosts with small dynamic swapfiles, so they only block when memory is
+    genuinely pressured (available below the floor, or pressure at/above the
+    ceiling). MEMORY_PRESSURE_HIGH is the direct memory check and always applies.
+    Fail-closed: missing memory telemetry is treated as pressured.
+    """
     t = {**DEFAULT_LAUNCH_GUARD_THRESHOLDS, **(thresholds or {})}
     blockers: list[dict[str, Any]] = []
-    if swap.is_available and swap.used_pct >= t["max_swap_used_pct"]:
+    mem_pressured = (
+        not memory.is_available
+        or memory.pressure_pct < 0
+        or memory.available_mb < t["min_avail_mb_for_swap_block"]
+        or memory.pressure_pct >= t["max_pressure_pct"]
+    )
+    if (
+        swap.is_available
+        and swap.used_pct >= t["max_swap_used_pct"]
+        and mem_pressured
+    ):
         blockers.append({
             "code": "SWAP_PRESSURE_HIGH",
             "swap_used_pct": swap.used_pct,
@@ -204,6 +227,7 @@ def launch_pressure_blockers(
         swap.is_available
         and swap.total_mb >= t["min_swap_free_mb"]
         and swap.free_mb < t["min_swap_free_mb"]
+        and mem_pressured
     ):
         blockers.append({
             "code": "SWAP_FREE_LOW",
@@ -242,7 +266,10 @@ def get_memory_state() -> MemoryState:
             ["vm_stat"], capture_output=True, text=True, timeout=3,
         )
         if out.returncode != 0:
-            return MemoryState(total_mb, 0, 0, total_mb, 0, 0)
+            # vm_stat failed: page stats unknown. Fail-closed — return an
+            # unavailable state instead of claiming all RAM free, so guards that
+            # gate on memory pressure treat this as pressured, not headroom.
+            return MemoryState(0, 0, 0, 0, 0, 0)
         for line in out.stdout.splitlines():
             match = re.match(r"(.+?):\s+(\d+)", line)
             if match:
@@ -251,7 +278,8 @@ def get_memory_state() -> MemoryState:
         if ps_match:
             page_size = int(ps_match.group(1))
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return MemoryState(total_mb, 0, 0, total_mb, 0, 0)
+        # vm_stat unavailable: fail-closed (see above) — do not fabricate free RAM.
+        return MemoryState(0, 0, 0, 0, 0, 0)
 
     def mb(key: str) -> int:
         return pages.get(key, 0) * page_size // (1024 * 1024)
@@ -269,14 +297,25 @@ def get_memory_state() -> MemoryState:
 
 
 def _get_total_memory_mb() -> int:
-    """Get total physical memory in MB. Returns 0 on failure."""
-    out = subprocess.run(
-        ["sysctl", "-n", "hw.memsize"],
-        capture_output=True, text=True, timeout=3,
-    )
-    if out.returncode == 0:
+    """Get total physical memory in MB. Returns 0 on any failure (never raises).
+
+    Returning 0 makes get_memory_state fall through to an unavailable
+    MemoryState, which guards treat as fail-closed (memory pressured). This must
+    never propagate an exception: fleet guard must always return a decision.
+    """
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return 0
+    if out.returncode != 0:
+        return 0
+    try:
         return int(out.stdout.strip()) // (1024 * 1024)
-    return 0
+    except ValueError:
+        return 0
 
 
 def _get_linux_memory_state() -> MemoryState | None:
