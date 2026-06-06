@@ -1,0 +1,22 @@
+{
+  "calibration": {
+    "method": "production_guard_expected_vs_observed",
+    "threshold_version": "v1"
+  },
+  "decision": "PASS",
+  "evidence": [
+    {
+      "guard_call_id": "guard-20260606-0001",
+      "path": "raw/guard_calls.jsonl",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "metrics": {
+    "false_negative_count": 0,
+    "false_positive_count": 0,
+    "mismatch_count": 0,
+    "observation_count": 12,
+    "post_calibration_error_pct": 8.5
+  },
+  "schema_version": "fleet-watch/real-validation-comparator/v1"
+}
