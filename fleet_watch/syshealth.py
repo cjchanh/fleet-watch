@@ -60,6 +60,15 @@ DEFAULT_LAUNCH_GUARD_THRESHOLDS = {
     "min_avail_mb_for_swap_block": 8192,
 }
 
+# macOS authoritative memory-pressure signal (the level the kernel itself uses
+# to decide app jetsam-kills): ``sysctl kern.memorystatus_vm_pressure_level``.
+# 1 = normal, 2 = warning, 4 = critical. This is ground truth; swap-% and the
+# computed pressure-% are PROXIES that over-read on big-RAM hosts with small
+# dynamic swapfiles (spec 2615908).
+VM_PRESSURE_NORMAL = 1
+VM_PRESSURE_WARN = 2
+VM_PRESSURE_CRITICAL = 4
+
 
 # --- Memory ---
 
@@ -316,6 +325,44 @@ def _get_total_memory_mb() -> int:
         return int(out.stdout.strip()) // (1024 * 1024)
     except ValueError:
         return 0
+
+
+def get_total_memory_mb() -> int:
+    """Public accessor for total physical RAM in MB (0 on failure).
+
+    Used by the swap-pressure gate to scale its available-RAM refusal floor to
+    the host — a fixed floor is wrong across a 16GB laptop and a 128GB Mac
+    (spec 2615908).
+    """
+    return _get_total_memory_mb()
+
+
+def get_vm_pressure_level() -> int | None:
+    """Read macOS's authoritative memory-pressure level (spec 2615908).
+
+    ``sysctl -n kern.memorystatus_vm_pressure_level`` returns the kernel's own
+    pressure classification — the signal it uses to decide app jetsam-kills — as
+    an integer: 1 normal / 2 warning / 4 critical. This is ground truth; swap-%
+    and the computed pressure-% are PROXIES that over-read on big-RAM hosts.
+
+    Returns the integer level, or ``None`` when the signal is unreadable
+    (non-macOS, sysctl missing/failed, or non-integer output). FAIL-CLOSED by
+    contract: callers treat ``None`` as pressured/refuse so an unreadable signal
+    never silently admits a workload onto a possibly-starved host.
+    """
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _get_linux_memory_state() -> MemoryState | None:
