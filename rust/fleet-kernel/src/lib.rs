@@ -1,17 +1,20 @@
-//! Fleet Watch governance kernel — Rust port (PS-A + PS-B).
+//! Fleet Watch governance kernel — Rust port (PS-A, PS-B, PS-C, PS-B2).
 //!
 //! The deterministic decision core of Fleet Watch, ported from the proven
-//! Python `fleet_watch.referee`; every function is parity-tested against the
-//! live Python reference.
+//! Python `fleet_watch.{referee, events, registry}`; every function is
+//! parity-tested against the live Python reference.
 //!
 //! Landed:
 //!   * PS-A — `Decision` contract + lexical path-overlap helpers
 //!     (`paths_overlap`, `overlap_paths`), zero I/O.
 //!   * PS-B — `normalize_write_scopes` + a Python-faithful `resolve`
 //!     (filesystem path resolution, `strict=False` semantics).
+//!   * PS-C — `events`: hash-chain ledger core (`compute_event_hash`,
+//!     `verify_chain`), SHA-256 parity with Python `_compute_hash`.
+//!   * PS-B2 — `registry` (read-only rusqlite layer) + `checks`
+//!     (`check_port`, `check_gpu_budget`), fail-closed on DB error.
 //!
 //! Deferred by design (see PATCHSET_PLAN_2026-06-13.md):
-//!   * `check_port` / `check_gpu_budget` + registry read layer — PS-C.
 //!   * `check_repo*` (stateful — GCs leases, releases PIDs, logs events) —
 //!     its own reconciler patchset, not a read core.
 //!   * `claim_*` / kill authority — PS-D.
@@ -25,6 +28,10 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+pub mod checks;
+pub mod events;
+pub mod registry;
 
 /// Outcome of a claim or guard decision. Mirrors `fleet_watch.referee.Decision`.
 ///

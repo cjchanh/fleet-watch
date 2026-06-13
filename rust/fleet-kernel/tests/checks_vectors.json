@@ -1,0 +1,47 @@
+[
+  {
+    "scenario": "port_claimed",
+    "check": "check_port",
+    "args": {
+      "port": 4242
+    },
+    "expected_allowed": false,
+    "expected_reason": "port 4242 claimed by PID 999 (demo)"
+  },
+  {
+    "scenario": "port_free",
+    "check": "check_port",
+    "args": {
+      "port": 5000
+    },
+    "expected_allowed": true,
+    "expected_reason": "port available"
+  },
+  {
+    "scenario": "gpu_zero",
+    "check": "check_gpu_budget",
+    "args": {
+      "gpu_mb": 0
+    },
+    "expected_allowed": true,
+    "expected_reason": "no GPU claim"
+  },
+  {
+    "scenario": "gpu_fits",
+    "check": "check_gpu_budget",
+    "args": {
+      "gpu_mb": 8192
+    },
+    "expected_allowed": true,
+    "expected_reason": "8192MB fits in 73728MB available"
+  },
+  {
+    "scenario": "gpu_exceeds",
+    "check": "check_gpu_budget",
+    "args": {
+      "gpu_mb": 100000
+    },
+    "expected_allowed": false,
+    "expected_reason": "GPU budget exceeded: requesting 100000MB but only 73728MB available (40960MB allocated of 114688MB allocatable)"
+  }
+]

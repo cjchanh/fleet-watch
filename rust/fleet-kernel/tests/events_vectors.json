@@ -1,0 +1,92 @@
+{
+  "hash_vectors": [
+    {
+      "prev": "genesis",
+      "ts": "2026-06-13T00:00:00+00:00",
+      "type": "REGISTER",
+      "detail": "{}",
+      "hash": "2cea8bc2897dcc195169909aed51df6c447379c94991775000dcfbe76f4d49dd"
+    },
+    {
+      "prev": "genesis",
+      "ts": "2026-06-13T00:00:00+00:00",
+      "type": "REGISTER",
+      "detail": "",
+      "hash": "ac54a521be754f11a4a92d2a13d44b7a767e65c350ebb2d68d3f0cae69b89e92"
+    },
+    {
+      "prev": "genesis",
+      "ts": "2026-06-13T12:34:56+00:00",
+      "type": "HEARTBEAT",
+      "detail": "{\"pid\":1234}",
+      "hash": "1f0b0b33d32db50f6239eb3bcce68cde654e1fe26e1175d2ff923d9977edd744"
+    },
+    {
+      "prev": "abc123",
+      "ts": "2026-06-13T00:00:00+00:00",
+      "type": "KILL",
+      "detail": "{\"reason\":\"timeout\"}",
+      "hash": "9eb26d55e5cb7af3f6a14da49c4dc6e1412c3046077c9b8acb3d68d7391411eb"
+    },
+    {
+      "prev": "genesis",
+      "ts": "2026-06-13T00:00:00+00:00",
+      "type": "SESSION_START",
+      "detail": "{\"workstream\":\"fleet\",\"pid\":999}",
+      "hash": "343362925dacb1027a6e71a0354a7a77b0e2c79177205297c740924506c613f1"
+    },
+    {
+      "prev": "abc123",
+      "ts": "2026-06-13T23:59:59+00:00",
+      "type": "RELEASE",
+      "detail": "{\"path\":\"/tmp/test\",\"unicode\":\"é汉字\"}",
+      "hash": "befbf1075cd54e3cc09e70b9305a4ff2002c6b15c2a2b16203082e7b7b3a6280"
+    }
+  ],
+  "valid_chain": [
+    {
+      "timestamp": "2026-06-13T10:00:00+00:00",
+      "event_type": "REGISTER",
+      "detail": "{\"pid\":100}",
+      "prev_hash": "genesis",
+      "hash": "c7332cdd84717b66e5c8508c2c6d2437a52357a266503d39a3e52be4e2f63e35"
+    },
+    {
+      "timestamp": "2026-06-13T10:01:00+00:00",
+      "event_type": "HEARTBEAT",
+      "detail": "{\"pid\":100}",
+      "prev_hash": "c7332cdd84717b66e5c8508c2c6d2437a52357a266503d39a3e52be4e2f63e35",
+      "hash": "0093153b643dccfcb079cda12091abc082acb747df11e87c5a4ad5bb3fd5d454"
+    },
+    {
+      "timestamp": "2026-06-13T10:02:00+00:00",
+      "event_type": "RELEASE",
+      "detail": "{\"pid\":100}",
+      "prev_hash": "0093153b643dccfcb079cda12091abc082acb747df11e87c5a4ad5bb3fd5d454",
+      "hash": "4fd577bc2805fc748091790182ecd6fffe819a020cc25047c41ea7ade6bea84d"
+    }
+  ],
+  "tampered_chain": [
+    {
+      "timestamp": "2026-06-13T10:00:00+00:00",
+      "event_type": "REGISTER",
+      "detail": "{\"pid\":100}",
+      "prev_hash": "genesis",
+      "hash": "c7332cdd84717b66e5c8508c2c6d2437a52357a266503d39a3e52be4e2f63e35"
+    },
+    {
+      "timestamp": "2026-06-13T10:01:00+00:00",
+      "event_type": "HEARTBEAT",
+      "detail": "{\"pid\":TAMPERED}",
+      "prev_hash": "c7332cdd84717b66e5c8508c2c6d2437a52357a266503d39a3e52be4e2f63e35",
+      "hash": "0093153b643dccfcb079cda12091abc082acb747df11e87c5a4ad5bb3fd5d454"
+    },
+    {
+      "timestamp": "2026-06-13T10:02:00+00:00",
+      "event_type": "RELEASE",
+      "detail": "{\"pid\":100}",
+      "prev_hash": "0093153b643dccfcb079cda12091abc082acb747df11e87c5a4ad5bb3fd5d454",
+      "hash": "4fd577bc2805fc748091790182ecd6fffe819a020cc25047c41ea7ade6bea84d"
+    }
+  ]
+}
