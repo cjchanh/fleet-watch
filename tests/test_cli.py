@@ -104,6 +104,48 @@ def test_session_start_and_close_updates_lease(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_session_list_json_shows_active_lease(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+    runner.invoke(
+        cli_module.cli,
+        ["session", "start", "--session-id", "sess-live", "--owner-pid", str(os.getpid())],
+    )
+
+    result = runner.invoke(cli_module.cli, ["session", "list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["session_leases"][0]["session_id"] == "sess-live"
+    assert payload["session_leases"][0]["status"] == "ACTIVE"
+
+
+def test_session_list_empty_is_clean(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["session", "list"])
+    assert result.exit_code == 0
+    assert "No active session leases." in result.output
+
+
+def test_session_list_active_excludes_closed_but_all_includes(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+    runner.invoke(
+        cli_module.cli,
+        ["session", "start", "--session-id", "sess-x", "--owner-pid", str(os.getpid())],
+    )
+    runner.invoke(cli_module.cli, ["session", "close", "--session-id", "sess-x"])
+
+    active = runner.invoke(cli_module.cli, ["session", "list", "--json"])
+    assert json.loads(active.output)["count"] == 0  # closed lease excluded by default
+
+    everything = runner.invoke(cli_module.cli, ["session", "list", "--all", "--json"])
+    payload = json.loads(everything.output)
+    assert payload["count"] == 1
+    assert payload["session_leases"][0]["status"] == "CLOSED"
+
+
 def test_session_start_records_write_scope(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     repo = tmp_path / "repo"

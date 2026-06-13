@@ -1340,6 +1340,45 @@ def session_close(session_id: str):
     conn.close()
 
 
+@session.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Include closed leases (default: active only)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def session_list(show_all: bool, as_json: bool):
+    """List session leases (active only by default).
+
+    Read-only: enumerates the explicit session leases other commands open via
+    ``session start``/``ensure``. This is the missing read counterpart to
+    start/heartbeat/close — leases could be opened and closed but never listed.
+    """
+    conn = _get_conn()
+    try:
+        leases = (
+            registry.list_session_leases(conn)
+            if show_all
+            else registry.list_active_session_leases(conn)
+        )
+    finally:
+        conn.close()
+
+    if as_json:
+        click.echo(json.dumps({"session_leases": leases, "count": len(leases)}, indent=2, default=str))
+        return
+
+    if not leases:
+        click.echo("No session leases." if show_all else "No active session leases.")
+        return
+
+    click.echo(f"{'SESSION_ID':<40} {'PID':>7} {'STATUS':<8} {'REPO':<28} LAST_HEARTBEAT")
+    for lease in leases:
+        click.echo(
+            f"{str(lease.get('session_id', '?')):<40} "
+            f"{str(lease.get('owner_pid') or '-'):>7} "
+            f"{str(lease.get('status', '?')):<8} "
+            f"{str(lease.get('repo_dir') or '-'):<28} "
+            f"{lease.get('last_heartbeat_at') or '-'}"
+        )
+
+
 @cli.command()
 @click.option("--port", type=int, required=True, help="Port to preempt")
 @click.option("--priority", type=click.IntRange(1, 5), required=True, help="Priority of the requesting workload")
