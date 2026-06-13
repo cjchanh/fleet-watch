@@ -33,7 +33,9 @@ pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessRow {
     pub pid: i64,
+    pub workstream: String,
     pub name: String,
+    pub priority: i64,
     pub port: Option<i64>,
 }
 
@@ -53,7 +55,9 @@ pub fn get_process_by_port(conn: &Connection, port: i64) -> Result<Option<Proces
         None => Ok(None),
         Some(row) => Ok(Some(ProcessRow {
             pid: row.get(0)?,
+            workstream: row.get(2)?,
             name: row.get(3)?,
+            priority: row.get(4)?,
             port: row.get(5)?,
         })),
     }

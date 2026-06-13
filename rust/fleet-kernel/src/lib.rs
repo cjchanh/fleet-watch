@@ -14,14 +14,18 @@
 //!   * PS-B2 — `registry` (read-only rusqlite layer) + `checks`
 //!     (`check_port`, `check_gpu_budget`), fail-closed on DB error.
 //!   * PS-D — `ledger`: the write path (`log_event`, `get_last_hash`,
-//!     `claim_port`); appends hash-linked rows, fail-closed (unknown type
-//!     rejected; un-loggable claim → deny).
+//!     `claim_port`, `release_process`); appends hash-linked rows, fail-closed
+//!     (unknown type rejected; un-loggable claim → deny).
+//!   * PS-D-preempt — `preempt`: kill authority (`preempt_port`) behind an
+//!     injected [`preempt::Signaller`]; production uses libc, tests use a mock
+//!     that issues no real signal. Testimony before kill; priority gate
+//!     fail-closed.
 //!
 //! Deferred by design (see PATCHSET_PLAN_2026-06-13.md):
 //!   * `check_repo*` (stateful — GCs leases, releases PIDs, logs events) —
 //!     its own reconciler patchset, not a read core.
-//!   * `preempt_port` / kill authority (`os.kill SIGTERM`) — own audited
-//!     patch; untestable without killing a real process.
+//!   * `fleet guard --json` CLI cutover (PS-E) — wire the kernel into the live
+//!     entry point behind a shadow-parity gate.
 //!
 //! Fail-closed (Invariant #5): `Decision` has NO `Default` impl. Every value is
 //! constructed explicitly via [`Decision::allow`] / [`Decision::deny`], so no
@@ -36,6 +40,7 @@ use std::path::{Component, Path, PathBuf};
 pub mod checks;
 pub mod events;
 pub mod ledger;
+pub mod preempt;
 pub mod registry;
 
 /// Outcome of a claim or guard decision. Mirrors `fleet_watch.referee.Decision`.

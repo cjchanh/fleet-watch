@@ -1,0 +1,26 @@
+{
+  "fixed_ts": "2026-06-13T00:00:00+00:00",
+  "preempt": {
+    "allowed": true,
+    "reason": "preempted PID 999 (demo) for: upgrade"
+  },
+  "killed": [
+    [
+      999,
+      15
+    ]
+  ],
+  "proc_remaining": 0,
+  "gpu_allocated_after": 2048,
+  "events": [
+    {
+      "timestamp": "2026-06-13T00:00:00+00:00",
+      "event_type": "PREEMPT",
+      "pid": 999,
+      "workstream": "ws",
+      "detail": "{\"port\":4242,\"holder_pid\":999,\"holder_priority\":3,\"new_priority\":5,\"reason\":\"upgrade\",\"grace_seconds\":30}",
+      "prev_hash": "genesis",
+      "hash": "d93261d3b9d5a227a39be2bf83ea2592c20b7209e4fb5e50888d1d4e508a3a87"
+    }
+  ]
+}

@@ -20,7 +20,7 @@
 use crate::events::{compute_event_hash, GENESIS_HASH};
 use crate::registry;
 use crate::Decision;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Valid event types — mirrors `fleet_watch.events.EVENT_TYPES`. Fail-closed:
 /// an unknown type is rejected rather than written to the audit log.
@@ -155,4 +155,81 @@ pub fn claim_port(conn: &Connection, timestamp: &str, port: i64) -> Decision {
         Ok(_) => decision,
         Err(e) => Decision::deny(format!("claim audit-log write failed: {e}")),
     }
+}
+
+/// A process released from the registry — mirrors the dict that Python
+/// `fleet_watch.registry.release_process` returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleasedProcess {
+    pub pid: i64,
+    pub name: String,
+    pub workstream: String,
+    pub gpu_mb: i64,
+}
+
+/// Release a registered process: delete it, decrement its GPU budget claim, and
+/// — for a `cli-{pid}` session with no remaining work — close the session lease.
+/// Faithful port of `fleet_watch.registry.release_process`, wrapped in a single
+/// transaction so the multi-table mutation is atomic (fail-closed: a crash never
+/// leaves a half-released registry). `timestamp` is injected (deterministic) in
+/// place of the internal `_now_iso`. Returns the released process, or `None` if
+/// `pid` was not registered.
+pub fn release_process(
+    conn: &mut Connection,
+    timestamp: &str,
+    pid: i64,
+) -> rusqlite::Result<Option<ReleasedProcess>> {
+    let tx = conn.transaction()?;
+    let row: Option<(i64, String, String, String, i64)> = tx
+        .query_row(
+            "SELECT pid, session_id, name, workstream, gpu_mb FROM processes WHERE pid = ?1",
+            [pid],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                ))
+            },
+        )
+        .optional()?;
+    let (rpid, session_id, name, workstream, gpu_mb) = match row {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    tx.execute("DELETE FROM processes WHERE pid = ?1", [pid])?;
+    if gpu_mb > 0 {
+        tx.execute(
+            "UPDATE gpu_budget SET allocated_mb = MAX(0, allocated_mb - ?1) WHERE id = 1",
+            [gpu_mb],
+        )?;
+    }
+    if session_id == format!("cli-{pid}") {
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM processes WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )?;
+        let external_remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM external_resources WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )?;
+        if remaining == 0 && external_remaining == 0 {
+            tx.execute(
+                "UPDATE session_leases SET shutdown_at = COALESCE(shutdown_at, ?1), \
+                 last_heartbeat_at = ?2, status = 'CLOSED' WHERE session_id = ?3",
+                rusqlite::params![timestamp, timestamp, session_id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(Some(ReleasedProcess {
+        pid: rpid,
+        name,
+        workstream,
+        gpu_mb,
+    }))
 }
