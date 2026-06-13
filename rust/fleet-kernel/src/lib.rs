@@ -1,4 +1,4 @@
-//! Fleet Watch governance kernel — Rust port (PS-A, PS-B, PS-C, PS-B2).
+//! Fleet Watch governance kernel — Rust port (PS-A, PS-B, PS-C, PS-B2, PS-D).
 //!
 //! The deterministic decision core of Fleet Watch, ported from the proven
 //! Python `fleet_watch.{referee, events, registry}`; every function is
@@ -13,11 +13,15 @@
 //!     `verify_chain`), SHA-256 parity with Python `_compute_hash`.
 //!   * PS-B2 — `registry` (read-only rusqlite layer) + `checks`
 //!     (`check_port`, `check_gpu_budget`), fail-closed on DB error.
+//!   * PS-D — `ledger`: the write path (`log_event`, `get_last_hash`,
+//!     `claim_port`); appends hash-linked rows, fail-closed (unknown type
+//!     rejected; un-loggable claim → deny).
 //!
 //! Deferred by design (see PATCHSET_PLAN_2026-06-13.md):
 //!   * `check_repo*` (stateful — GCs leases, releases PIDs, logs events) —
 //!     its own reconciler patchset, not a read core.
-//!   * `claim_*` / kill authority — PS-D.
+//!   * `preempt_port` / kill authority (`os.kill SIGTERM`) — own audited
+//!     patch; untestable without killing a real process.
 //!
 //! Fail-closed (Invariant #5): `Decision` has NO `Default` impl. Every value is
 //! constructed explicitly via [`Decision::allow`] / [`Decision::deny`], so no
@@ -31,6 +35,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub mod checks;
 pub mod events;
+pub mod ledger;
 pub mod registry;
 
 /// Outcome of a claim or guard decision. Mirrors `fleet_watch.referee.Decision`.
