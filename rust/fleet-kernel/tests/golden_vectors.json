@@ -1,0 +1,118 @@
+{
+  "paths_overlap": [
+    {
+      "l": "/a/b",
+      "r": "/a/b",
+      "overlap": true
+    },
+    {
+      "l": "/a/b",
+      "r": "/a",
+      "overlap": true
+    },
+    {
+      "l": "/a",
+      "r": "/a/b",
+      "overlap": true
+    },
+    {
+      "l": "/a/b",
+      "r": "/a/bc",
+      "overlap": false
+    },
+    {
+      "l": "/a/bc",
+      "r": "/a/b",
+      "overlap": false
+    },
+    {
+      "l": "/a/b",
+      "r": "/c/d",
+      "overlap": false
+    },
+    {
+      "l": "/",
+      "r": "/a",
+      "overlap": true
+    },
+    {
+      "l": "/a/b/c",
+      "r": "/a",
+      "overlap": true
+    },
+    {
+      "l": "/a/b",
+      "r": "/a/b/",
+      "overlap": true
+    },
+    {
+      "l": "/a//b",
+      "r": "/a/b",
+      "overlap": true
+    },
+    {
+      "l": "relative/a",
+      "r": "relative/a/b",
+      "overlap": true
+    },
+    {
+      "l": "/a/b",
+      "r": "/A/b",
+      "overlap": false
+    },
+    {
+      "l": "/a/./b",
+      "r": "/a/b",
+      "overlap": true
+    },
+    {
+      "l": "/x",
+      "r": "/x/y/z",
+      "overlap": true
+    }
+  ],
+  "overlap_paths": [
+    {
+      "requested": [
+        "/a/b"
+      ],
+      "held": [
+        "/a"
+      ],
+      "out": [
+        "/a/b",
+        "/a"
+      ]
+    },
+    {
+      "requested": [
+        "/a/b"
+      ],
+      "held": [
+        "/c"
+      ],
+      "out": []
+    },
+    {
+      "requested": [
+        "/a/b",
+        "/x"
+      ],
+      "held": [
+        "/a",
+        "/y"
+      ],
+      "out": [
+        "/a/b",
+        "/a"
+      ]
+    },
+    {
+      "requested": [],
+      "held": [
+        "/a"
+      ],
+      "out": []
+    }
+  ]
+}
