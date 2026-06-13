@@ -1,0 +1,101 @@
+[
+  {
+    "repo_dir": null,
+    "scopes": [],
+    "expected": []
+  },
+  {
+    "repo_dir": null,
+    "scopes": [
+      "/Users/cj/Workspace/active/fleet-watch"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch"
+    ]
+  },
+  {
+    "repo_dir": null,
+    "scopes": [
+      "/Users/cj/Workspace/active/fleet-watch",
+      "/Users/cj/Workspace/active/fleet-watch"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch"
+    ]
+  },
+  {
+    "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
+    "scopes": [
+      "fleet_watch"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch/fleet_watch"
+    ]
+  },
+  {
+    "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
+    "scopes": [
+      "rust/fleet-kernel/src"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch/rust/fleet-kernel/src"
+    ]
+  },
+  {
+    "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
+    "scopes": [
+      "nope/deep/missing"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch/nope/deep/missing"
+    ]
+  },
+  {
+    "repo_dir": null,
+    "scopes": [
+      "~"
+    ],
+    "expected": [
+      "/Users/cj"
+    ]
+  },
+  {
+    "repo_dir": null,
+    "scopes": [
+      "~/Workspace"
+    ],
+    "expected": [
+      "/Users/cj/Workspace"
+    ]
+  },
+  {
+    "repo_dir": null,
+    "scopes": [
+      "/tmp/nonexistent_x"
+    ],
+    "expected": [
+      "/private/tmp/nonexistent_x"
+    ]
+  },
+  {
+    "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
+    "scopes": [
+      "fleet_watch/../tests"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch/tests"
+    ]
+  },
+  {
+    "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
+    "scopes": [
+      "fleet_watch",
+      "rust",
+      "fleet_watch"
+    ],
+    "expected": [
+      "/Users/cj/Workspace/active/fleet-watch/fleet_watch",
+      "/Users/cj/Workspace/active/fleet-watch/rust"
+    ]
+  }
+]

@@ -1,14 +1,20 @@
-//! Fleet Watch governance kernel — Rust port (PS-A scope).
+//! Fleet Watch governance kernel — Rust port (PS-A + PS-B).
 //!
-//! This crate is the deterministic decision core of Fleet Watch, ported from
-//! the proven Python `fleet_watch.referee`. PS-A intentionally ships ONLY the
-//! genuinely pure surface — the `Decision` contract and the lexical
-//! path-overlap helpers — so the port can be parity-proven with zero I/O.
+//! The deterministic decision core of Fleet Watch, ported from the proven
+//! Python `fleet_watch.referee`; every function is parity-tested against the
+//! live Python reference.
+//!
+//! Landed:
+//!   * PS-A — `Decision` contract + lexical path-overlap helpers
+//!     (`paths_overlap`, `overlap_paths`), zero I/O.
+//!   * PS-B — `normalize_write_scopes` + a Python-faithful `resolve`
+//!     (filesystem path resolution, `strict=False` semantics).
 //!
 //! Deferred by design (see PATCHSET_PLAN_2026-06-13.md):
-//!   * `normalize_write_scopes` — touches the filesystem (`expanduser`/`resolve`),
-//!     so it belongs to PS-B (read path), not the pure scaffold.
-//!   * `check_*` / `claim_*` / kill authority — PS-B and PS-D, each gated.
+//!   * `check_port` / `check_gpu_budget` + registry read layer — PS-C.
+//!   * `check_repo*` (stateful — GCs leases, releases PIDs, logs events) —
+//!     its own reconciler patchset, not a read core.
+//!   * `claim_*` / kill authority — PS-D.
 //!
 //! Fail-closed (Invariant #5): `Decision` has NO `Default` impl. Every value is
 //! constructed explicitly via [`Decision::allow`] / [`Decision::deny`], so no
@@ -16,7 +22,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::env;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 /// Outcome of a claim or guard decision. Mirrors `fleet_watch.referee.Decision`.
 ///
@@ -108,9 +116,135 @@ pub fn overlap_paths(requested: &[String], held: &[String]) -> Vec<String> {
     overlaps
 }
 
+/// Expand a leading `~` (or `~/...`) to `$HOME`, matching Python
+/// `Path.expanduser` for the common forms. `~user` is not expanded (passed
+/// through), matching the no-pwd-entry fallback.
+fn expanduser(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Collapse `.` and `..` lexically (no filesystem access). Root/prefix is
+/// preserved; a `..` with nothing above root is dropped.
+fn lexical_collapse(path: &Path) -> PathBuf {
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut result = PathBuf::new();
+    for comp in out {
+        result.push(comp.as_os_str());
+    }
+    result
+}
+
+/// Resolve like Python `Path.resolve(strict=False)`: canonicalize the longest
+/// existing ancestor (so symlinks such as `/tmp -> /private/tmp` are followed),
+/// then re-attach the non-existent tail with lexical `.`/`..` collapse. Relative
+/// inputs are absolutized against the current directory, mirroring Python.
+/// Total function — never panics, never requires the path to exist (F3).
+///
+/// Known edge (documented, not a bug): a `..` in the non-existent tail that
+/// would re-cross a symlinked component of the existing prefix is collapsed
+/// lexically rather than re-resolved; realistic scope inputs (repo
+/// subdirectories) do not hit this.
+fn resolve(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.clone();
+    loop {
+        if let Ok(real) = fs::canonicalize(&cur) {
+            let mut result = real;
+            for name in tail.iter().rev() {
+                result.push(name);
+            }
+            return lexical_collapse(&result);
+        }
+        match cur.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !cur.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    lexical_collapse(&abs)
+}
+
+/// Resolve write scopes to stable absolute paths for overlap checks. Faithful
+/// port of `fleet_watch.referee.normalize_write_scopes`: each scope is
+/// `~`-expanded, joined onto the resolved `repo_dir` base when relative, then
+/// resolved; results are de-duplicated preserving first-seen order.
+///
+/// `repo_dir = None` (or empty) means no base — relative scopes then resolve
+/// against the current directory, exactly as Python's `Path.resolve()` does.
+/// Feeds [`overlap_paths`]; correct resolution is single-writer-load-bearing.
+pub fn normalize_write_scopes(repo_dir: Option<&str>, write_scopes: &[String]) -> Vec<String> {
+    if write_scopes.is_empty() {
+        return Vec::new();
+    }
+    let base: Option<PathBuf> = repo_dir
+        .filter(|s| !s.is_empty())
+        .map(|s| resolve(&expanduser(s)));
+    let mut resolved: Vec<String> = Vec::new();
+    for raw in write_scopes {
+        let mut path = expanduser(raw);
+        if path.is_relative() {
+            if let Some(base) = &base {
+                path = base.join(path);
+            }
+        }
+        let value = resolve(&path).to_string_lossy().into_owned();
+        if !resolved.contains(&value) {
+            resolved.push(value);
+        }
+    }
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lexical_collapse_handles_parent_and_current() {
+        assert_eq!(
+            lexical_collapse(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(lexical_collapse(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        assert_eq!(lexical_collapse(Path::new("/../a")), PathBuf::from("/a"));
+    }
 
     #[test]
     fn decision_is_fail_closed_by_construction() {
