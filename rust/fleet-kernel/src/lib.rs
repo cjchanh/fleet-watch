@@ -1,4 +1,4 @@
-//! Fleet Watch governance kernel — Rust port (PS-A, PS-B, PS-C, PS-B2, PS-D).
+//! Fleet Watch governance kernel — Rust port (PS-A…PS-D, preempt, reconciler).
 //!
 //! The deterministic decision core of Fleet Watch, ported from the proven
 //! Python `fleet_watch.{referee, events, registry}`; every function is
@@ -20,10 +20,13 @@
 //!     injected [`preempt::Signaller`]; production uses libc, tests use a mock
 //!     that issues no real signal. Testimony before kill; priority gate
 //!     fail-closed.
+//!   * reconciler — `check_repo` / `check_repo_with_session`: the single-writer
+//!     core. GCs dead+stale leases (`close_session_lease` + CLEAN), auto-releases
+//!     dead-PID process holders, and runs write-scope overlap + exclusive /
+//!     cooperative checks. Dead-PID detection via the injected `Signaller`;
+//!     fail-closed on any DB error.
 //!
 //! Deferred by design (see PATCHSET_PLAN_2026-06-13.md):
-//!   * `check_repo*` (stateful — GCs leases, releases PIDs, logs events) —
-//!     its own reconciler patchset, not a read core.
 //!   * `fleet guard --json` CLI cutover (PS-E) — wire the kernel into the live
 //!     entry point behind a shadow-parity gate.
 //!
@@ -41,6 +44,7 @@ pub mod checks;
 pub mod events;
 pub mod ledger;
 pub mod preempt;
+pub mod reconciler;
 pub mod registry;
 
 /// Outcome of a claim or guard decision. Mirrors `fleet_watch.referee.Decision`.
@@ -247,6 +251,19 @@ pub fn normalize_write_scopes(repo_dir: Option<&str>, write_scopes: &[String]) -
         }
     }
     resolved
+}
+
+/// Resolve a repo path to its canonical absolute form.
+///
+/// Mirrors Python `str(Path(repo_dir).resolve())` (strict=False): follows
+/// real symlinks on the longest existing prefix, then appends any non-existent
+/// tail with lexical collapse.  Used by `reconciler::check_repo_with_session`
+/// to produce the `resolved_repo_dir` that matches what the Python referee
+/// stores in SQLite.
+pub fn resolve_repo(repo_dir: &str) -> String {
+    resolve(&expanduser(repo_dir))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

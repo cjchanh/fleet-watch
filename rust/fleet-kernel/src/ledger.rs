@@ -1,9 +1,11 @@
-//! Write path for the hash-chained audit ledger (PS-D — privilege surface).
+//! Write path for the hash-chained audit ledger (PS-D — privilege surface)
+//! plus `close_session_lease` (reconciler patchset).
 //!
-//! Ported from Python `fleet_watch.events.{get_last_hash, log_event}` and
-//! `fleet_watch.referee.claim_port`. This is the kernel's first WRITE surface:
-//! it appends hash-linked rows to the `events` table and is the foundation the
-//! claim / reconciler / preempt patchsets build on.
+//! Ported from Python `fleet_watch.events.{get_last_hash, log_event}`,
+//! `fleet_watch.referee.claim_port`, and
+//! `fleet_watch.registry.close_session_lease`. This is the kernel's WRITE
+//! surface: it appends hash-linked rows to the `events` table, releases
+//! processes, and closes session leases.
 //!
 //! DELIBERATELY NOT PORTED (own audited patch, see PATCHSET_PLAN PS-D audit):
 //!   * `preempt_port` — embeds `os.kill(SIGTERM)` (kill authority) + process
@@ -232,4 +234,32 @@ pub fn release_process(
         workstream,
         gpu_mb,
     }))
+}
+
+/// Close a session lease by marking it `CLOSED`. Port of
+/// `fleet_watch.registry.close_session_lease`:
+///
+/// ```python
+/// now = _now_iso()
+/// conn.execute(
+///     "UPDATE session_leases SET shutdown_at = ?, last_heartbeat_at = ?, status = 'CLOSED'
+///      WHERE session_id = ?",
+///     (now, now, session_id),
+/// )
+/// ```
+///
+/// `timestamp` is injected (deterministic). Returns `true` when the row was
+/// found and updated, `false` when the session_id was not in the table.
+pub fn close_session_lease(
+    conn: &Connection,
+    timestamp: &str,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let rows_changed = conn.execute(
+        "UPDATE session_leases \
+         SET shutdown_at = ?, last_heartbeat_at = ?, status = 'CLOSED' \
+         WHERE session_id = ?",
+        rusqlite::params![timestamp, timestamp, session_id],
+    )?;
+    Ok(rows_changed > 0)
 }
