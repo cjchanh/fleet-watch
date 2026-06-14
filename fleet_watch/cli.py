@@ -1474,18 +1474,61 @@ def reconcile(as_json: bool):
         )
 
 
+def _mcp_reap_candidates() -> list[dict[str, Any]]:
+    """NS-17 B3: dead-session MCP servers as reap candidates (source='mcp').
+    Opt-in via `fleet reap --include-mcp`. Reuses the audited detector, which
+    guarantees a live-session server is NEVER an orphan. Fail-soft."""
+    try:
+        result = mcp_orphan_detector.detect()
+    except Exception:  # noqa: BLE001 — a detector error must not break reap
+        return []
+    return [
+        {
+            "pid": pid, "name": "mcp-server", "workstream": "mcp",
+            "session_id": None, "evidence": ["dead-session MCP server (parent dead)"],
+            "source": "mcp",
+        }
+        for pid in result.orphan_pids
+    ]
+
+
 @cli.command()
 @click.option("--confirm", is_flag=True, help="Kill and release orphan-confirmed processes")
+@click.option("--include-mcp", is_flag=True, default=False,
+              help="Also reap dead-session MCP servers (opt-in; kill requires --confirm)")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
-def reap(confirm: bool, as_json: bool):
-    """Kill only orphan-confirmed processes. Dry-run by default."""
+def reap(confirm: bool, include_mcp: bool, as_json: bool):
+    """Kill only orphan-confirmed processes. Dry-run by default.
+
+    With --include-mcp, also reaps dead-session MCP servers (NS-17 B3). The
+    live-session-never-reaped invariant is guaranteed by the detector.
+    """
     conn = _get_conn()
     candidates = registry.get_reapable_processes(conn)
+    if include_mcp:
+        candidates = candidates + _mcp_reap_candidates()
     released: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
     if confirm:
         for item in candidates:
+            if item.get("source") == "mcp":
+                # MCP orphan: terminate by PID; not a registry row, so no release.
+                terminated = _terminate_orphan(item["pid"])
+                if not terminated and registry._pid_exists(item["pid"]):
+                    failed.append({
+                        "pid": item["pid"], "name": item["name"],
+                        "reason": "failed to terminate MCP orphan PID",
+                    })
+                    continue
+                released.append({"pid": item["pid"], "name": item["name"], "source": "mcp"})
+                events.log_event(
+                    conn, "REAP", pid=item["pid"],
+                    workstream=item.get("workstream", "mcp"),
+                    detail={"reason": "mcp_orphan_confirmed",
+                            "session_id": item.get("session_id")},
+                )
+                continue
             terminated = _terminate_orphan(item["pid"])
             if not terminated and registry._pid_exists(item["pid"]):
                 failed.append({
