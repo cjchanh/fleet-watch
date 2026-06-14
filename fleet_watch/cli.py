@@ -859,60 +859,72 @@ def guard(
     """Canonical pre-flight interface for agents and operators."""
     if write_scopes and repo_dir is None:
         raise click.UsageError("--write-scope requires --repo")
-    current_session_id = _resolved_session_id(session_id)
-    conn = _get_conn()
-    for cleaned in registry.clean_dead_pids(conn):
-        events.log_event(
+    # INV #1 (fail-closed): the guard decision path touches the DB (connect,
+    # clean, build payload). Any error here — DB locked, unreachable, malformed —
+    # must return {allowed: false}, never propagate an unhandled exception to the
+    # caller (CLAUDE.md Local Invariant #1 + Local Fail-Closed Rule).
+    try:
+        current_session_id = _resolved_session_id(session_id)
+        conn = _get_conn()
+        for cleaned in registry.clean_dead_pids(conn):
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=cleaned["pid"],
+                workstream=cleaned["workstream"],
+                detail={"reason": "dead_pid", "name": cleaned["name"]},
+            )
+        stale_session_leases_cleaned = registry.clean_stale_session_leases(conn)
+        for cleaned in stale_session_leases_cleaned:
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=cleaned["owner_pid"],
+                workstream="session",
+                detail={**cleaned, "source": "guard"},
+            )
+
+        payload = _build_guard_payload(
             conn,
-            "CLEAN",
-            pid=cleaned["pid"],
-            workstream=cleaned["workstream"],
-            detail={"reason": "dead_pid", "name": cleaned["name"]},
-        )
-    stale_session_leases_cleaned = registry.clean_stale_session_leases(conn)
-    for cleaned in stale_session_leases_cleaned:
-        events.log_event(
-            conn,
-            "CLEAN",
-            pid=cleaned["owner_pid"],
-            workstream="session",
-            detail={**cleaned, "source": "guard"},
+            port=port,
+            repo_dir=repo_dir,
+            write_scopes=write_scopes,
+            exclusive_repo_lock=exclusive_repo_lock,
+            gpu_mb=gpu_mb,
+            framework=framework,
+            model_hint=model_hint,
+            current_session_id=current_session_id,
+            stale_session_leases_cleaned=stale_session_leases_cleaned,
         )
 
-    payload = _build_guard_payload(
-        conn,
-        port=port,
-        repo_dir=repo_dir,
-        write_scopes=write_scopes,
-        exclusive_repo_lock=exclusive_repo_lock,
-        gpu_mb=gpu_mb,
-        framework=framework,
-        model_hint=model_hint,
-        current_session_id=current_session_id,
-        stale_session_leases_cleaned=stale_session_leases_cleaned,
-    )
-
-    gpu_check = payload["checks"].get("gpu")
-    if gpu_check and not gpu_check.get("allowed", True):
-        event_type = (
-            "GPU_WORKING_SET_DENY"
-            if gpu_check.get("reason") == "working_set_exceeds_physical_ram"
-            else "GPU_BUDGET_DENY"
-        )
-        events.log_event(
-            conn,
-            event_type,
-            workstream="guard",
-            detail={
-                "requested_mb": gpu_check.get("requested_mb"),
-                "reason": gpu_check.get("reason"),
-                "detail": gpu_check.get("detail"),
-                "framework": framework,
-                "model": model_hint,
-                "working_set": gpu_check.get("working_set"),
-            },
-        )
-    conn.close()
+        gpu_check = payload["checks"].get("gpu")
+        if gpu_check and not gpu_check.get("allowed", True):
+            event_type = (
+                "GPU_WORKING_SET_DENY"
+                if gpu_check.get("reason") == "working_set_exceeds_physical_ram"
+                else "GPU_BUDGET_DENY"
+            )
+            events.log_event(
+                conn,
+                event_type,
+                workstream="guard",
+                detail={
+                    "requested_mb": gpu_check.get("requested_mb"),
+                    "reason": gpu_check.get("reason"),
+                    "detail": gpu_check.get("detail"),
+                    "framework": framework,
+                    "model": model_hint,
+                    "working_set": gpu_check.get("working_set"),
+                },
+            )
+        conn.close()
+    except Exception as exc:  # fail-closed: deny on any guard-path error
+        reason = f"guard_error_fail_closed: {type(exc).__name__}: {exc}"
+        if as_json:
+            click.echo(json.dumps({"allowed": False, "reason": reason}, default=str))
+        else:
+            click.echo(f"DENY (guard fail-closed): {reason}", err=True)
+        sys.exit(1)
 
     # Advisory: scan for active runaway processes (never crash the guard)
     try:
