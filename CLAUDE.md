@@ -30,9 +30,15 @@ for this folder only. On conflict, ~/.claude/CLAUDE.md is authoritative.
    and `last_heartbeat_at` older than `DEFAULT_STALE_SECONDS` (180s) is treated
    as stale by the referee; no lease may extend its own TTL without a heartbeat
    write (verified by test_referee.py stale-lease cases).
-4. No network calls anywhere in `fleet_watch/` (local-only product invariant;
-   verified by `grep -r "urllib\|httpx\|requests\|aiohttp" fleet_watch/` —
-   must return zero matches).
+4. No NON-LOOPBACK network calls anywhere in `fleet_watch/` (local-only,
+   zero-egress product invariant). Loopback probes to local runtimes
+   (`127.0.0.1`/`localhost`/`::1`, e.g. the Ollama orphan-runner check in
+   `discover.py` / `discovery/orphan_detector.py`) are permitted; all egress
+   is forbidden. Enforced by `tests/test_no_external_egress.py`: forbids
+   `requests`/`httpx`/`aiohttp` outright, and for any module importing
+   `urllib`/`http.client`/`socket` asserts every URL literal targets loopback
+   (replaces the old "zero matches" grep, which the loopback probes violated
+   while egress was still genuinely zero).
 5. Boot-persistence plist `com.cj.fleet-watch-sync.plist` must reload without
    kernel state corruption: the launchd agent runs `fleet discover` every 60s
    and must not bind ports or mutate OS state (read + DB write only).
