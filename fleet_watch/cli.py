@@ -21,7 +21,7 @@ from fleet_watch import boot_coverage as boot_coverage_mod
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch import pkill as pkill_mod
-from fleet_watch.discovery import ollama_runners, orphan_detector
+from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
 
 
@@ -1687,6 +1687,22 @@ def context(ctx):
     )
 
 
+def _mcp_surface_lines(mcp: Any) -> list[str]:
+    """NS-17 B3: format the read-only MCP-orphan surfacing for `fleet discover`.
+    Pure (no I/O, no kill) so it is unit-testable. Returns echo lines."""
+    if not getattr(mcp, "mcp_process_count", 0):
+        return []
+    if getattr(mcp, "orphans_detected", False):
+        lines = [
+            f"MCP: {len(mcp.orphan_pids)} dead-session orphan(s) of "
+            f"{mcp.mcp_process_count} server(s), ~{mcp.estimated_recovered_mb}MB recoverable"
+        ]
+        if mcp.suggested_kill_command:
+            lines.append(f"  suggested: {mcp.suggested_kill_command}")
+        return lines
+    return [f"MCP: {mcp.mcp_process_count} server(s) tracked, 0 orphans."]
+
+
 @cli.command()
 @click.option("--no-auto-kill", is_flag=True, default=False,
               help="Log runaway processes without killing them")
@@ -1731,6 +1747,16 @@ def discover(no_auto_kill: bool):
     tracker = runaway.DaemonRunawayTracker.load(tracker_path)
     _run_runaway_tick(conn, tracker, tracker_path=tracker_path,
                       auto_kill=not no_auto_kill)
+
+    # NS-17 B3: read-only MCP-orphan surfacing (never kills here). Fail-soft —
+    # a detector error must not break discover. The opt-in kill path
+    # (fleet reap --include-mcp) is the governed remainder, spec 2616440.
+    try:
+        for _line in _mcp_surface_lines(mcp_orphan_detector.detect()):
+            click.echo(_line)
+    except Exception as exc:  # noqa: BLE001 — surfacing must never break discover
+        click.echo(f"! MCP orphan scan skipped: {type(exc).__name__}", err=True)
+
     conn.close()
 
 
