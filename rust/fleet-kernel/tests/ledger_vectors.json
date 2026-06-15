@@ -1,0 +1,31 @@
+{
+  "fixed_ts": "2026-06-13T00:00:00+00:00",
+  "claim_free": {
+    "allowed": true,
+    "reason": "port available"
+  },
+  "claim_taken": {
+    "allowed": false,
+    "reason": "port 4242 claimed by PID 999 (demo)"
+  },
+  "events": [
+    {
+      "timestamp": "2026-06-13T00:00:00+00:00",
+      "event_type": "CLAIM",
+      "pid": null,
+      "workstream": null,
+      "detail": "{\"resource\":\"port\",\"port\":5000}",
+      "prev_hash": "genesis",
+      "hash": "30306deb7e8ef3359ccc292afdae682849b60ddc3937d5b83ebbc7977507716e"
+    },
+    {
+      "timestamp": "2026-06-13T00:00:00+00:00",
+      "event_type": "CONFLICT",
+      "pid": null,
+      "workstream": null,
+      "detail": "{\"resource\":\"port\",\"port\":4242,\"holder_pid\":999}",
+      "prev_hash": "30306deb7e8ef3359ccc292afdae682849b60ddc3937d5b83ebbc7977507716e",
+      "hash": "0c46cee04a5e653cc61e95e109989d9a787123b95eb85c47dd9981c226599dee"
+    }
+  ]
+}

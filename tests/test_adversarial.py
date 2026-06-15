@@ -446,3 +446,29 @@ def test_thunder_sync_and_claim_surface(tmp_path, monkeypatch):
     assert len(state["external_resources"]) == 1
     assert state["external_resources"][0]["external_id"] == "tcrsdox3"
     assert state["external_resources"][0]["repo_dir"] == str(tmp_path.resolve())
+
+
+def test_guard_fails_closed_when_db_unreachable(tmp_path, monkeypatch):
+    # INV #1: `fleet guard --json` must return {allowed: false} when the DB is
+    # locked / Fleet Watch is unreachable -- never propagate an unhandled
+    # exception to the caller (CLAUDE.md Local Invariant #1 + Local Fail-Closed
+    # Rule). Regression for the ground-truth finding 2026-06-14: guard previously
+    # crashed with empty stdout instead of denying.
+    _patch_paths(monkeypatch, tmp_path)
+
+    def _boom():
+        raise RuntimeError("simulated DB locked / unreachable")
+
+    monkeypatch.setattr(cli_module, "_get_conn", _boom)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.cli, ["guard", "--port", "8100", "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["allowed"] is False
+    assert "guard_error_fail_closed" in payload["reason"]
+
+    # Human (non-JSON) path must also deny, never silently allow.
+    human = runner.invoke(cli_module.cli, ["guard", "--port", "8100"])
+    assert human.exit_code == 1
+    assert "DENY (guard fail-closed)" in human.output

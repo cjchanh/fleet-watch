@@ -1,0 +1,17 @@
+{
+  "capture_window": {
+    "end_utc": "2026-06-06T00:10:00Z",
+    "start_utc": "2026-06-06T00:00:00Z"
+  },
+  "data_class": "production_telemetry",
+  "privacy_constraints": "local_only_no_secret_values",
+  "schema_version": "fleet-watch/real-validation-drop/source-manifest/v1",
+  "source_count": 4,
+  "source_owner": "operator",
+  "source_paths": [
+    "raw/guard_calls.jsonl",
+    "raw/state_snapshots.jsonl",
+    "raw/health_snapshots.jsonl",
+    "raw/registry_events.jsonl"
+  ]
+}

@@ -1,0 +1,236 @@
+{
+  "schema_version": "fleet-watch/evidence-archive-manifest/v1",
+  "archive_created_utc": "2026-06-06T23:59:00Z",
+  "archive_policy": "manifest_and_readme_only",
+  "authorized_scope": {
+    "repo": "/Users/cj/Workspace/active/fleet-watch",
+    "destination": "docs/engineering/real_validation_drop/evidence/multi_scenario_20260606/",
+    "allowed_files": [
+      "README.md",
+      "manifest.json"
+    ],
+    "forbidden_effects": [
+      "push",
+      "promote",
+      "deploy",
+      "signal_processes",
+      "modify_runtime_fleet_state"
+    ]
+  },
+  "source_pack": {
+    "path": "/Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z",
+    "baseline_commit": "b460256967fbd0bfd8e6099673e15e19db1f0b6c",
+    "claim_scope": "multi-scenario single-machine Fleet Watch production telemetry pack",
+    "guard_scenario_count": 7,
+    "support_scenarios": [
+      "stale_holder",
+      "runaway_scan",
+      "orphan_scan",
+      "cleanup_proof"
+    ]
+  },
+  "receipt_verdicts": {
+    "intake": {
+      "decision": "PASS",
+      "path": "receipts/intake_receipt.json",
+      "sha256": "c7f6b08f769b59bf8527b41bca69f2c2b64202ca84e7525ef89bf97866579638"
+    },
+    "comparator": {
+      "decision": "PASS",
+      "path": "comparator/comparator_receipt.json",
+      "sha256": "5eac6a6d181fe11122b5c202d874b04a84b02ac04aaa841a5976af4a942828ae"
+    },
+    "uncertainty_analysis": {
+      "decision": "PASS",
+      "path": "ua/uncertainty_receipt.json",
+      "sha256": "242703460e776bd7d691a83392b706b81c9cb3610e04189f136eebe1d6fe4432"
+    },
+    "promotion_readiness": {
+      "decision": "PASS",
+      "path": "receipts/promotion_readiness_receipt.json",
+      "sha256": "78e571e871732ed718c4b2fc60d5a29b60f75d3121a621a5945395df8baa2a86",
+      "tier_a_promotion_ready": true,
+      "promotion_applied": false
+    }
+  },
+  "scenario_summary": {
+    "guard_scenarios": [
+      {
+        "guard_call_id": "clean-allow-fleet-watch-repo",
+        "category": "clean_allow",
+        "expected_allowed": true,
+        "observed_allowed": true
+      },
+      {
+        "guard_call_id": "repo-held-deny-temp-exclusive-lease",
+        "category": "repo_held_deny",
+        "expected_allowed": false,
+        "observed_allowed": false
+      },
+      {
+        "guard_call_id": "port-conflict-deny-archivist-4242",
+        "category": "port_conflict_deny",
+        "expected_allowed": false,
+        "observed_allowed": false
+      },
+      {
+        "guard_call_id": "safe-port-allow-8000",
+        "category": "safe_port_allow",
+        "expected_allowed": true,
+        "observed_allowed": true
+      },
+      {
+        "guard_call_id": "gpu-overbudget-deny",
+        "category": "gpu_overbudget_deny",
+        "expected_allowed": false,
+        "observed_allowed": false
+      },
+      {
+        "guard_call_id": "memory-pressure-warning-allow",
+        "category": "memory_pressure_warning",
+        "expected_allowed": true,
+        "observed_allowed": true
+      },
+      {
+        "guard_call_id": "cleanup-temp-repo-allow-after-close",
+        "category": "cleanup_clean_allow",
+        "expected_allowed": true,
+        "observed_allowed": true
+      }
+    ],
+    "comparator_observation_count": 7,
+    "comparator_mismatch_count": 0,
+    "post_calibration_error_pct": 0.0,
+    "ua_combined_uncertainty_pct": 11.0,
+    "false_positive_risk_pct": 9.0,
+    "false_negative_risk_pct": 9.0,
+    "stale_holder_detected": true,
+    "runaway_flagged_count": 1,
+    "orphans_detected": false
+  },
+  "source_file_hashes": [
+    {
+      "path": "RUN_STATUS_REPORT.md",
+      "bytes": 6297,
+      "sha256": "fe3237e0c62732baa958a27b744934f2aa6b7b55ed4a4fbf26fb5fafac2b5e23"
+    },
+    {
+      "path": "commands.json",
+      "bytes": 6160,
+      "sha256": "07f95d3011446a12dae46d3aabdc002f4ec897f9785e1ff8cd003a9d5d58f95e"
+    },
+    {
+      "path": "comparator/comparator_receipt.json",
+      "bytes": 968,
+      "sha256": "5eac6a6d181fe11122b5c202d874b04a84b02ac04aaa841a5976af4a942828ae"
+    },
+    {
+      "path": "comparator/expected_decisions.jsonl",
+      "bytes": 1489,
+      "sha256": "d207a66882aba6aa1e612c4d7fdf99308fce53ded3d8de7e16f43b9dca72251f"
+    },
+    {
+      "path": "metadata.json",
+      "bytes": 1476,
+      "sha256": "a77a4cd394ceb90add62c44a438c3af057b7ed57d43687eeeeb88483b21a3d00"
+    },
+    {
+      "path": "normalized/guard_decision_summary.jsonl",
+      "bytes": 1535,
+      "sha256": "c4b95bcabb70bbb68e3f10471b4e3025be1e59feaec6f4c20ab3cb74b08e7c25"
+    },
+    {
+      "path": "normalized/support_scenario_summary.json",
+      "bytes": 260,
+      "sha256": "41993b73c14dee6290d4e1ecedb45d24874199206478a8e663ca0d2af747c6b6"
+    },
+    {
+      "path": "raw/cleanup_events.jsonl",
+      "bytes": 836,
+      "sha256": "65f2e2826f925b7a119c9f549998b42e1e3fb8f4c44869633f892aff0b023765"
+    },
+    {
+      "path": "raw/guard_calls.jsonl",
+      "bytes": 18508,
+      "sha256": "395ba3326504c5ea60a90ac1e672bbdc39a5a04017a86323ddd04c3998377abc"
+    },
+    {
+      "path": "raw/health_snapshots.jsonl",
+      "bytes": 5723,
+      "sha256": "d18924bbaf5ef6c1f559fc9adcdad0cd28f98ce81752f771ae09b6a5819ed7b8"
+    },
+    {
+      "path": "raw/registry_events.jsonl",
+      "bytes": 15951,
+      "sha256": "d4bf6493e802c6eb5d762aef4477c53c80326d33ce7c1fbf1168d560bd9f4203"
+    },
+    {
+      "path": "raw/runaway_orphan_scans.jsonl",
+      "bytes": 1065,
+      "sha256": "3a7e3965ef5cbe26694bcbc9c7c9b00825675d08598f5230a545e8265e85cd8c"
+    },
+    {
+      "path": "raw/stale_holders.jsonl",
+      "bytes": 363,
+      "sha256": "678f17323e27ac0133bf54f758e102bc0270075cbbc4d6b56cc91568529dbb39"
+    },
+    {
+      "path": "raw/state_snapshots.jsonl",
+      "bytes": 6568,
+      "sha256": "398caa09d3edc47a2737fe2f3f5dd73d9a765a43989939ac983e4384f1d8dc91"
+    },
+    {
+      "path": "receipts/intake_receipt.json",
+      "bytes": 1461,
+      "sha256": "c7f6b08f769b59bf8527b41bca69f2c2b64202ca84e7525ef89bf97866579638"
+    },
+    {
+      "path": "receipts/normalization_receipt.json",
+      "bytes": 330,
+      "sha256": "0d96c6388d875c9629d31576d37e19560f8f655d7d3122b01f5fcbd9fa88576b"
+    },
+    {
+      "path": "receipts/promotion_readiness_receipt.json",
+      "bytes": 1160,
+      "sha256": "78e571e871732ed718c4b2fc60d5a29b60f75d3121a621a5945395df8baa2a86"
+    },
+    {
+      "path": "receipts/raw_hash_manifest.json",
+      "bytes": 1391,
+      "sha256": "ef3ad862fa19adaa74f3eccf381b3172416cbb4c5b0c728a0bf76d46edeb4219"
+    },
+    {
+      "path": "run_manifest.json",
+      "bytes": 663,
+      "sha256": "8671b027e6e240491a92ceadebd4e331f845721845c5684a6d3b1487e71ff786"
+    },
+    {
+      "path": "source_manifest.json",
+      "bytes": 615,
+      "sha256": "eaca80d53589c3d3024881814730e507feb01ac1f192062d132073bbbd47c65f"
+    },
+    {
+      "path": "ua/uncertainty_receipt.json",
+      "bytes": 837,
+      "sha256": "242703460e776bd7d691a83392b706b81c9cb3610e04189f136eebe1d6fe4432"
+    }
+  ],
+  "validation_commands": [
+    {
+      "command": "python3 scripts/validate_real_validation_drop.py /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z --receipt-out /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json",
+      "decision": "PASS"
+    },
+    {
+      "command": "python3 scripts/validate_real_validation_promotion.py --intake-receipt /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json --comparator /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/comparator/comparator_receipt.json --ua /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/ua/uncertainty_receipt.json --receipt-out /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/promotion_readiness_receipt.json",
+      "decision": "PASS"
+    },
+    {
+      "command": "python3 -m pytest tests -q",
+      "result": "355 passed"
+    },
+    {
+      "command": "python3 ~/.codex/validators/post_session.py /Users/cj/Workspace/active/fleet-watch",
+      "result": "POST_SESSION PASS: fleet-watch clean, grade=A"
+    }
+  ]
+}

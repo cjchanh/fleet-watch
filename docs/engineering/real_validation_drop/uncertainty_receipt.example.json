@@ -1,0 +1,16 @@
+{
+  "decision": "PASS",
+  "evidence": [
+    {
+      "path": "ua/uncertainty_receipt.json",
+      "receipt_id": "ua-20260606-0001"
+    }
+  ],
+  "schema_version": "fleet-watch/real-validation-uncertainty-analysis/v1",
+  "uncertainty": {
+    "combined_uncertainty_pct": 9.0,
+    "false_negative_risk_pct": 4.0,
+    "false_positive_risk_pct": 3.0,
+    "method": "bounded_expected_vs_observed_guard_analysis"
+  }
+}

@@ -21,7 +21,7 @@ from fleet_watch import boot_coverage as boot_coverage_mod
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch import pkill as pkill_mod
-from fleet_watch.discovery import ollama_runners, orphan_detector
+from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
 
 
@@ -859,60 +859,72 @@ def guard(
     """Canonical pre-flight interface for agents and operators."""
     if write_scopes and repo_dir is None:
         raise click.UsageError("--write-scope requires --repo")
-    current_session_id = _resolved_session_id(session_id)
-    conn = _get_conn()
-    for cleaned in registry.clean_dead_pids(conn):
-        events.log_event(
+    # INV #1 (fail-closed): the guard decision path touches the DB (connect,
+    # clean, build payload). Any error here — DB locked, unreachable, malformed —
+    # must return {allowed: false}, never propagate an unhandled exception to the
+    # caller (CLAUDE.md Local Invariant #1 + Local Fail-Closed Rule).
+    try:
+        current_session_id = _resolved_session_id(session_id)
+        conn = _get_conn()
+        for cleaned in registry.clean_dead_pids(conn):
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=cleaned["pid"],
+                workstream=cleaned["workstream"],
+                detail={"reason": "dead_pid", "name": cleaned["name"]},
+            )
+        stale_session_leases_cleaned = registry.clean_stale_session_leases(conn)
+        for cleaned in stale_session_leases_cleaned:
+            events.log_event(
+                conn,
+                "CLEAN",
+                pid=cleaned["owner_pid"],
+                workstream="session",
+                detail={**cleaned, "source": "guard"},
+            )
+
+        payload = _build_guard_payload(
             conn,
-            "CLEAN",
-            pid=cleaned["pid"],
-            workstream=cleaned["workstream"],
-            detail={"reason": "dead_pid", "name": cleaned["name"]},
-        )
-    stale_session_leases_cleaned = registry.clean_stale_session_leases(conn)
-    for cleaned in stale_session_leases_cleaned:
-        events.log_event(
-            conn,
-            "CLEAN",
-            pid=cleaned["owner_pid"],
-            workstream="session",
-            detail={**cleaned, "source": "guard"},
+            port=port,
+            repo_dir=repo_dir,
+            write_scopes=write_scopes,
+            exclusive_repo_lock=exclusive_repo_lock,
+            gpu_mb=gpu_mb,
+            framework=framework,
+            model_hint=model_hint,
+            current_session_id=current_session_id,
+            stale_session_leases_cleaned=stale_session_leases_cleaned,
         )
 
-    payload = _build_guard_payload(
-        conn,
-        port=port,
-        repo_dir=repo_dir,
-        write_scopes=write_scopes,
-        exclusive_repo_lock=exclusive_repo_lock,
-        gpu_mb=gpu_mb,
-        framework=framework,
-        model_hint=model_hint,
-        current_session_id=current_session_id,
-        stale_session_leases_cleaned=stale_session_leases_cleaned,
-    )
-
-    gpu_check = payload["checks"].get("gpu")
-    if gpu_check and not gpu_check.get("allowed", True):
-        event_type = (
-            "GPU_WORKING_SET_DENY"
-            if gpu_check.get("reason") == "working_set_exceeds_physical_ram"
-            else "GPU_BUDGET_DENY"
-        )
-        events.log_event(
-            conn,
-            event_type,
-            workstream="guard",
-            detail={
-                "requested_mb": gpu_check.get("requested_mb"),
-                "reason": gpu_check.get("reason"),
-                "detail": gpu_check.get("detail"),
-                "framework": framework,
-                "model": model_hint,
-                "working_set": gpu_check.get("working_set"),
-            },
-        )
-    conn.close()
+        gpu_check = payload["checks"].get("gpu")
+        if gpu_check and not gpu_check.get("allowed", True):
+            event_type = (
+                "GPU_WORKING_SET_DENY"
+                if gpu_check.get("reason") == "working_set_exceeds_physical_ram"
+                else "GPU_BUDGET_DENY"
+            )
+            events.log_event(
+                conn,
+                event_type,
+                workstream="guard",
+                detail={
+                    "requested_mb": gpu_check.get("requested_mb"),
+                    "reason": gpu_check.get("reason"),
+                    "detail": gpu_check.get("detail"),
+                    "framework": framework,
+                    "model": model_hint,
+                    "working_set": gpu_check.get("working_set"),
+                },
+            )
+        conn.close()
+    except Exception as exc:  # fail-closed: deny on any guard-path error
+        reason = f"guard_error_fail_closed: {type(exc).__name__}: {exc}"
+        if as_json:
+            click.echo(json.dumps({"allowed": False, "reason": reason}, default=str))
+        else:
+            click.echo(f"DENY (guard fail-closed): {reason}", err=True)
+        sys.exit(1)
 
     # Advisory: scan for active runaway processes (never crash the guard)
     try:
@@ -1340,6 +1352,45 @@ def session_close(session_id: str):
     conn.close()
 
 
+@session.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Include closed leases (default: active only)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def session_list(show_all: bool, as_json: bool):
+    """List session leases (active only by default).
+
+    Read-only: enumerates the explicit session leases other commands open via
+    ``session start``/``ensure``. This is the missing read counterpart to
+    start/heartbeat/close — leases could be opened and closed but never listed.
+    """
+    conn = _get_conn()
+    try:
+        leases = (
+            registry.list_session_leases(conn)
+            if show_all
+            else registry.list_active_session_leases(conn)
+        )
+    finally:
+        conn.close()
+
+    if as_json:
+        click.echo(json.dumps({"session_leases": leases, "count": len(leases)}, indent=2, default=str))
+        return
+
+    if not leases:
+        click.echo("No session leases." if show_all else "No active session leases.")
+        return
+
+    click.echo(f"{'SESSION_ID':<40} {'PID':>7} {'STATUS':<8} {'REPO':<28} LAST_HEARTBEAT")
+    for lease in leases:
+        click.echo(
+            f"{str(lease.get('session_id', '?')):<40} "
+            f"{str(lease.get('owner_pid') or '-'):>7} "
+            f"{str(lease.get('status', '?')):<8} "
+            f"{str(lease.get('repo_dir') or '-'):<28} "
+            f"{lease.get('last_heartbeat_at') or '-'}"
+        )
+
+
 @cli.command()
 @click.option("--port", type=int, required=True, help="Port to preempt")
 @click.option("--priority", type=click.IntRange(1, 5), required=True, help="Priority of the requesting workload")
@@ -1435,18 +1486,61 @@ def reconcile(as_json: bool):
         )
 
 
+def _mcp_reap_candidates() -> list[dict[str, Any]]:
+    """NS-17 B3: dead-session MCP servers as reap candidates (source='mcp').
+    Opt-in via `fleet reap --include-mcp`. Reuses the audited detector, which
+    guarantees a live-session server is NEVER an orphan. Fail-soft."""
+    try:
+        result = mcp_orphan_detector.detect()
+    except Exception:  # noqa: BLE001 — a detector error must not break reap
+        return []
+    return [
+        {
+            "pid": pid, "name": "mcp-server", "workstream": "mcp",
+            "session_id": None, "evidence": ["dead-session MCP server (parent dead)"],
+            "source": "mcp",
+        }
+        for pid in result.orphan_pids
+    ]
+
+
 @cli.command()
 @click.option("--confirm", is_flag=True, help="Kill and release orphan-confirmed processes")
+@click.option("--include-mcp", is_flag=True, default=False,
+              help="Also reap dead-session MCP servers (opt-in; kill requires --confirm)")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
-def reap(confirm: bool, as_json: bool):
-    """Kill only orphan-confirmed processes. Dry-run by default."""
+def reap(confirm: bool, include_mcp: bool, as_json: bool):
+    """Kill only orphan-confirmed processes. Dry-run by default.
+
+    With --include-mcp, also reaps dead-session MCP servers (NS-17 B3). The
+    live-session-never-reaped invariant is guaranteed by the detector.
+    """
     conn = _get_conn()
     candidates = registry.get_reapable_processes(conn)
+    if include_mcp:
+        candidates = candidates + _mcp_reap_candidates()
     released: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
     if confirm:
         for item in candidates:
+            if item.get("source") == "mcp":
+                # MCP orphan: terminate by PID; not a registry row, so no release.
+                terminated = _terminate_orphan(item["pid"])
+                if not terminated and registry._pid_exists(item["pid"]):
+                    failed.append({
+                        "pid": item["pid"], "name": item["name"],
+                        "reason": "failed to terminate MCP orphan PID",
+                    })
+                    continue
+                released.append({"pid": item["pid"], "name": item["name"], "source": "mcp"})
+                events.log_event(
+                    conn, "REAP", pid=item["pid"],
+                    workstream=item.get("workstream", "mcp"),
+                    detail={"reason": "mcp_orphan_confirmed",
+                            "session_id": item.get("session_id")},
+                )
+                continue
             terminated = _terminate_orphan(item["pid"])
             if not terminated and registry._pid_exists(item["pid"]):
                 failed.append({
@@ -1648,6 +1742,22 @@ def context(ctx):
     )
 
 
+def _mcp_surface_lines(mcp: Any) -> list[str]:
+    """NS-17 B3: format the read-only MCP-orphan surfacing for `fleet discover`.
+    Pure (no I/O, no kill) so it is unit-testable. Returns echo lines."""
+    if not getattr(mcp, "mcp_process_count", 0):
+        return []
+    if getattr(mcp, "orphans_detected", False):
+        lines = [
+            f"MCP: {len(mcp.orphan_pids)} dead-session orphan(s) of "
+            f"{mcp.mcp_process_count} server(s), ~{mcp.estimated_recovered_mb}MB recoverable"
+        ]
+        if mcp.suggested_kill_command:
+            lines.append(f"  suggested: {mcp.suggested_kill_command}")
+        return lines
+    return [f"MCP: {mcp.mcp_process_count} server(s) tracked, 0 orphans."]
+
+
 @cli.command()
 @click.option("--no-auto-kill", is_flag=True, default=False,
               help="Log runaway processes without killing them")
@@ -1692,6 +1802,16 @@ def discover(no_auto_kill: bool):
     tracker = runaway.DaemonRunawayTracker.load(tracker_path)
     _run_runaway_tick(conn, tracker, tracker_path=tracker_path,
                       auto_kill=not no_auto_kill)
+
+    # NS-17 B3: read-only MCP-orphan surfacing (never kills here). Fail-soft —
+    # a detector error must not break discover. The opt-in kill path
+    # (fleet reap --include-mcp) is the governed remainder, spec 2616440.
+    try:
+        for _line in _mcp_surface_lines(mcp_orphan_detector.detect()):
+            click.echo(_line)
+    except Exception as exc:  # noqa: BLE001 — surfacing must never break discover
+        click.echo(f"! MCP orphan scan skipped: {type(exc).__name__}", err=True)
+
     conn.close()
 
 

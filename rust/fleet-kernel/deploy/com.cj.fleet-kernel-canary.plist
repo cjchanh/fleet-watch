@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PS-E canary: runs the read-only shadow-parity check every 10 minutes,
+  accumulating clean-cycle evidence toward the 144-cycle promotion gate.
+  It NEVER writes the live registry or touches the fleet-guard hot path.
+
+  This is a TEMPLATE — it is intentionally NOT installed. To enable the canary:
+    cp rust/fleet-kernel/deploy/com.cj.fleet-kernel-canary.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.cj.fleet-kernel-canary.plist
+  To stop it:
+    launchctl unload ~/Library/LaunchAgents/com.cj.fleet-kernel-canary.plist
+  Watch progress:
+    cat ~/.governance/receipts/fleet-kernel/canary/tally.json | python3 -c "import json,sys;print(json.load(sys.stdin)['clean_streak'],'/ 144')"
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cj.fleet-kernel-canary</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/cj/Workspace/active/fleet-watch/rust/fleet-kernel/scripts/canary_run.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/cj/.governance/receipts/fleet-kernel/canary/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/cj/.governance/receipts/fleet-kernel/canary/launchd.err.log</string>
+</dict>
+</plist>
