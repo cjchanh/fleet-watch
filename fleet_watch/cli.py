@@ -1391,6 +1391,41 @@ def session_list(show_all: bool, as_json: bool):
         )
 
 
+@session.command("check")
+@click.option("--repo", "repo_dir", required=True, help="Repo you are about to write")
+@click.option("--me", "my_session_id", default=None, help="Your own session id (excluded from conflicts)")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def session_check(repo_dir: str, my_session_id: str | None, as_json: bool):
+    """Single-writer preflight: is another LIVE session already on this repo?
+
+    Read-only. A lease counts only if its owner PID is alive AND its heartbeat
+    is fresh; a null ``repo_dir`` is resolved from the owner PID's cwd, so
+    conflicts surface even for sessions that never bound their repo.
+
+    Exit: 0 ALLOW (safe to write) · 3 CONFLICT (another live session holds it) ·
+    4 UNKNOWN (liveness unresolvable; fail-closed).
+    """
+    from fleet_watch import session_coupling as sc
+
+    leases = sc.load_active_leases()
+    verdict = sc.single_writer_check(
+        repo_dir, my_session_id, leases, age_of=sc.default_age_of
+    )
+    if as_json:
+        click.echo(json.dumps(
+            {"decision": verdict.decision, "repo": verdict.repo,
+             "reason": verdict.reason, "conflicts": verdict.conflicts},
+            indent=2, default=str))
+    else:
+        click.echo(f"{verdict.decision}: {verdict.reason}")
+        for c in verdict.conflicts:
+            click.echo(
+                f"  conflict: session {c.get('session_id')} "
+                f"PID {c.get('owner_pid')} ({c.get('repo_lock_mode')}) "
+                f"hb {c.get('last_heartbeat_at')}")
+    sys.exit(verdict.exit_code)
+
+
 @cli.command()
 @click.option("--port", type=int, required=True, help="Port to preempt")
 @click.option("--priority", type=click.IntRange(1, 5), required=True, help="Priority of the requesting workload")

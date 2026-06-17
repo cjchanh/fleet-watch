@@ -960,3 +960,38 @@ def test_guard_repo_uses_env_session_id_for_same_session_bypass(tmp_path, monkey
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["checks"]["repo"]["allowed"] is True
+
+
+# ── fleet session check (single-writer preflight) smoke tests ───────────────
+from fleet_watch import session_coupling as _sc  # noqa: E402
+
+
+def test_session_check_allows_when_no_other_session(monkeypatch):
+    monkeypatch.setattr(_sc, "load_active_leases", lambda: [])
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["session", "check", "--repo", "/tmp/repoX", "--me", "me"])
+    assert result.exit_code == 0
+    assert "ALLOW" in result.output
+
+
+def test_session_check_conflicts_on_other_live_session(monkeypatch):
+    live = {"session_id": "OTHER", "owner_pid": os.getpid(), "repo_dir": "/tmp/repoX",
+            "status": "ACTIVE", "last_heartbeat_at": "x", "shutdown_at": None,
+            "repo_lock_mode": "cooperative"}
+    monkeypatch.setattr(_sc, "load_active_leases", lambda: [live])
+    monkeypatch.setattr(_sc, "default_age_of", lambda hb: 5.0)  # fresh heartbeat
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli, ["session", "check", "--repo", "/tmp/repoX", "--me", "me", "--json"])
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["decision"] == "CONFLICT"
+    assert payload["conflicts"][0]["session_id"] == "OTHER"
+
+
+def test_session_check_failclosed_when_registry_unavailable(monkeypatch):
+    monkeypatch.setattr(_sc, "load_active_leases", lambda: None)
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["session", "check", "--repo", "/tmp/repoX"])
+    assert result.exit_code == 4
+    assert "UNKNOWN" in result.output
