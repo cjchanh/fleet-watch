@@ -24,6 +24,12 @@ is null, and answers single-writer safety:
 - `is_live(lease)` — `status==ACTIVE` **and** PID alive **and** heartbeat fresher
   than `DEFAULT_STALE_SECONDS` (180). Heartbeat freshness also defeats PID
   recycling — a recycled PID never heartbeats Fleet.
+  Note (Path C): the referee/reaper liveness path additionally uses
+  `registry._lease_owner_alive`, which compares the owner PID's recorded vs.
+  live kernel create-time to defeat PID reuse POSITIVELY (no TTL wait) and
+  release a proven-dead owner's lease immediately. This read-only module keeps
+  the simpler heartbeat-freshness rule because it never mutates a lease; it only
+  reports live conflicts.
 - `who_is_live(repo)` — live sessions whose resolved repo matches.
 - `single_writer_check(repo, me, leases)` → `Verdict`:
   - **ALLOW** (exit 0) — no other live session on the repo.

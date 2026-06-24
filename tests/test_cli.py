@@ -275,7 +275,8 @@ def test_guard_repo_cleans_stale_dead_exclusive_session_before_payload(tmp_path,
     assert row[1] == "session"
     detail = json.loads(row[2])
     assert detail["source"] == "guard"
-    assert detail["reason"] == "stale_dead_session_lease"
+    # Path C: proven-dead owner is reaped via the dead-owner arm.
+    assert detail["reason"] == "dead_session_owner"
     assert detail["session_id"] == "sess-stale"
     assert detail["repo_dir"] == str(repo.resolve())
 

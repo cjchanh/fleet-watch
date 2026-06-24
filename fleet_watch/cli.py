@@ -1369,6 +1369,15 @@ def session_list(show_all: bool, as_json: bool):
             if show_all
             else registry.list_active_session_leases(conn)
         )
+        # Path C (HONESTY): cross-check PID liveness so a dead-owner lease is
+        # never reported as a plain ACTIVE one. ``owner_alive`` is create-time
+        # aware (defeats PID reuse); ``None`` means the lease has no owner PID.
+        for lease in leases:
+            lease["owner_alive"] = (
+                registry._lease_owner_alive(lease)
+                if lease.get("owner_pid") is not None
+                else None
+            )
     finally:
         conn.close()
 
@@ -1380,11 +1389,19 @@ def session_list(show_all: bool, as_json: bool):
         click.echo("No session leases." if show_all else "No active session leases.")
         return
 
-    click.echo(f"{'SESSION_ID':<40} {'PID':>7} {'STATUS':<8} {'REPO':<28} LAST_HEARTBEAT")
+    click.echo(
+        f"{'SESSION_ID':<40} {'PID':>7} {'OWNER':<6} {'STATUS':<8} "
+        f"{'REPO':<28} LAST_HEARTBEAT"
+    )
     for lease in leases:
+        owner_alive = lease.get("owner_alive")
+        owner_str = (
+            "-" if owner_alive is None else ("alive" if owner_alive else "DEAD")
+        )
         click.echo(
             f"{str(lease.get('session_id', '?')):<40} "
             f"{str(lease.get('owner_pid') or '-'):>7} "
+            f"{owner_str:<6} "
             f"{str(lease.get('status', '?')):<8} "
             f"{str(lease.get('repo_dir') or '-'):<28} "
             f"{lease.get('last_heartbeat_at') or '-'}"
@@ -1475,10 +1492,21 @@ def history(event_type: str | None, hours: int):
 
 @cli.command()
 def stale():
-    """List heartbeat-stale processes with evidence-based classification."""
+    """List heartbeat-stale processes and dead-owner session leases.
+
+    Path C (HONESTY): cross-checks PID liveness on ACTIVE session leases so a
+    provably-dead owner (PID gone or recycled) is surfaced as dead instead of
+    silently reported as ACTIVE.
+    """
     conn = _get_conn()
     stale_procs = registry.get_stale_processes(conn)
-    if not stale_procs:
+    dead_owner_leases = [
+        lease
+        for lease in registry.list_active_session_leases(conn)
+        if lease.get("owner_pid") is not None
+        and not registry._lease_owner_alive(lease)
+    ]
+    if not stale_procs and not dead_owner_leases:
         click.echo("No stale processes.")
     else:
         for s in stale_procs:
@@ -1487,6 +1515,15 @@ def stale():
                 f"PID {s['pid']} ({s['name']}) — {s['classification']} — "
                 f"heartbeat {s['stale_seconds']}s ago"
                 + (f" — {evidence}" if evidence else "")
+            )
+        for lease in dead_owner_leases:
+            age = registry._age_seconds(lease.get("last_heartbeat_at"))
+            age_str = f"{age}s ago" if age is not None else "unknown"
+            click.echo(
+                f"SESSION {lease['session_id']} "
+                f"(PID {lease.get('owner_pid')}) — dead_session_owner — "
+                f"owner not alive; heartbeat {age_str}; "
+                f"lock {lease.get('repo_lock_mode', 'cooperative')}"
             )
     conn.close()
 
