@@ -256,9 +256,12 @@ def test_clean_stale_session_leases_closes_dead_stale_owner_with_limit(monkeypat
 
     cleaned = registry.clean_stale_session_leases(conn, limit=1)
 
+    # Path C: a proven-dead owner is reaped via the dead-owner arm (reason
+    # "dead_session_owner"), immediately and independent of TTL. The limit,
+    # ordering, and which lease closes are unchanged.
     assert cleaned == [
         {
-            "reason": "stale_dead_session_lease",
+            "reason": "dead_session_owner",
             "session_id": "stale-a",
             "owner_pid": 2147483646,
             "repo_dir": str(Path("/tmp/repo-a").resolve()),

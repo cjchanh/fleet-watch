@@ -43,9 +43,11 @@ CREATE TABLE IF NOT EXISTS session_leases (
     owner_ppid          INTEGER,
     owner_pgid          INTEGER,
     owner_tty           TEXT,
+    owner_create_time   TEXT,
     repo_dir            TEXT,
     repo_lock_mode      TEXT NOT NULL DEFAULT 'cooperative',
     write_scopes        TEXT,
+    fencing_epoch       INTEGER NOT NULL DEFAULT 1,
     started_at          TEXT NOT NULL,
     last_heartbeat_at   TEXT NOT NULL,
     shutdown_at         TEXT,
@@ -192,6 +194,118 @@ def _pid_exists(pid: int | None) -> bool:
     return True
 
 
+def _pid_create_time(pid: int | None) -> str | None:
+    """Return a stable create-time string for a live PID via ``ps -o lstart=``.
+
+    The kernel start time is constant for the life of a process and changes the
+    instant a PID is recycled, so a recorded-vs-live mismatch positively proves
+    the original owner is gone — defeating PID reuse without waiting out the TTL.
+    Returns ``None`` when the PID is dead or create-time is unresolvable (the
+    caller then degrades to PID-existence only — conservative, never fail-open).
+
+    ENVIRONMENT INVARIANCE (catastrophic two-writer guard): ``ps -o lstart=``
+    renders its timestamp in the *caller's* timezone and locale, so the SAME
+    live PID yields different strings to an interactive shell (local TZ) and the
+    launchd ``fleet discover`` daemon (UTC). The recorded value is used ONLY for
+    equality in ``_lease_owner_alive`` (never displayed), so we force a fixed
+    rendering — ``LC_ALL=C`` and ``TZ=UTC`` — in the subprocess environment.
+    Capture and check then produce byte-identical strings regardless of the
+    caller's environment, so a LIVE owner is never misread as dead across a
+    TZ/locale boundary (which would release its exclusive lease => two writers).
+    """
+    if pid is None or pid <= 0:
+        return None
+    if not _pid_exists(pid):
+        return None
+    # Force an environment-independent rendering so the create-time recorded at
+    # lease open compares equal to the create-time read at the liveness check
+    # regardless of the caller's TZ / locale. Equality is the only use of this
+    # value (it is never displayed), so a fixed canonical rendering is correct.
+    fixed_env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env=fixed_env,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return None
+    line = result.stdout.strip()
+    if result.returncode != 0 or not line:
+        return None
+    return line
+
+
+def _lease_owner_alive(lease: dict[str, Any] | None) -> bool:
+    """Positively confirm a lease's owner process is the SAME process that opened
+    it — PID exists AND, when a create-time was recorded, the live PID's
+    create-time still matches.
+
+    A recorded create-time that no longer matches means the OS recycled the PID
+    onto an unrelated process: the original owner is dead. Returns ``False`` for
+    a null owner_pid (ownership is then handled by the conservative TTL arm).
+    """
+    if lease is None:
+        return False
+    owner_pid = lease.get("owner_pid")
+    if owner_pid is None:
+        return False
+    if not _pid_exists(owner_pid):
+        return False
+    recorded = lease.get("owner_create_time")
+    if not recorded:
+        # No create-time evidence on this (likely pre-migration) lease — degrade
+        # to PID existence, which is the prior behavior. Never fail-open.
+        return True
+    live = _pid_create_time(owner_pid)
+    if live is None:
+        # Could not read live create-time; do not declare death on missing
+        # evidence — fall back to PID existence (already confirmed True above).
+        return True
+    return live == recorded
+
+
+def current_fencing_epoch(conn: sqlite3.Connection, session_id: str) -> int | None:
+    """Return the lease's current monotonic fencing epoch, or ``None`` if absent.
+
+    HONESTY NOTE (Path C, Layer C): this is NOT a storage-level fencing token in
+    the Kleppmann sense. Fleet Watch is advisory pre-flight — it never sits in
+    the filesystem write path, so there is no enforcement point at which a stale
+    token can be MECHANICALLY rejected by the storage system. The epoch is a
+    real, persisted, monotonic grant counter: a caller that snapshotted epoch N
+    can call ``fencing_token_valid`` later to detect that the lease was re-granted
+    (epoch advanced) and self-abort. That detection is voluntary, not enforced.
+    On a single machine the load-bearing guards against the stale-owner failure
+    are create-time identity + TTL (Layers A/B); the epoch is the minimal honest
+    primitive a future gated writer could enforce against, nothing more.
+    """
+    row = conn.execute(
+        "SELECT fencing_epoch FROM session_leases WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def fencing_token_valid(
+    conn: sqlite3.Connection, session_id: str, presented_epoch: int
+) -> bool:
+    """True iff ``presented_epoch`` matches the lease's CURRENT epoch.
+
+    A holder whose epoch is behind the current one took a stale snapshot (the
+    lease was re-granted to a newer owner) and must not act. Returns ``False``
+    when the lease is absent — fail-closed, never validate an unknown token.
+    """
+    current = current_fencing_epoch(conn, session_id)
+    if current is None:
+        return False
+    return presented_epoch == current
+
+
 def _inspect_process(pid: int | None) -> dict[str, Any] | None:
     if pid is None or pid <= 0:
         return None
@@ -332,6 +446,12 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _ensure_column(conn, "session_leases", "repo_lock_mode", "TEXT NOT NULL DEFAULT 'cooperative'")
     _ensure_column(conn, "session_leases", "write_scopes", "TEXT")
+    # Path C migration (backward-compatible): create-time identity defeats PID
+    # reuse; fencing_epoch is a monotonic per-lease token issued at grant. Both
+    # default safely on pre-existing rows (NULL create-time degrades to PID
+    # existence; epoch defaults to 1).
+    _ensure_column(conn, "session_leases", "owner_create_time", "TEXT")
+    _ensure_column(conn, "session_leases", "fencing_epoch", "INTEGER NOT NULL DEFAULT 1")
     # Ensure gpu_budget singleton exists
     conn.execute(
         "INSERT OR IGNORE INTO gpu_budget (id, total_mb, reserve_mb, allocated_mb) "
@@ -376,23 +496,30 @@ def upsert_session_lease(
     owner_ppid = inspect.get("ppid") if inspect else None
     owner_pgid = inspect.get("pgid") if inspect else None
     owner_tty = inspect.get("tty") if inspect else None
+    owner_create_time = _pid_create_time(owner_pid)
+    # Fencing: a (re-)grant issues a monotonically increasing epoch so a stale
+    # holder's token can be rejected at any future enforcement point. A new
+    # owner taking over the same session id strictly bumps the prior epoch.
+    next_epoch = (int(prior.get("fencing_epoch") or 0) + 1) if prior else 1
 
     conn.execute(
         """
         INSERT INTO session_leases (
-            session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-            repo_lock_mode, write_scopes,
-            started_at, last_heartbeat_at, shutdown_at, status
+            session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+            owner_create_time, repo_dir, repo_lock_mode, write_scopes,
+            fencing_epoch, started_at, last_heartbeat_at, shutdown_at, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(session_id) DO UPDATE SET
             owner_pid = COALESCE(excluded.owner_pid, session_leases.owner_pid),
             owner_ppid = COALESCE(excluded.owner_ppid, session_leases.owner_ppid),
             owner_pgid = COALESCE(excluded.owner_pgid, session_leases.owner_pgid),
             owner_tty = COALESCE(excluded.owner_tty, session_leases.owner_tty),
+            owner_create_time = excluded.owner_create_time,
             repo_dir = COALESCE(excluded.repo_dir, session_leases.repo_dir),
             repo_lock_mode = excluded.repo_lock_mode,
             write_scopes = excluded.write_scopes,
+            fencing_epoch = excluded.fencing_epoch,
             last_heartbeat_at = excluded.last_heartbeat_at,
             shutdown_at = NULL,
             status = excluded.status
@@ -403,9 +530,11 @@ def upsert_session_lease(
             owner_ppid,
             owner_pgid,
             owner_tty,
+            owner_create_time,
             resolved_repo,
             resolved_mode,
             _encode_write_scopes(resolved_scopes),
+            next_epoch,
             now,
             now,
             status,
@@ -446,6 +575,9 @@ def heartbeat_session_lease(
     owner_ppid = inspect.get("ppid") if inspect else lease.get("owner_ppid")
     owner_pgid = inspect.get("pgid") if inspect else lease.get("owner_pgid")
     owner_tty = inspect.get("tty") if inspect else lease.get("owner_tty")
+    owner_create_time = _pid_create_time(pid_to_use) or lease.get(
+        "owner_create_time"
+    )
     resolved_repo = _resolve_repo_dir(repo_dir) or lease.get("repo_dir")
     resolved_mode = repo_lock_mode or lease.get("repo_lock_mode", "cooperative")
     resolved_scopes = (
@@ -460,6 +592,7 @@ def heartbeat_session_lease(
             owner_ppid = ?,
             owner_pgid = ?,
             owner_tty = ?,
+            owner_create_time = ?,
             repo_dir = COALESCE(?, repo_dir),
             repo_lock_mode = ?,
             write_scopes = ?,
@@ -473,6 +606,7 @@ def heartbeat_session_lease(
             owner_ppid,
             owner_pgid,
             owner_tty,
+            owner_create_time,
             resolved_repo,
             resolved_mode,
             _encode_write_scopes(resolved_scopes),
@@ -505,8 +639,9 @@ def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, An
     """Return one session lease by id, if present."""
     row = conn.execute(
         """
-        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+               owner_create_time, repo_dir, repo_lock_mode, write_scopes,
+               fencing_epoch, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         WHERE session_id = ?
         """,
@@ -521,8 +656,9 @@ def list_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return all session leases ordered by creation time."""
     rows = conn.execute(
         """
-        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+               owner_create_time, repo_dir, repo_lock_mode, write_scopes,
+               fencing_epoch, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         ORDER BY started_at ASC, session_id ASC
         """
@@ -534,8 +670,9 @@ def list_active_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]
     """Return only active, non-shutdown session leases."""
     rows = conn.execute(
         """
-        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+               owner_create_time, repo_dir, repo_lock_mode, write_scopes,
+               fencing_epoch, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         WHERE status = 'ACTIVE' AND shutdown_at IS NULL
         ORDER BY last_heartbeat_at DESC
@@ -592,10 +729,11 @@ def register_process(
         conn.execute(
             """
             INSERT INTO session_leases (
-                session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
+                session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+                owner_create_time, repo_dir,
                 started_at, last_heartbeat_at, shutdown_at, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE')
             """,
             (
                 sid,
@@ -603,6 +741,7 @@ def register_process(
                 inspect.get("ppid"),
                 inspect.get("pgid"),
                 inspect.get("tty"),
+                _pid_create_time(pid),
                 resolved_repo,
                 now,
                 now,
@@ -795,7 +934,15 @@ def clean_stale_session_leases(
     limit: int = DEFAULT_SESSION_LEASE_CLEANUP_LIMIT,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Close ACTIVE session leases whose owner PID is dead and heartbeat is stale."""
+    """Close ACTIVE session leases that are stale by EITHER sufficient trigger.
+
+    Path C (DECOUPLE): a lease is reapable when the owner is PROVEN DEAD
+    (``_lease_owner_alive`` False — PID gone or create-time mismatch from PID
+    reuse) OR when an ownerless/dead lease's heartbeat has exceeded the TTL. A
+    proven-dead owner is reaped IMMEDIATELY, independent of heartbeat age, so a
+    dead session never holds a repo for up to ``stale_seconds``. A null-PID
+    lease with a fresh heartbeat is conservatively left in place (TTL arm only).
+    """
     if limit <= 0:
         return []
 
@@ -806,11 +953,20 @@ def clean_stale_session_leases(
         if lease["status"] != "ACTIVE" or lease.get("shutdown_at") is not None:
             continue
         owner_pid = lease.get("owner_pid")
-        if owner_pid is None or _pid_exists(owner_pid):
-            continue
         heartbeat_age = _age_seconds(lease.get("last_heartbeat_at"))
-        if heartbeat_age is None or heartbeat_age <= stale_seconds:
+
+        if owner_pid is not None and not _lease_owner_alive(lease):
+            # Proven death (PID gone or recycled) — independent sufficient
+            # trigger, no TTL wait.
+            reason = "dead_session_owner"
+        elif heartbeat_age is not None and heartbeat_age > stale_seconds and (
+            owner_pid is None or not _lease_owner_alive(lease)
+        ):
+            # TTL arm: ownerless/dead lease whose heartbeat has expired.
+            reason = "stale_dead_session_lease"
+        else:
             continue
+
         try:
             closed = close_session_lease(conn, lease["session_id"])
         except (sqlite3.Error, OSError):
@@ -819,7 +975,7 @@ def clean_stale_session_leases(
             continue
         cleaned.append(
             {
-                "reason": "stale_dead_session_lease",
+                "reason": reason,
                 "session_id": lease["session_id"],
                 "owner_pid": owner_pid,
                 "repo_dir": lease.get("repo_dir"),
@@ -850,7 +1006,10 @@ def _session_lease_blocks_repo(
         return False
 
     owner_pid = lease.get("owner_pid")
-    if owner_pid is not None and _pid_exists(owner_pid):
+    if owner_pid is not None:
+        # Proven death (PID gone or recycled) never blocks — Path C decouple.
+        if not _lease_owner_alive(lease):
+            return False
         return True
 
     heartbeat_age = _age_seconds(lease.get("last_heartbeat_at"))
@@ -866,8 +1025,9 @@ def get_active_session_leases_by_repo(
     resolved = str(Path(repo_dir).resolve())
     rows = conn.execute(
         """
-        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty, repo_dir,
-               repo_lock_mode, write_scopes, started_at, last_heartbeat_at, shutdown_at, status
+        SELECT session_id, owner_pid, owner_ppid, owner_pgid, owner_tty,
+               owner_create_time, repo_dir, repo_lock_mode, write_scopes,
+               fencing_epoch, started_at, last_heartbeat_at, shutdown_at, status
         FROM session_leases
         WHERE repo_dir = ? AND status = 'ACTIVE' AND shutdown_at IS NULL
         ORDER BY last_heartbeat_at DESC
@@ -1274,9 +1434,11 @@ def _session_lease_row_to_dict(row: tuple) -> dict[str, Any]:
         "owner_ppid",
         "owner_pgid",
         "owner_tty",
+        "owner_create_time",
         "repo_dir",
         "repo_lock_mode",
         "write_scopes",
+        "fencing_epoch",
         "started_at",
         "last_heartbeat_at",
         "shutdown_at",
@@ -1285,6 +1447,7 @@ def _session_lease_row_to_dict(row: tuple) -> dict[str, Any]:
     data = dict(zip(cols, row))
     data["repo_lock_mode"] = data.get("repo_lock_mode") or "cooperative"
     data["write_scopes"] = _decode_write_scopes(data.get("write_scopes"))
+    data["fencing_epoch"] = int(data.get("fencing_epoch") or 1)
     return data
 
 

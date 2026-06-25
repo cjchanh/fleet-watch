@@ -127,9 +127,21 @@ def check_repo_with_session(
 
                 owner_pid = lease.get("owner_pid")
                 heartbeat_age = registry._age_seconds(lease.get("last_heartbeat_at"))
-                owner_dead = owner_pid is not None and not registry._pid_exists(owner_pid)
                 owner_missing = owner_pid is None
-                if (owner_missing or owner_dead) and heartbeat_age is not None and heartbeat_age > registry.DEFAULT_STALE_SECONDS:
+                # Path C (DECOUPLE): proven owner death and heartbeat-TTL expiry
+                # are INDEPENDENT sufficient triggers for release — OR, not AND.
+                # ``_lease_owner_alive`` is create-time aware, so a recycled PID
+                # (PID reuse) reads as dead even though the integer still exists.
+                owner_dead = owner_pid is not None and not registry._lease_owner_alive(
+                    lease
+                )
+                ttl_expired = (
+                    heartbeat_age is not None
+                    and heartbeat_age > registry.DEFAULT_STALE_SECONDS
+                )
+                # Conservative arm: a null-PID lease only releases on TTL expiry
+                # (missing PID + fresh heartbeat keeps blocking — fail-closed).
+                if owner_dead or (owner_missing and ttl_expired):
                     registry.close_session_lease(conn, lease["session_id"])
                     events.log_event(
                         conn,

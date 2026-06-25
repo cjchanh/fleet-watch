@@ -158,10 +158,16 @@ def test_repo_allowed_for_current_session_lease():
     assert "owned by current session" in d.reason
 
 
-def test_repo_allows_cooperative_lease_with_dead_owner_but_fresh_heartbeat(monkeypatch):
-    """A fresh cooperative lease with a dead owner is advisory, not an exclusive block."""
+def test_repo_releases_cooperative_lease_with_dead_owner(monkeypatch):
+    """Path C (DECOUPLE): a cooperative lease whose owner is PROVEN DEAD is
+    released immediately, independent of heartbeat freshness. A dead owner is
+    not a live advisory holder — the lease is closed and surfaced as stale.
+    (Replaces the prior test asserting the buggy behavior of keeping a fresh
+    dead-owner lease ACTIVE.)"""
     conn = _fresh_conn()
     monkeypatch.setattr(registry, "_pid_exists", lambda pid: False)
+    # Fresh heartbeat (5s) — old behavior kept it ACTIVE; Path C closes it.
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 5 if ts else None)
     registry.upsert_session_lease(
         conn,
         "sess-dead-owner",
@@ -170,9 +176,10 @@ def test_repo_allows_cooperative_lease_with_dead_owner_but_fresh_heartbeat(monke
     )
     d = referee.check_repo_with_session(conn, "/tmp/test-repo", current_session_id="sess-mine")
     assert d.allowed is True
-    assert d.holders[0]["session_id"] == "sess-dead-owner"
+    assert d.holders == []
+    assert d.stale_holders[0]["session_id"] == "sess-dead-owner"
     lease = registry.get_session_lease(conn, "sess-dead-owner")
-    assert lease["status"] == "ACTIVE"
+    assert lease["status"] == "CLOSED"
 
 
 def test_repo_allowed_when_owner_dead_and_heartbeat_stale(monkeypatch):

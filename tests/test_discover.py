@@ -319,8 +319,11 @@ def test_clean_stale_session_leases_closes_dead_stale(monkeypatch):
     assert lease["status"] == "CLOSED"
 
 
-def test_clean_stale_session_leases_skips_fresh_heartbeat(monkeypatch):
-    """Leases with dead owner but fresh heartbeat are NOT closed."""
+def test_clean_stale_session_leases_reaps_dead_owner_despite_fresh_heartbeat(monkeypatch):
+    """Path C (DECOUPLE): a dead-owner lease is reaped IMMEDIATELY by the
+    discover reaper, even when its heartbeat is fresh — proven death is an
+    independent sufficient trigger that does not wait out the 180s TTL.
+    (Replaces the prior test asserting the buggy AND-coupled behavior.)"""
     conn = _fresh_conn()
     registry.upsert_session_lease(conn, "fresh-sess", owner_pid=99999)
     monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid != 99999)
@@ -328,8 +331,22 @@ def test_clean_stale_session_leases_skips_fresh_heartbeat(monkeypatch):
 
     cleaned = discover._clean_stale_session_leases(conn)
 
-    assert cleaned == 0
+    assert cleaned == 1
     lease = registry.get_session_lease(conn, "fresh-sess")
+    assert lease["status"] == "CLOSED"
+
+
+def test_clean_stale_session_leases_keeps_ownerless_fresh_lease(monkeypatch):
+    """Conservative arm: a null-PID lease with a fresh heartbeat is NOT closed —
+    missing PID + fresh heartbeat keeps blocking (fail-closed)."""
+    conn = _fresh_conn()
+    registry.upsert_session_lease(conn, "ownerless-fresh", owner_pid=None)
+    monkeypatch.setattr(registry, "_age_seconds", lambda ts: 30 if ts else None)
+
+    cleaned = discover._clean_stale_session_leases(conn)
+
+    assert cleaned == 0
+    lease = registry.get_session_lease(conn, "ownerless-fresh")
     assert lease["status"] == "ACTIVE"
 
 
