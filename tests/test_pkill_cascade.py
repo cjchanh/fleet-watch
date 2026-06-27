@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fleet_watch import pkill as pkill_module
 from fleet_watch.pkill import (
     PkillResult,
     PkillTarget,
@@ -64,10 +65,34 @@ class TestExecutePkill:
                                 cascade=False, confirm=True)
         assert len(result.errors) > 0
 
-    def test_confirm_flag_propagates(self):
+    def test_confirm_flag_propagates(self, monkeypatch):
+        terminated: list[int] = []
+        monkeypatch.setattr(
+            pkill_module,
+            "_find_matching_pids",
+            lambda pattern: [{"pid": 424242}],
+        )
+        monkeypatch.setattr(
+            pkill_module,
+            "_get_process_detail",
+            lambda pid: {
+                "pid": pid,
+                "ppid": 1,
+                "rss_mb": 1,
+                "name": "fixture",
+                "cmdline": "fixture test process",
+            },
+        )
+        monkeypatch.setattr(
+            pkill_module,
+            "_terminate_process",
+            lambda pid: (terminated.append(pid), True)[1],
+        )
+
         result = execute_pkill(pattern="test", cascade=False, confirm=True)
         assert result.confirmed
         assert not result.dry_run
+        assert terminated == [424242]
 
     def test_cascade_flag_propagates(self):
         result = execute_pkill(pattern="test", cascade=True, confirm=False)
