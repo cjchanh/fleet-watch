@@ -50,19 +50,26 @@ class TestCheckSwapPressure:
     def test_normal_no_crossings(self):
         thresholds = {**DEFAULT_THRESHOLDS, "swap_warning_pct": 50,
                        "swap_gpu_refusal_pct": 80, "swap_all_refusal_pct": 95}
-        v = check_swap_pressure(thresholds=thresholds)
-        # When swap is below 50%, no flags should trigger
-        if v.swap_used_pct <= 50:
-            assert not v.warning
-            assert not v.gpu_blocked
-            assert not v.all_blocked
+        v = check_swap_pressure(thresholds=thresholds,
+                                swap_state=_swap(20.0),
+                                mem_state=_mem(64000, 20),
+                                pressure_level=_NORMAL,
+                                total_mem_mb=_MB_128GB)
+        assert not v.warning
+        assert not v.gpu_blocked
+        assert not v.all_blocked
 
     def test_warning_above_50(self):
         thresholds = {"swap_warning_pct": 30, "swap_gpu_refusal_pct": 80,
                        "swap_all_refusal_pct": 95}
-        v = check_swap_pressure(thresholds=thresholds)
-        if v.swap_used_pct > 30:
-            assert v.warning
+        v = check_swap_pressure(thresholds=thresholds,
+                                swap_state=_swap(40.0),
+                                mem_state=_mem(64000, 20),
+                                pressure_level=_NORMAL,
+                                total_mem_mb=_MB_128GB)
+        assert v.warning
+        assert not v.gpu_blocked
+        assert not v.all_blocked
 
     def test_thresholds_saved_in_verdict(self):
         v = check_swap_pressure()

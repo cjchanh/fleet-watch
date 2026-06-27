@@ -45,10 +45,15 @@ def list_launchd_agents() -> dict[str, dict[str, Any]]:
                 "pid": None,
             }
 
-    result = subprocess.run(
-        ["launchctl", "list"],
-        capture_output=True, text=True, timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
+        return agents
+    if result.returncode != 0:
+        return agents
     for line in result.stdout.strip().split("\n"):
         parts = line.split()
         if len(parts) >= 2:

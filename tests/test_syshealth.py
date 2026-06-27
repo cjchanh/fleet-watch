@@ -44,6 +44,7 @@ def test_memory_pressure_pct_is_clamped_to_valid_percent():
 
 def test_memory_state_unavailable_on_failure(monkeypatch):
     """Returns unavailable state when sysctl fails."""
+    monkeypatch.setattr(syshealth, "_get_linux_memory_state", lambda: None)
     monkeypatch.setattr(
         syshealth.subprocess, "run",
         lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError),

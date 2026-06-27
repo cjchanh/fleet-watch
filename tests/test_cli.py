@@ -14,6 +14,18 @@ from fleet_watch import syshealth
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
     monkeypatch.setattr(registry, "DB_PATH", tmp_path / "registry.db")
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(131072, 20000, 60000, 20000, 0, 10000),
+    )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(8192, 1024, 7168),
+    )
+    monkeypatch.setattr(cli_module.syshealth, "get_vm_pressure_level", lambda: 1)
+    monkeypatch.setattr(cli_module.syshealth, "get_total_memory_mb", lambda: 131072)
 
 
 def test_guard_json_denies_taken_port(tmp_path, monkeypatch):

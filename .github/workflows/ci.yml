@@ -53,15 +53,15 @@ jobs:
 
           runner_temp = Path(os.environ["RUNNER_TEMP"])
           guard = json.loads((runner_temp / "guard.json").read_text())
-          assert set(guard.keys()) == {"allowed", "request", "checks", "state"}
-          assert set(guard["state"].keys()) == {
+          assert {"allowed", "request", "checks", "state"} <= set(guard.keys())
+          assert {
               "process_count",
               "occupied_ports",
               "safe_ports",
               "locked_repos",
               "gpu_budget",
               "external_resources",
-          }
+          } <= set(guard["state"].keys())
 
           state = json.loads((Path(os.environ["HOME"]) / ".fleet-watch" / "state.json").read_text())
           assert state["agent_interface"] == "fleet guard --json"

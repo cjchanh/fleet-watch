@@ -6,12 +6,24 @@ import os
 from click.testing import CliRunner
 
 from fleet_watch import cli as cli_module
-from fleet_watch import events, registry, runaway
+from fleet_watch import events, registry, runaway, syshealth
 
 
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
     monkeypatch.setattr(registry, "DB_PATH", tmp_path / "registry.db")
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(131072, 20000, 60000, 20000, 0, 10000),
+    )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(8192, 1024, 7168),
+    )
+    monkeypatch.setattr(cli_module.syshealth, "get_vm_pressure_level", lambda: 1)
+    monkeypatch.setattr(cli_module.syshealth, "get_total_memory_mb", lambda: 131072)
 
 
 # --- runaway.py unit tests ---
