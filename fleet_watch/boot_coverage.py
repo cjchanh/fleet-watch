@@ -105,6 +105,7 @@ def _find_launchd_for_process(
 
 
 def _plist_template(name: str, command: str, label: str) -> str:
+    log_path = Path.home() / "Library" / "Logs" / f"{label}.log"
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -127,9 +128,9 @@ def _plist_template(name: str, command: str, label: str) -> str:
         f"        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n"
         f"    </dict>\n"
         f"    <key>StandardOutPath</key>\n"
-        f"    <string>/Users/cj/Library/Logs/{label}.log</string>\n"
+        f"    <string>{log_path}</string>\n"
         f"    <key>StandardErrorPath</key>\n"
-        f"    <string>/Users/cj/Library/Logs/{label}.log</string>\n"
+        f"    <string>{log_path}</string>\n"
         f"</dict>\n"
         f"</plist>\n"
     )

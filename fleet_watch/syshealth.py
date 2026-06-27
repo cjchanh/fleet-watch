@@ -99,7 +99,7 @@ class MemoryState:
         if not self.is_available:
             return -1
         used = self.active_mb + self.wired_mb + self.compressed_mb
-        return int(used / max(self.total_mb, 1) * 100)
+        return max(0, min(100, int(used / max(self.total_mb, 1) * 100)))
 
     def to_dict(self) -> dict[str, Any]:
         return {

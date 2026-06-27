@@ -29,6 +29,19 @@ def test_memory_state_dict():
     assert d["available_mb"] == mem.free_mb + mem.inactive_mb
 
 
+def test_memory_pressure_pct_is_clamped_to_valid_percent():
+    """Compressed memory can over-read the proxy; public percent stays valid."""
+    mem = syshealth.MemoryState(
+        total_mb=100,
+        active_mb=80,
+        inactive_mb=0,
+        free_mb=0,
+        compressed_mb=80,
+        wired_mb=10,
+    )
+    assert mem.pressure_pct == 100
+
+
 def test_memory_state_unavailable_on_failure(monkeypatch):
     """Returns unavailable state when sysctl fails."""
     monkeypatch.setattr(

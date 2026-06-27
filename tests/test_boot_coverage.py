@@ -111,6 +111,10 @@ class TestBootCoverage(unittest.TestCase):
         )
         self.assertIn("com.cds.test-service", template)
         self.assertIn("/usr/bin/test", template)
+        self.assertIn(
+            str(Path.home() / "Library" / "Logs" / "com.cds.test-service.log"),
+            template,
+        )
 
     def test_run_creates_receipt(self):
         self._mock_receipt_dir()
