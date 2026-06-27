@@ -1,6 +1,5 @@
 """Tests for fleet_watch.boot_coverage — service persistence audit."""
 
-import json
 import plistlib
 import tempfile
 import unittest

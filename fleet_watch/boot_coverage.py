@@ -9,7 +9,6 @@ Schema version: boot_coverage_receipt_v1
 from __future__ import annotations
 
 import json
-import os
 import plistlib
 import subprocess
 from pathlib import Path

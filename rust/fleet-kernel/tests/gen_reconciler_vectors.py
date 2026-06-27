@@ -22,7 +22,7 @@ from typing import Any
 WTREE = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(WTREE))
 
-from fleet_watch import events as fw_events, registry as fw_registry, referee as fw_referee
+from fleet_watch import events as fw_events, registry as fw_registry, referee as fw_referee  # noqa: E402
 
 FIXED_TS = "2026-06-13T12:00:00+00:00"
 FIXED_DT = datetime.fromisoformat(FIXED_TS)

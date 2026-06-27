@@ -69,7 +69,6 @@ class TestCheckSwapPressure:
         assert "swap_warning_pct" in v.thresholds_used
 
     def test_unavailable_swap_returns_empty_verdict(self):
-        thresholds = {**DEFAULT_THRESHOLDS}
         v = SwapPressureVerdict(swap_used_pct=0.0, swap_total_mb=0,
                                  swap_used_mb=0, swap_free_mb=0)
         assert not v.blocked

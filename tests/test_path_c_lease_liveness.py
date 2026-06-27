@@ -17,7 +17,6 @@ import os
 import sqlite3
 import time
 
-import pytest
 from click.testing import CliRunner
 
 from fleet_watch import cli, referee, registry
@@ -185,7 +184,7 @@ def test_owner_create_time_captured_at_open():
     # Column must exist (migration ran via SCHEMA/_ensure_column).
     cols = {row[1] for row in conn.execute("PRAGMA table_info(session_leases)")}
     assert "owner_create_time" in cols
-    lease = registry.get_session_lease  # accessor exists
+    assert callable(registry.get_session_lease)
     registry.upsert_session_lease(
         conn, "sess-capture", owner_pid=99999, repo_dir="/tmp/r"
     )
@@ -238,7 +237,7 @@ def test_session_list_json_reports_dead_owner_liveness(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     lease = next(
-        l for l in payload["session_leases"] if l["session_id"] == "sess-dead-list"
+        item for item in payload["session_leases"] if item["session_id"] == "sess-dead-list"
     )
     assert lease["owner_alive"] is False, lease
 

@@ -1,7 +1,6 @@
 """Tests for the process registry."""
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 

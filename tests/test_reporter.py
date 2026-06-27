@@ -5,7 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from fleet_watch import events, registry, reporter
+from fleet_watch import registry, reporter
 
 
 def _fresh_conn() -> sqlite3.Connection:
@@ -212,7 +212,6 @@ def test_changelog_no_entry_when_no_change(tmp_path):
 
 def test_changelog_decays_old_entries(tmp_path):
     """Changelog trims oldest entries when exceeding max."""
-    conn = _fresh_conn()
     log_path = tmp_path / "state_changelog.jsonl"
     # Write more than CHANGELOG_MAX_LINES entries directly
     with log_path.open("w") as f:

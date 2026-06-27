@@ -9,7 +9,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-import validate_real_validation_drop as validator
+import validate_real_validation_drop as validator  # noqa: E402
 
 
 def _write_json(path: Path, data: dict) -> None:
