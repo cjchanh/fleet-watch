@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from fleet_watch import syshealth
@@ -61,6 +62,7 @@ DEFAULT_THRESHOLDS = {
 }
 
 POLICY_PATH = FLEET_DIR / "policy.json"
+STATE_FALLBACK_MAX_AGE_SECONDS = 120
 
 # Sentinel so a caller can inject pressure_level=None ("unreadable" -> fail-closed)
 # DISTINCTLY from "not provided" (read the live signal from syshealth).
@@ -84,6 +86,18 @@ def load_thresholds() -> dict[str, int]:
     return thresholds
 
 
+def _parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 @dataclass
 class SwapPressureVerdict:
     """Result of a swap-pressure gate check."""
@@ -102,6 +116,7 @@ class SwapPressureVerdict:
     all_blocked: bool = False
     thresholds_used: dict[str, int] = field(default_factory=dict)
     threshold_crossings: list[str] = field(default_factory=list)
+    telemetry_source: str = "live"
 
     @property
     def blocked(self) -> bool:
@@ -123,7 +138,65 @@ class SwapPressureVerdict:
             "all_blocked": self.all_blocked,
             "thresholds_used": self.thresholds_used,
             "threshold_crossings": self.threshold_crossings,
+            "telemetry_source": self.telemetry_source,
         }
+
+
+def _fresh_state_verdict(
+    thresholds: dict[str, int],
+    *,
+    now: datetime | None = None,
+) -> SwapPressureVerdict | None:
+    """Use the daemon-written state snapshot when sandboxed probes are blind."""
+    path = FLEET_DIR / "state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    generated = _parse_utc(payload.get("generated_utc"))
+    if generated is None:
+        return None
+    reference = now or datetime.now(timezone.utc)
+    age_seconds = (reference - generated).total_seconds()
+    if age_seconds < -30 or age_seconds > STATE_FALLBACK_MAX_AGE_SECONDS:
+        return None
+    raw = payload.get("swap_pressure")
+    if not isinstance(raw, dict):
+        return None
+    pressure_level = raw.get("pressure_level")
+    mem_available = raw.get("mem_available_mb")
+    if not isinstance(pressure_level, int) or not isinstance(mem_available, int):
+        return None
+    if mem_available <= 0:
+        return None
+    threshold_values = raw.get("thresholds_used")
+    if not isinstance(threshold_values, dict):
+        threshold_values = thresholds
+    crossings = raw.get("threshold_crossings")
+    try:
+        return SwapPressureVerdict(
+            swap_used_pct=float(raw.get("swap_used_pct", 0.0)),
+            swap_total_mb=int(raw.get("swap_total_mb", 0)),
+            swap_used_mb=int(raw.get("swap_used_mb", 0)),
+            swap_free_mb=int(raw.get("swap_free_mb", 0)),
+            mem_available_mb=mem_available,
+            mem_pressure_pct=int(raw.get("mem_pressure_pct", -1)),
+            mem_pressured=bool(raw.get("mem_pressured", False)),
+            pressure_level=pressure_level,
+            scaled_avail_floor_mb=int(raw.get("scaled_avail_floor_mb", 0)),
+            warning=bool(raw.get("warning", False)),
+            gpu_blocked=bool(raw.get("gpu_blocked", False)),
+            all_blocked=bool(raw.get("all_blocked", False)),
+            thresholds_used={str(k): int(v) for k, v in threshold_values.items()},
+            threshold_crossings=[
+                str(item) for item in crossings if isinstance(item, str)
+            ] if isinstance(crossings, list) else [],
+            telemetry_source="state_fallback",
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def check_swap_pressure(
@@ -158,6 +231,21 @@ def check_swap_pressure(
         if pressure_level is _UNSET
         else pressure_level
     )
+    live_probe = (
+        swap_state is None
+        and mem_state is None
+        and pressure_level is _UNSET
+        and total_mem_mb is _UNSET
+    )
+    if live_probe and (
+        not swap.is_available or not mem.is_available or level is None
+    ):
+        try:
+            fallback = _fresh_state_verdict(t)
+        except Exception:
+            fallback = None
+        if fallback is not None:
+            return fallback
     # Total RAM for the scaled floor: explicit override > the MemoryState's own
     # total (already read — keeps the floor consistent with the injected/mocked
     # mem) > a direct syshealth read as a last resort.

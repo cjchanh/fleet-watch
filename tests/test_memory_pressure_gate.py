@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import fleet_watch.guards.memory_pressure as memory_pressure
 from fleet_watch.guards.memory_pressure import (
     SwapPressureVerdict,
     check_swap_pressure,
@@ -151,6 +154,47 @@ def _mem(available_mb, pressure_pct, avail=True):
                            pressure_pct=pressure_pct)
 
 
+def _blind_live_probes(monkeypatch, tmp_path):
+    monkeypatch.setattr(memory_pressure, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(memory_pressure, "load_thresholds",
+                        lambda: dict(DEFAULT_THRESHOLDS))
+    monkeypatch.setattr(memory_pressure.syshealth, "get_swap_state",
+                        lambda: _swap(0.0, avail=False))
+    monkeypatch.setattr(memory_pressure.syshealth, "get_memory_state",
+                        lambda: _mem(0, -1, avail=False))
+    monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_level",
+                        lambda: None)
+    monkeypatch.setattr(memory_pressure.syshealth, "get_total_memory_mb",
+                        lambda: _MB_128GB)
+
+
+def _fresh_state(generated=None, mem_available_mb=44592):
+    generated_at = generated or datetime.now(timezone.utc)
+    return {
+        "generated_utc": generated_at.isoformat(),
+        "swap_pressure": {
+            "swap_used_pct": 91.0,
+            "swap_total_mb": 11264,
+            "swap_used_mb": 10325,
+            "swap_free_mb": 938,
+            "mem_available_mb": mem_available_mb,
+            "mem_pressure_pct": 106,
+            "mem_pressured": False,
+            "pressure_level": _NORMAL,
+            "scaled_avail_floor_mb": _MB_128GB * 6 // 100,
+            "warning": True,
+            "gpu_blocked": False,
+            "all_blocked": False,
+            "thresholds_used": dict(DEFAULT_THRESHOLDS),
+            "threshold_crossings": ["warning"],
+        },
+    }
+
+
+def _write_state(tmp_path, payload):
+    (tmp_path / "state.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
 # Authoritative macOS pressure levels (spec 2615908): 1 normal / 2 warn / 4 crit.
 _NORMAL, _WARN, _CRIT = 1, 2, 4
 _MB_128GB = 131072
@@ -249,6 +293,110 @@ class TestAuthoritativePressureGate:
         assert v.gpu_blocked
         assert v.all_blocked
         assert v.mem_pressured is True
+
+
+class TestStateJsonFallback:
+    def test_blind_probe_fresh_state_allows_with_provenance(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        _write_state(tmp_path, _fresh_state())
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+        d = guard_decision(v, audit_cycles=20)
+
+        assert d["allowed"]
+        assert v.telemetry_source == "state_fallback"
+        assert d["verdict"]["telemetry_source"] == "state_fallback"
+
+    def test_live_telemetry_wins_over_fresh_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(memory_pressure, "FLEET_DIR", tmp_path)
+        monkeypatch.setattr(memory_pressure, "load_thresholds",
+                            lambda: dict(DEFAULT_THRESHOLDS))
+        monkeypatch.setattr(memory_pressure.syshealth, "get_swap_state",
+                            lambda: _swap(30.0))
+        monkeypatch.setattr(memory_pressure.syshealth, "get_memory_state",
+                            lambda: _mem(40000, 50))
+        monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_level",
+                            lambda: _CRIT)
+        monkeypatch.setattr(memory_pressure.syshealth, "get_total_memory_mb",
+                            lambda: _MB_128GB)
+        _write_state(tmp_path, _fresh_state())
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert v.all_blocked
+
+    def test_explicit_overrides_prevent_state_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(memory_pressure, "FLEET_DIR", tmp_path)
+        monkeypatch.setattr(memory_pressure, "load_thresholds",
+                            lambda: dict(DEFAULT_THRESHOLDS))
+        _write_state(tmp_path, _fresh_state())
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(0.0, avail=False),
+                                mem_state=_mem(0, -1, avail=False),
+                                pressure_level=None,
+                                total_mem_mb=_MB_128GB)
+
+        assert v.telemetry_source == "live"
+        assert v.all_blocked
+
+    def test_stale_state_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        generated = datetime.now(timezone.utc) - timedelta(seconds=121)
+        _write_state(tmp_path, _fresh_state(generated=generated))
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
+
+    def test_future_state_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        generated = datetime.now(timezone.utc) + timedelta(seconds=31)
+        _write_state(tmp_path, _fresh_state(generated=generated))
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
+
+    def test_missing_state_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
+
+    def test_malformed_state_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        (tmp_path / "state.json").write_text("{not-json", encoding="utf-8")
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
+
+    def test_missing_generated_utc_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        payload = _fresh_state()
+        payload.pop("generated_utc")
+        _write_state(tmp_path, payload)
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
+
+    def test_blind_state_snapshot_refuses(self, tmp_path, monkeypatch):
+        _blind_live_probes(monkeypatch, tmp_path)
+        _write_state(tmp_path, _fresh_state(mem_available_mb=0))
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+
+        assert v.telemetry_source == "live"
+        assert not guard_decision(v, audit_cycles=20)["allowed"]
 
 
 class TestLoadThresholdsMemoryKeys:
