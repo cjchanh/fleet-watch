@@ -546,6 +546,32 @@ def test_guard_gpu_without_model_does_not_false_deny(tmp_path, monkeypatch):
     assert "working_set" not in payload["checks"]["gpu"]
 
 
+def test_guard_gpu_uses_kernel_pressure_over_computed_proxy(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    # Replay the live 128GB-host incident: the computed proxy reaches 81%, but
+    # macOS reports NORMAL pressure and roughly 57GB remains available.
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_memory_state",
+        lambda: syshealth.MemoryState(131072, 38971, 41263, 15709, 55059, 12443),
+    )
+    monkeypatch.setattr(
+        cli_module.syshealth,
+        "get_swap_state",
+        lambda: syshealth.SwapState(4096, 2777, 1318, encrypted=True),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["guard", "--gpu", "3072", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["allowed"] is True
+    assert payload["checks"]["swap_pressure"]["allowed"] is True
+    assert payload["checks"]["memory_pressure"]["allowed"] is True
+    assert payload["checks"]["memory_pressure"]["blockers"] == []
+
+
 def test_guard_blocks_worker_launch_on_swap_pressure(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     # Memory genuinely pressured (available < floor) so the swap blockers are

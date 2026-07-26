@@ -362,16 +362,25 @@ def _build_guard_payload(
     if gpu_mb is not None:
         mem = syshealth.get_memory_state()
         swap = syshealth.get_swap_state()
-        pressure_blockers = syshealth.launch_pressure_blockers(mem, swap)
+        # ``swap_pressure`` is the authoritative launch gate. Keep the legacy
+        # check shape for callers, but do not let its computed pressure proxy
+        # contradict the kernel pressure level and scaled available-RAM floor.
+        pressure_allowed = bool(swap_decision["allowed"])
+        pressure_blockers = (
+            syshealth.launch_pressure_blockers(mem, swap)
+            if not pressure_allowed
+            else []
+        )
         pressure_check = {
-            "allowed": not pressure_blockers,
-            "reason": "memory pressure within launch limits" if not pressure_blockers else "worker launch blocked by memory pressure",
+            "allowed": pressure_allowed,
+            "reason": swap_decision.get(
+                "reason", "memory pressure within launch limits"
+            ),
             "blockers": pressure_blockers,
             "memory": mem.to_dict(),
             "swap": swap.to_dict(),
         }
         payload["checks"]["memory_pressure"] = pressure_check
-        payload["allowed"] = payload["allowed"] and pressure_check["allowed"]
 
         decision = referee.check_gpu_budget(conn, gpu_mb)
         gpu_check: dict[str, Any] = {
