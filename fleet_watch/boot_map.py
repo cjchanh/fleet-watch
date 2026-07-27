@@ -104,7 +104,13 @@ _EXECUTABLE_SUFFIXES = frozenset(
     {"", ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".rb", ".pl", ".ts", ".bin", ".app"}
 )
 
-#: Caps keep an adversarial / verbose evidence string from exploding the graph.
+#: Caps keep an adversarial or merely verbose row from exploding the graph. One
+#: item must never be able to dominate the map. Observed ceiling on a real
+#: 178-item census: 3 declared paths and 5 declared endpoints per item, so these
+#: leave headroom without leaving the door open. Every clamp is counted in
+#: ``stats.extraction`` — bounded is not the same as silent.
+MAX_DECLARED_PATHS_PER_ITEM = 12
+MAX_DECLARED_ENDPOINTS_PER_ITEM = 8
 MAX_EVIDENCE_PATHS_PER_ITEM = 8
 MAX_EVIDENCE_ENDPOINTS_PER_ITEM = 6
 MAX_EVIDENCE_CHARS = 1400
@@ -492,6 +498,8 @@ def build_graph(census: ParsedCensus, *, source_path: str = "", source_sha256: s
     graph = _Graph()
     stats: dict[str, int] = {
         "items": 0,
+        "declared_paths_capped": 0,
+        "declared_endpoints_capped": 0,
         "evidence_paths_capped": 0,
         "evidence_endpoints_capped": 0,
         "unrooted_targets": 0,
@@ -553,6 +561,9 @@ def build_graph(census: ParsedCensus, *, source_path: str = "", source_sha256: s
 
             declared = f"{item.path}\n{item.resource}"
             declared_paths = extract_paths(declared)
+            if len(declared_paths) > MAX_DECLARED_PATHS_PER_ITEM:
+                stats["declared_paths_capped"] += 1
+                declared_paths = declared_paths[:MAX_DECLARED_PATHS_PER_ITEM]
             evidence_paths = [p for p in extract_paths(item.evidence) if p not in declared_paths]
             if len(evidence_paths) > MAX_EVIDENCE_PATHS_PER_ITEM:
                 stats["evidence_paths_capped"] += 1
@@ -567,6 +578,9 @@ def build_graph(census: ParsedCensus, *, source_path: str = "", source_sha256: s
                 _attach_target(graph, item_id, item, path, "INFERRED", stats, is_own_path=False)
 
             declared_endpoints = extract_endpoints(f"{item.label}\n{item.resource}")
+            if len(declared_endpoints) > MAX_DECLARED_ENDPOINTS_PER_ITEM:
+                stats["declared_endpoints_capped"] += 1
+                declared_endpoints = declared_endpoints[:MAX_DECLARED_ENDPOINTS_PER_ITEM]
             evidence_endpoints = [e for e in extract_endpoints(item.evidence) if e not in declared_endpoints]
             if len(evidence_endpoints) > MAX_EVIDENCE_ENDPOINTS_PER_ITEM:
                 stats["evidence_endpoints_capped"] += 1

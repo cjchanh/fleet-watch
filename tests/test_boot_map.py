@@ -188,6 +188,39 @@ class TestTransform(unittest.TestCase):
             self.assertTrue(link["source_ref"], "every edge names the census row behind it")
             self.assertGreater(link["weight"], 0)
 
+    def test_one_row_cannot_dominate_the_map(self):
+        # A single verbose or hostile row must not blow the graph up. The clamp
+        # is counted, not silent — bounded output still has to testify.
+        flood = " ".join(f"/usr/bin/t{n}" for n in range(5000))
+        graph = boot_map.build_graph(
+            boot_map.parse_census(
+                [{"domain": "d", "items": [
+                    {"label": "flood", "status": "running", "verdict": "keep", "resource": flood}
+                ]}]
+            )
+        )
+        targets = [n for n in graph["nodes"] if n["kind"] == "target"]
+        self.assertEqual(len(targets), boot_map.MAX_DECLARED_PATHS_PER_ITEM)
+        self.assertEqual(graph["stats"]["extraction"]["declared_paths_capped"], 1)
+
+    def test_endpoint_flood_is_also_clamped(self):
+        flood = " ".join(f"127.0.0.1:{9000 + n}" for n in range(400))
+        graph = boot_map.build_graph(
+            boot_map.parse_census(
+                [{"domain": "d", "items": [
+                    {"label": "ports", "status": "running", "verdict": "keep", "resource": flood}
+                ]}]
+            )
+        )
+        ports = [n for n in graph["nodes"] if n["kind"] == "port"]
+        self.assertEqual(len(ports), boot_map.MAX_DECLARED_ENDPOINTS_PER_ITEM)
+        self.assertEqual(graph["stats"]["extraction"]["declared_endpoints_capped"], 1)
+
+    def test_real_world_rows_are_nowhere_near_the_cap(self):
+        # A clamp that fires on ordinary input is a truncation bug, not a bound.
+        self.assertEqual(self.graph["stats"]["extraction"]["declared_paths_capped"], 0)
+        self.assertEqual(self.graph["stats"]["extraction"]["declared_endpoints_capped"], 0)
+
     def test_no_dangling_edge_endpoints(self):
         ids = {n["id"] for n in self.graph["nodes"]}
         for link in self.graph["links"]:
