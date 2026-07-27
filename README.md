@@ -208,6 +208,30 @@ Top-level keys:
 | `fleet stale` | List heartbeat-stale processes with evidence |
 | `fleet reconcile` | Non-destructive ownership diagnosis |
 | `fleet reconcile --json` | Machine-readable ownership diagnosis |
+| `fleet census` | What boots and runs on this machine, and what's stale |
+| `fleet census --json` | Full census receipt (`fleet-census/v1`) |
+| `fleet census --emit-launchd-plist` | Print the staged daily-census launchd job; installs nothing |
+
+#### `fleet census`
+
+A deterministic, read-only sweep of every persistence and runtime surface:
+`~/Library/LaunchAgents` cross-referenced against `launchctl list` and
+`launchctl print-disabled` (both-direction orphan check), `/Library` daemons and
+agents, live processes clustered by what they actually run, TCP listeners
+attributed to their owning process, crontab, login items, brew services, and
+Fleet Watch's own registry.
+
+Every item carries a `status`, a `verdict` (`keep` / `investigate` / `close` /
+`remove`), the exact evidence behind it, and the deterministic `rule` that fired.
+Receipts land at `~/.governance/receipts/fleet-census/`, and each run diffs
+itself against the previous one — new, disappeared and verdict-changed boot
+entries are the signal.
+
+Fleet Watch never kills anything here: `close_command` is advisory text for the
+operator, and the recurring launchd job is staged
+(`contrib/launchd/io.fleet-watch.census.plist`), never installed.
+
+Receipt contract: [`docs/fleet-census-receipt-contract-v1.md`](docs/fleet-census-receipt-contract-v1.md).
 
 ### Session Lifecycle
 

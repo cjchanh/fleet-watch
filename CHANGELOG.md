@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`fleet census`** — deterministic, read-only census of every boot and runtime surface on the machine: user LaunchAgents (cross-referenced against `launchctl list` and `launchctl print-disabled`, with both-direction orphan detection), `/Library` daemons and agents, live processes clustered by what they actually run, TCP listeners attributed to their owning process, crontab, login items, brew services, and the Fleet Watch registry itself.
+- **Deterministic verdict engine** — every item gets `status`, `verdict` (`keep`/`investigate`/`close`/`remove`), evidence, and the named `rule` that produced it, so a receipt testifies which heuristic fired rather than just its conclusion.
+- **`fleet-census/v1` receipt contract** — dated receipts plus an atomically swapped `latest.json` at `~/.governance/receipts/fleet-census/`. The payload is validated before any write and re-validated from disk before the pointer swap; a receipt that fails validation never replaces a good one. Contract: `docs/fleet-census-receipt-contract-v1.md`.
+- **Drift detection** — each census diffs itself against the previous receipt and reports new, disappeared and verdict-changed boot entries. The volatile `processes` domain is excluded from the diff and named in `drift.excluded_domains`.
+- **Staged daily launchd job** — `contrib/launchd/io.fleet-watch.census.plist`, emitted with the machine's resolved `fleet` path by `fleet census --emit-launchd-plist`. Staged only; Fleet Watch never bootstraps a launchd job.
+
+### Notes
+
+- Zero items across all domains is a refusal, not a receipt: nothing is written and the CLI exits 1. An unparseable plist is surfaced as `unknown`/`investigate`, never dropped.
+- `close_command` is advisory text. `fleet census` is read-only and kills nothing.
+
 ## 0.2.0
 
 ### Added

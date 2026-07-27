@@ -18,6 +18,7 @@ import click
 
 from fleet_watch import autonomous as autonomous_mod
 from fleet_watch import boot_coverage as boot_coverage_mod
+from fleet_watch import census as census_mod
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch import pkill as pkill_mod
@@ -2452,6 +2453,189 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
     for entry in failed:
         click.echo(f"FAIL: PID {entry['pid']} ({entry['name']}) — {entry.get('reason', 'unknown')}", err=True)
     sys.exit(1 if failed else 0)
+def _census_registry_rows() -> list[dict[str, Any]]:
+    """Read the Fleet Watch registry for the census. Never creates the DB."""
+    try:
+        if not registry.DB_PATH.exists():
+            return []
+        conn = _get_conn()
+    except (sqlite3.Error, OSError):
+        return []
+    try:
+        return registry.get_all_processes(conn)
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _render_census(payload: dict[str, Any], result: Any) -> list[str]:
+    totals = payload["totals"]
+    machine = payload.get("machine", {})
+    lines = [
+        f"Fleet Census — {payload['host']} ({machine.get('os', 'unknown')}), "
+        f"{payload['generated_at']}",
+        f"  {totals['items']} items: {totals['keep']} keep, "
+        f"{totals['investigate']} investigate, {totals['close']} close, "
+        f"{totals['remove']} remove",
+        "",
+    ]
+
+    for domain in payload["domains"]:
+        domain_totals = domain["totals"]
+        lines.append(f"  [{domain['domain']}] {domain_totals['items']} items")
+        lines.append(
+            f"      keep {domain_totals['keep']}  investigate "
+            f"{domain_totals['investigate']}  close {domain_totals['close']}  "
+            f"remove {domain_totals['remove']}"
+        )
+        for item in domain["items"]:
+            if item["verdict"] == "keep":
+                continue
+            lines.append(
+                f"      [{item['verdict'].upper():<11}] {item['label']} "
+                f"({item['status']}) — {item['reason']}"
+            )
+    lines.append("")
+
+    drift = payload["drift"]
+    if drift["prior_receipt"] is None:
+        lines.append(f"  Drift: no valid prior receipt ({drift['prior_status']}).")
+    else:
+        lines.append(
+            f"  Drift vs {drift['prior_receipt']}: {len(drift['new_items'])} new, "
+            f"{len(drift['disappeared'])} disappeared, "
+            f"{len(drift['verdict_changes'])} verdict change(s)."
+        )
+        for change in drift["verdict_changes"]:
+            lines.append(
+                f"      {change['label']}: {change['from']} -> {change['to']}"
+            )
+        for entry in drift["new_items"]:
+            lines.append(f"      NEW {entry['label']} ({entry['verdict']})")
+        for entry in drift["disappeared"]:
+            lines.append(f"      GONE {entry['label']} (was {entry['verdict']})")
+
+    advisories = [
+        (domain["domain"], item)
+        for domain in payload["domains"]
+        for item in domain["items"]
+        if item.get("close_command")
+    ]
+    if advisories:
+        lines.append("")
+        lines.append(
+            f"  Advisory close commands ({len(advisories)}) — Fleet Watch never runs "
+            "these; they are for the operator:"
+        )
+        for _domain, item in advisories:
+            lines.append(f"      {item['label']}: {item['close_command']}")
+
+    failed_probes = [p for p in payload.get("probes", []) if not p["ok"]]
+    if failed_probes:
+        lines.append("")
+        lines.append(f"  Probes that returned nothing ({len(failed_probes)}):")
+        for probe in failed_probes:
+            lines.append(f"      {probe['command']} — {probe['error']}")
+
+    lines.append("")
+    if result.dated_path is None:
+        lines.append("  Receipt: not written (--no-receipt)")
+    else:
+        lines.append(f"  Receipt: {result.dated_path}")
+        lines.append(f"  Latest:  {result.latest_path}")
+    return lines
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit the full receipt as JSON")
+@click.option("--quiet", is_flag=True, help="Print only totals and the receipt path")
+@click.option("--no-receipt", is_flag=True, help="Judge only; write no receipt")
+@click.option(
+    "--receipt-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override the receipt directory",
+)
+@click.option(
+    "--deep",
+    is_flag=True,
+    help="Wait longer on slow probes (sfltool login items) for full coverage",
+)
+@click.option(
+    "--emit-launchd-plist",
+    is_flag=True,
+    help="Print the staged daily-census launchd plist and exit; installs nothing",
+)
+def census(
+    as_json: bool,
+    quiet: bool,
+    no_receipt: bool,
+    receipt_dir: Path | None,
+    deep: bool,
+    emit_launchd_plist: bool,
+):
+    """Census what boots and runs on this machine, and what is stale."""
+    if emit_launchd_plist:
+        executable = shutil.which("fleet") or census_mod.DEFAULT_FLEET_BIN
+        click.echo(census_mod.render_launchd_plist(executable), nl=False)
+        # stderr so the plist can be redirected to a file while the operator
+        # still sees what to run. Fleet Watch does not install it.
+        click.echo(
+            "\nStaged only — nothing was installed. To install the daily census:\n"
+            f"  {census_mod.INSTALL_COMMAND}\n"
+            "To remove it:\n"
+            f"  {census_mod.UNINSTALL_COMMAND}",
+            err=True,
+        )
+        return
+
+    result = census_mod.run_census(
+        registry_processes=_census_registry_rows(),
+        receipt_dir=receipt_dir or census_mod.RECEIPT_DIR,
+        write=not no_receipt,
+        deep=deep,
+    )
+
+    if result.refusal:
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": census_mod.SCHEMA_VERSION,
+                        "refusal": result.refusal,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            click.echo("REFUSAL: census receipt not written.", err=True)
+            for error in result.refusal:
+                click.echo(f"  - {error}", err=True)
+            click.echo(
+                "  latest.json was left untouched (never clobber good with bad).",
+                err=True,
+            )
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(result.payload, indent=2, sort_keys=True))
+        return
+
+    totals = result.payload["totals"]
+    if quiet:
+        click.echo(
+            f"census {totals['items']} items "
+            f"(keep {totals['keep']}, investigate {totals['investigate']}, "
+            f"close {totals['close']}, remove {totals['remove']}) -> "
+            f"{result.dated_path or 'no receipt'}"
+        )
+        return
+
+    click.echo("\n".join(_render_census(result.payload, result)))
+
+
 def main():
     """Run the Fleet Watch CLI entrypoint."""
     cli()

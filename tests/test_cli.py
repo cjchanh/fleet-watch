@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 from click.testing import CliRunner
 
@@ -1034,3 +1035,80 @@ def test_session_check_failclosed_when_registry_unavailable(monkeypatch):
     result = runner.invoke(cli_module.cli, ["session", "check", "--repo", "/tmp/repoX"])
     assert result.exit_code == 4
     assert "UNKNOWN" in result.output
+
+
+def _census_snapshot(loaded_pid=4242):
+    from fleet_watch.census import probes as census_probes
+
+    return census_probes.SystemSnapshot(
+        machine=census_probes.MachineInfo(
+            host="testhost", os="Darwin 25.5.0", cores=8, ram_gb=16
+        ),
+        user_agents=[
+            census_probes.ParsedPlist(
+                path=Path("/tmp/LaunchAgents/com.x.job.plist"),
+                label="com.x.job",
+                target="/usr/bin/true",
+                triggers=("RunAtLoad",),
+                keys=("Label", "Program"),
+            )
+        ],
+        launchctl={
+            "com.x.job": census_probes.LaunchctlEntry("com.x.job", loaded_pid, 0)
+        },
+    )
+
+
+def test_census_writes_a_valid_receipt_and_reports_its_path(tmp_path, monkeypatch):
+    from fleet_watch import census as census_mod
+
+    monkeypatch.setattr(
+        census_mod, "collect_snapshot", lambda *a, **k: _census_snapshot()
+    )
+    monkeypatch.setattr(cli_module, "_census_registry_rows", lambda: [])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli, ["census", "--receipt-dir", str(tmp_path), "--json"]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == census_mod.SCHEMA_VERSION
+    assert payload["totals"]["items"] >= 1
+    assert (tmp_path / "latest.json").exists()
+    assert census_mod.validate(json.loads((tmp_path / "latest.json").read_text())) == []
+
+
+def test_census_refuses_and_exits_nonzero_when_every_probe_returns_nothing(
+    tmp_path, monkeypatch
+):
+    from fleet_watch import census as census_mod
+    from fleet_watch.census import probes as census_probes
+
+    empty = census_probes.SystemSnapshot(
+        machine=census_probes.MachineInfo(host="testhost", os="Darwin 25.5.0")
+    )
+    monkeypatch.setattr(census_mod, "collect_snapshot", lambda *a, **k: empty)
+    monkeypatch.setattr(cli_module, "_census_registry_rows", lambda: [])
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["census", "--receipt-dir", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "REFUSAL" in result.output
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        cli_module.subprocess, "run", lambda *a, **k: called.append(a) or None
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["census", "--emit-launchd-plist"])
+
+    assert result.exit_code == 0
+    assert "io.fleet-watch.census" in result.output
+    assert called == []
