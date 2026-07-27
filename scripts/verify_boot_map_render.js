@@ -59,8 +59,9 @@ function makeEl(tag) {
     tagName: tag, className: "", id: "", style: {}, children: [], _text: "",
     innerHTML: "", type: "", checked: false, value: "", placeholder: "",
     clientWidth: 1600, clientHeight: 900, width: 1600, height: 900,
+    handlers: {},
     appendChild(child) { this.children.push(child); return child; },
-    addEventListener() {},
+    addEventListener(name, fn) { (this.handlers[name] = this.handlers[name] || []).push(fn); },
     getBoundingClientRect() { return { left: 0, top: 0, width: 1600, height: 900 }; },
     getContext() { return makeCtx(); },
     get textContent() { return this._text; },
@@ -83,11 +84,17 @@ const sandbox = {
   document: {
     getElementById: (id) => byId[id] || null,
     createElement: makeEl,
+    createTextNode: (value) => {
+      const node = makeEl("#text");
+      node.textContent = value;
+      return node;
+    },
     body: makeEl("body"),
     title: "",
   },
   window: {
-    addEventListener() {},
+    handlers: {},
+    addEventListener(name, fn) { (this.handlers[name] = this.handlers[name] || []).push(fn); },
     devicePixelRatio: 2,
     requestAnimationFrame(fn) { nextFrame = fn; scheduled++; },
   },
@@ -118,6 +125,74 @@ for (let i = 0; i < 5 && nextFrame; i++) {
   }
 }
 
+// Drive the input handlers too. Load + paint is only half the page: hover
+// picking and the detail panel read many OPTIONAL node attributes, and a
+// TypeError in there is invisible to a draw-call count.
+let interactions = 0;
+let detailElements = 0;
+function fire(target, name, event) {
+  const list = (target.handlers && target.handlers[name]) || [];
+  for (const fn of list) {
+    interactions++;
+    fn(event);
+  }
+}
+function syntheticEvents() {
+  const stubEvent = (over) => Object.assign({
+    clientX: 800, clientY: 450, shiftKey: false, deltaY: -120,
+    key: "r", target: null, preventDefault() {},
+  }, over || {});
+  // Sweep a grid so the picker actually resolves nodes. A sparse diagonal can
+  // miss every node, leaving `hovered` at -1 and the detail panel unexercised —
+  // the probe would then pass while proving nothing about renderDetail.
+  let hoveredAt = null;
+  for (let gy = 40; gy < 900 && !hoveredAt; gy += 20) {
+    for (let gx = 40; gx < 1600; gx += 20) {
+      fire(sandbox.window, "mousemove", stubEvent({ clientX: gx, clientY: gy }));
+      // A hover that resolves a node writes the tooltip; use that as the signal.
+      if (tip.className === "on") { hoveredAt = { x: gx, y: gy }; break; }
+    }
+  }
+  if (!hoveredAt) {
+    throw new Error("hover picker resolved no node anywhere on a 20px grid");
+  }
+  // Open the detail panel on the hovered node, which is where the optional
+  // node attributes get read.
+  const beforeClick = created.length;
+  fire(canvas, "click", stubEvent(hoveredAt));
+  detailElements = created.length - beforeClick;
+  if (detailElements <= 0) {
+    throw new Error("click on a hovered node created no detail panel content");
+  }
+  fire(canvas, "wheel", stubEvent());
+  fire(canvas, "mousedown", stubEvent());
+  fire(sandbox.window, "mousemove", stubEvent({ clientX: 830, clientY: 470 }));
+  fire(sandbox.window, "mouseup", stubEvent());
+  fire(sandbox.window, "keydown", stubEvent({ key: "r" }));
+  fire(sandbox.window, "keydown", stubEvent({ key: "Escape" }));
+  fire(sandbox.window, "resize", stubEvent());
+}
+
+if (!created.some((el) => el.id === "refusal")) {
+  try {
+    syntheticEvents();
+  } catch (err) {
+    console.error("HANDLER FAILURE: " + (err && err.stack ? err.stack : err));
+    process.exit(EXIT_BLOCKED);
+  }
+  // Repaint after interaction so a handler that corrupts render state surfaces.
+  for (let i = 0; i < 2 && nextFrame; i++) {
+    const fn = nextFrame;
+    nextFrame = null;
+    try {
+      fn();
+    } catch (err) {
+      console.error("POST-INTERACTION FRAME FAILURE: " + (err && err.stack ? err.stack : err));
+      process.exit(EXIT_BLOCKED);
+    }
+  }
+}
+
 const refused = created.some((el) => el.id === "refusal");
 const painted = draws.fill > 0 && draws.stroke > 0;
 const observed = refused ? "refusal" : (painted ? "render" : "silent");
@@ -130,6 +205,8 @@ console.log(JSON.stringify({
   refusal_panel: refused,
   draw_calls: draws,
   chrome_elements: created.length,
+  handlers_fired: interactions,
+  detail_panel_elements: detailElements,
 }, null, 1));
 
 if (observed !== expect) {

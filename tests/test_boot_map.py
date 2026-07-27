@@ -483,6 +483,16 @@ class TestRenderPath(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('"observed": "render"', result.stdout)
 
+    def test_hover_and_detail_panel_actually_run(self):
+        # Painting is only half the page. The picker must resolve a real node
+        # and the detail panel must build content from its optional attributes.
+        boot_map.build(receipt=FIXTURE, out_dir=self.tmp)
+        result = self._probe(self.tmp / "index.html", "render")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout[result.stdout.index("{"): result.stdout.rindex("}") + 1])
+        self.assertGreater(payload["handlers_fired"], 0)
+        self.assertGreater(payload["detail_panel_elements"], 0)
+
     def test_an_empty_graph_refuses_instead_of_painting_nothing(self):
         empty = {"schema_version": boot_map.SCHEMA_VERSION, "census": {}, "nodes": [],
                  "links": [], "stats": {"node_count": 0, "edge_count": 0}, "warnings": []}
