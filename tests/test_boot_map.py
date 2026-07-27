@@ -188,6 +188,55 @@ class TestTransform(unittest.TestCase):
             self.assertTrue(link["source_ref"], "every edge names the census row behind it")
             self.assertGreater(link["weight"], 0)
 
+    def test_nested_job_labels_do_not_cross_link(self):
+        # Launchd labels nest by design. A process owned by `...-graph` must not
+        # also be handed to the shorter parent it merely starts with.
+        graph = boot_map.build_graph(
+            boot_map.parse_census(
+                [
+                    {"domain": "user LaunchAgents", "items": [
+                        {"label": "com.demo.gateway", "path": "~/Library/LaunchAgents/com.demo.gateway.plist",
+                         "status": "running", "verdict": "keep"},
+                        {"label": "com.demo.gateway-graph", "path": "~/Library/LaunchAgents/com.demo.gateway-graph.plist",
+                         "status": "running", "verdict": "keep"},
+                    ]},
+                    {"domain": "live process census", "items": [
+                        {"label": "graph worker", "resource": "PID 77",
+                         "status": "running", "verdict": "keep",
+                         "evidence": "launchd label com.demo.gateway-graph owns it."},
+                    ]},
+                ]
+            )
+        )
+        owners = {
+            node_by_label(graph, "graph worker")["id"]: [],
+        }
+        for link in graph["links"]:
+            if link["relation"] == "managed_by" and link["source"] in owners:
+                owners[link["source"]].append(link["target"])
+        worker = node_by_label(graph, "graph worker")["id"]
+        self.assertEqual(
+            owners[worker], [node_by_label(graph, "com.demo.gateway-graph")["id"]]
+        )
+
+    def test_a_plist_suffix_still_resolves_to_its_own_job(self):
+        # `<label>.plist` names the same job; only sibling suffixes are foreign.
+        graph = boot_map.build_graph(
+            boot_map.parse_census(
+                [
+                    {"domain": "user LaunchAgents", "items": [
+                        {"label": "com.demo.gateway", "path": "~/Library/LaunchAgents/com.demo.gateway.plist",
+                         "status": "running", "verdict": "keep"},
+                    ]},
+                    {"domain": "live process census", "items": [
+                        {"label": "worker", "resource": "PID 78", "status": "running", "verdict": "keep",
+                         "evidence": "loaded from com.demo.gateway.plist"},
+                    ]},
+                ]
+            )
+        )
+        self.assertEqual(graph["stats"]["counts_by_relation"].get("managed_by"), 1)
+
     def test_one_row_cannot_dominate_the_map(self):
         # A single verbose or hostile row must not blow the graph up. The clamp
         # is counted, not silent — bounded output still has to testify.

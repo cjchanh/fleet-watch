@@ -701,24 +701,34 @@ def _link_processes_to_jobs(
 ) -> None:
     """Correlate live processes / listeners back to the launchd job that owns them.
 
-    Deterministic substring match on distinctive launchd labels (dotted, >= 6
-    chars) inside the item's own text. No fuzzy matching, no guessing.
+    Deterministic, boundary-anchored match on distinctive launchd labels (dotted,
+    >= 6 chars) inside the item's own text. No fuzzy matching, no guessing.
+
+    The boundary is load-bearing, not decoration: launchd labels nest by design
+    (``com.cds.mcp-gateway`` is a prefix of six siblings on a real census), so a
+    plain substring test hands every ``-graph`` / ``-dispatch`` process a
+    spurious edge to the shorter parent. The trailing class excludes ``-`` and
+    word characters but NOT ``.``, so ``<label>.plist`` still resolves to its own
+    job — that reference is the same job, a sibling suffix is not.
     """
-    job_labels: list[tuple[str, str]] = []
+    job_patterns: list[tuple[re.Pattern[str], str]] = []
     for item, nid in item_nodes:
         if graph.nodes[nid]["kind"] != "job":
             continue
         label = item.label
         if len(label) >= 6 and "." in label and _LAUNCHD_LABEL_RE.match(label):
-            job_labels.append((label, nid))
-    job_labels.sort(key=lambda pair: (-len(pair[0]), pair[0]))
+            pattern = re.compile(
+                r"(?<![A-Za-z0-9_\-])" + re.escape(label) + r"(?![A-Za-z0-9_\-])"
+            )
+            job_patterns.append((pattern, nid))
+    job_patterns.sort(key=lambda pair: pair[0].pattern)
 
     for item, nid in item_nodes:
         if graph.nodes[nid]["kind"] == "job":
             continue
         blob = f"{item.label}\n{item.path}\n{item.resource}\n{item.evidence}"
-        for label, job_id in job_labels:
-            if label in blob:
+        for pattern, job_id in job_patterns:
+            if pattern.search(blob):
                 graph.edge(nid, job_id, "managed_by", "INFERRED", item.label)
                 stats["managed_by_matches"] += 1
 
