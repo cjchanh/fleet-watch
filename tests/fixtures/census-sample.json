@@ -1,0 +1,153 @@
+{
+  "schema_version": "fleet-census/v1",
+  "generated_at": "2026-07-27T12:00:00Z",
+  "host": "demo-host",
+  "machine": {"os": "Darwin 25.5.0", "cores": 8, "ram_gb": 32},
+  "totals": {"items": 12, "keep": 7, "investigate": 3, "close": 1, "remove": 1},
+  "domains": [
+    {
+      "domain": "user LaunchAgents (~/Library/LaunchAgents)",
+      "summary": "Synthetic stand-in for the user LaunchAgents domain.",
+      "totals": {"plist_files_on_disk": 3, "loaded_in_launchctl": 2},
+      "items": [
+        {
+          "label": "com.demo.gateway",
+          "path": "~/Library/LaunchAgents/com.demo.gateway.plist",
+          "status": "running",
+          "evidence": "plutil -p: RunAtLoad=true, KeepAlive=true, Program=/Users/demo/Workspace/active/demo-repo/bin/gateway.py, StandardErrorPath=/tmp/gateway.err. launchctl list: PID 4242, exit 0.",
+          "verdict": "keep",
+          "reason": "Gateway daemon running clean."
+        },
+        {
+          "label": "com.demo.dead-watchdog",
+          "path": "~/Library/LaunchAgents/com.demo.dead-watchdog.plist",
+          "status": "failing",
+          "evidence": "launchctl list: 78 0 com.demo.dead-watchdog. Plist references /Users/demo/.local/bin/watchdog.sh with RunAtLoad=true; target is MISSING.",
+          "verdict": "remove",
+          "reason": "Script target deleted but the agent still retries every 10 minutes."
+        },
+        {
+          "label": "com.demo.unrated",
+          "path": "~/Library/LaunchAgents/com.demo.unrated.plist",
+          "evidence": "plutil -p failed: plist is an empty stub. Kept for awareness, not silently dropped.",
+          "reason": "Unparseable stub plist."
+        }
+      ]
+    },
+    {
+      "domain": "global-daemons (/Library/LaunchDaemons + /Library/LaunchAgents)",
+      "summary": "Synthetic stand-in for the third-party global daemon domain.",
+      "totals": {"library_launchdaemons_thirdparty": 1},
+      "items": [
+        {
+          "label": "com.vendor.helper",
+          "path": "/Library/LaunchDaemons/com.vendor.helper.plist",
+          "resource": "/Library/PrivilegedHelperTools/com.vendor.helper (MachServices, on-demand)",
+          "status": "idle-loaded",
+          "evidence": "PlistBuddy -c Print shows MachServices dict, no RunAtLoad. Binary exists.",
+          "verdict": "keep",
+          "reason": "Vendor privileged helper, on-demand, matches an installed app."
+        }
+      ]
+    },
+    {
+      "domain": "live process census",
+      "summary": "Synthetic stand-in for the live process domain.",
+      "totals": {"total_processes": 400},
+      "items": [
+        {
+          "label": "demo relay process",
+          "path": "/opt/homebrew/bin/socat",
+          "resource": "PID 4242, 0.4% CPU, 12MB RSS",
+          "status": "running",
+          "evidence": "ps -p 4242 shows socat TCP-LISTEN:8123; launchd label com.demo.gateway owns it.",
+          "verdict": "keep",
+          "reason": "Loopback relay in front of the gateway, owned by a named launchd job."
+        },
+        {
+          "label": "stray build worker",
+          "path": "/Users/demo/Workspace/active/demo-repo/target/debug/worker",
+          "resource": "PID 9001, 0.0% CPU, elapsed 3-01:02:11",
+          "status": "orphan",
+          "evidence": "ps -Ao pid,etime,comm: parent exited, elapsed over three days, 0.0% CPU.",
+          "verdict": "investigate",
+          "reason": "Detached build worker with no live parent; confirm before reaping."
+        }
+      ]
+    },
+    {
+      "domain": "network-listeners",
+      "summary": "Synthetic stand-in for the TCP listener domain.",
+      "totals": {"tcp_listeners": 2},
+      "items": [
+        {
+          "label": "demo gateway — 127.0.0.1:8123",
+          "path": "/Users/demo/Workspace/active/demo-repo/bin/gateway.py (pid 4242)",
+          "resource": "TCP 127.0.0.1:8123",
+          "status": "running",
+          "evidence": "lsof -nP -iTCP -sTCP:LISTEN shows 'python 4242 ... TCP 127.0.0.1:8123 (LISTEN)'.",
+          "verdict": "keep",
+          "reason": "Loopback-only gateway port, expected."
+        },
+        {
+          "label": "exposed api — 0.0.0.0:8080",
+          "path": "/Applications/DemoApp.app/Contents/MacOS/DemoApp",
+          "resource": "TCP 0.0.0.0:8080",
+          "status": "running",
+          "evidence": "lsof shows DemoApp bound to 0.0.0.0:8080 — reachable from the LAN, not loopback-only.",
+          "verdict": "investigate",
+          "reason": "All-interfaces bind on a developer machine; confirm this is intentional."
+        }
+      ]
+    },
+    {
+      "domain": "cron, login items, periodic, brew services",
+      "summary": "Synthetic stand-in for the scheduled-work domain.",
+      "totals": {"crontab_entries": 1, "brew_services": 1},
+      "items": [
+        {
+          "label": "demo.cron.nightly",
+          "path": "~/Library/LaunchAgents/demo.cron.nightly.plist",
+          "status": "stale",
+          "evidence": "Plist StartCalendarInterval 03:00; last run log is 94 days old at /Users/demo/Library/Logs/demo-nightly.log.",
+          "verdict": "close",
+          "reason": "Nightly job has not produced output in three months.",
+          "close_command": "launchctl bootout gui/$UID ~/Library/LaunchAgents/demo.cron.nightly.plist"
+        },
+        {
+          "label": "demo.odd.entry",
+          "path": "~/Library/LaunchAgents/demo.odd.entry.plist",
+          "status": "zombie",
+          "evidence": "Producer emitted an off-enum status and verdict; consumer must keep the row verbatim and flag it.",
+          "verdict": "maybe",
+          "reason": "Deliberate off-enum row for consumer fail-closed testing."
+        }
+      ]
+    },
+    {
+      "domain": "CDS fleet layer",
+      "summary": "Synthetic stand-in for the first-party automation domain.",
+      "totals": {"tmux_sessions": 1},
+      "items": [
+        {
+          "label": "tmux session demo-lane",
+          "resource": "PID 5150, attached 0",
+          "status": "idle-loaded",
+          "evidence": "tmux ls: demo-lane: 1 windows (created Mon Jul 27 09:14:00 2026).",
+          "verdict": "keep",
+          "reason": "Named work lane, idle, harmless."
+        },
+        {
+          "label": "orphan mcp server",
+          "path": "/Users/demo/.codex/scripts/mcp_server.py",
+          "resource": "PID 6006",
+          "status": "dead",
+          "evidence": "launchctl shows no owning label; process exited leaving a stale socket at /tmp/mcp.sock.",
+          "verdict": "investigate",
+          "reason": "No owning launchd label; confirm whether it should be respawned or cleaned."
+        }
+      ]
+    }
+  ],
+  "drift": {"prior_receipt": null, "new_items": [], "disappeared": [], "verdict_changes": []}
+}
