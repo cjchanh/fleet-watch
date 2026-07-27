@@ -182,6 +182,23 @@ class TestTransform(unittest.TestCase):
         self.assertIn("off_enum_status", codes)
         self.assertIn("off_enum_verdict", codes)
 
+    def test_every_kind_and_relation_emitted_is_declared(self):
+        # The renderer styles by kind and relation; an undeclared one would draw
+        # as an unlabelled blob, so the declaration lists are enforced, not
+        # decorative. Both directions: real output conforms, and a violation raises.
+        for node in self.graph["nodes"]:
+            self.assertIn(node["kind"], boot_map.NODE_KINDS)
+        for link in self.graph["links"]:
+            self.assertIn(link["relation"], boot_map.RELATIONS)
+
+        graph = boot_map._Graph()
+        with self.assertRaises(boot_map.BootMapError):
+            graph.node("sprocket", "k", "l")
+        a = graph.node("job", "a", "a")
+        b = graph.node("job", "b", "b")
+        with self.assertRaises(boot_map.BootMapError):
+            graph.edge(a, b, "haunts", "EXTRACTED", "x")
+
     def test_links_carry_provenance(self):
         for link in self.graph["links"]:
             self.assertIn(link["confidence"], ("EXTRACTED", "INFERRED"))

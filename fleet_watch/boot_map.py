@@ -141,10 +141,6 @@ class CensusItem:
     status_valid: bool
     verdict_valid: bool
 
-    @property
-    def severity(self) -> int:
-        return VERDICT_SEVERITY.get(self.verdict, DEFAULT_SEVERITY)
-
 
 @dataclass(frozen=True)
 class DomainRecord:
@@ -461,6 +457,10 @@ class _Graph:
         self.edges: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def node(self, kind: str, key: str, label: str, **attrs: Any) -> str:
+        # The renderer styles by kind and colours by relation; an undeclared one
+        # would draw as an unlabelled blob. Fail here, not silently on screen.
+        if kind not in NODE_KINDS:
+            raise BootMapError(f"undeclared node kind {kind!r} (add it to NODE_KINDS)")
         nid = node_id(kind, key)
         node = self.nodes.get(nid)
         if node is None:
@@ -475,6 +475,8 @@ class _Graph:
         return nid
 
     def edge(self, source: str, target: str, relation: str, confidence: str, source_ref: str) -> None:
+        if relation not in RELATIONS:
+            raise BootMapError(f"undeclared relation {relation!r} (add it to RELATIONS)")
         if source == target:
             return
         key = (source, target, relation)
