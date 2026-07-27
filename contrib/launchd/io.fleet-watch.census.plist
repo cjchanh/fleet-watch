@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  io.fleet-watch.census : daily fleet census at 09:00 local.
+  Staged, not installed. Fleet Watch never bootstraps a launchd job;
+  process control is an operator action. The install and uninstall
+  lines are printed on stderr by 'fleet census' when it emits this
+  file, and are recorded in docs/fleet-census-receipt-contract-v1.md.
+  (XML comments cannot contain a double hyphen, so the command lines
+  cannot live in here without corrupting the plist.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.fleet-watch.census</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/fleet</string>
+        <string>census</string>
+        <string>--quiet</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Nice</key>
+    <integer>19</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/fleet-census.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/fleet-census.log</string>
+</dict>
+</plist>
