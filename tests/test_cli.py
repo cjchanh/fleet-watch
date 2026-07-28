@@ -1101,6 +1101,7 @@ def test_census_refuses_and_exits_nonzero_when_every_probe_returns_nothing(
 
 
 def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
+    monkeypatch.setattr(cli_module, "_executable_supports_census", lambda _e: True)
     called = []
     monkeypatch.setattr(
         cli_module.subprocess, "run", lambda *a, **k: called.append(a) or None
@@ -1111,4 +1112,19 @@ def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
 
     assert result.exit_code == 0
     assert "io.fleet-watch.census" in result.output
-    assert called == []
+    assert called == [], "emitting the plist must not shell out to launchctl"
+
+
+def test_census_emit_launchd_plist_warns_when_installed_fleet_lacks_census(monkeypatch):
+    """A job pointing at an older `fleet` would fail silently every morning."""
+    monkeypatch.setattr(cli_module, "_executable_supports_census", lambda _e: False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli, ["census", "--emit-launchd-plist"], catch_exceptions=False
+    )
+
+    assert result.exit_code == 0
+    assert "io.fleet-watch.census" in result.output  # plist still emitted
+    assert "does not support `census`" in result.stderr
+    assert "reinstall" in result.stderr.lower()

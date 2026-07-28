@@ -100,6 +100,14 @@ Required on every item: `label`, `path`, `status`, `evidence`, `verdict`,
 `user-agent/missing-target`, `listener/stale-unmanaged`), so a receipt
 testifies *which* rule fired, not just what it concluded.
 
+**Removal safety.** A `remove` verdict only ever comes from an **absolute**
+target path that is absent from disk. Anything the census cannot pin down — a
+`python -m` module name, an inline `sh -c` command, a relative argument the
+plist does not anchor with `WorkingDirectory` — resolves to
+`*/target-unverifiable` (`status: unknown`, `verdict: investigate`). Unverifiable
+is neither healthy nor removable; guessing in either direction is how a working
+job gets deleted or a dead one gets a clean bill of health.
+
 ## Probes
 
 ```json
@@ -148,7 +156,10 @@ boot-surface change under process churn. New / disappeared / verdict-changed
    written, `latest.json` is left untouched, and the CLI exits `1`.
 4. The dated receipt is read back off disk and re-validated before
    `latest.json` is swapped — what landed is verified, not what was intended.
-5. The census is read-only. It never loads, unloads, kills or installs
+5. Validation enforces every required item and domain field, and checks each
+   **domain's own** totals against that domain's own items — a per-domain
+   miscount must not be able to hide inside a correct grand total.
+6. The census is read-only. It never loads, unloads, kills or installs
    anything.
 
 ---
@@ -174,6 +185,11 @@ launchctl bootout gui/$(id -u)/io.fleet-watch.census && rm ~/Library/LaunchAgent
 
 `fleet census --emit-launchd-plist` prints the plist on stdout and these two
 lines on stderr, so the redirect above captures only the plist.
+
+The `fleet` on `PATH` may be a separate installation (pipx, for example) that
+predates this command — a launchd job pointing at it would fail silently every
+morning. `--emit-launchd-plist` probes the resolved binary and warns on stderr
+when it does not support `census`; reinstall it before installing the job.
 
 ---
 

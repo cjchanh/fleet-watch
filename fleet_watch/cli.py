@@ -2469,6 +2469,26 @@ def _census_registry_rows() -> list[dict[str, Any]]:
         conn.close()
 
 
+def _executable_supports_census(executable: str) -> bool:
+    """Does the `fleet` on PATH actually have this subcommand?
+
+    The installed entry point can be a pipx venv that is a different, older
+    copy of this package than the source tree emitting the plist.
+    """
+    try:
+        proc = subprocess.run(
+            [executable, "census", "--help"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def _render_census(
     payload: dict[str, Any], result: census_mod.CensusResult
 ) -> list[str]:
@@ -2590,6 +2610,18 @@ def census(
             f"  {census_mod.UNINSTALL_COMMAND}",
             err=True,
         )
+        if not _executable_supports_census(executable):
+            # A launchd job pointing at a `fleet` that predates this command
+            # would fail silently every morning. Say so before it is installed.
+            click.echo(
+                f"\nWARNING: {executable} does not support `census` — the staged job "
+                "would fail on every run.\n"
+                "  That binary is a separate installation from this source tree. "
+                "Reinstall it first, e.g.\n"
+                "    pipx reinstall fleet-watch   (or: pipx install --force "
+                f"{Path(__file__).resolve().parent.parent})",
+                err=True,
+            )
         return
 
     try:
