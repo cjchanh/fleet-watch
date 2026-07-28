@@ -32,7 +32,7 @@ Consumers **must** handle the absent state: no `latest.json` means
 {
   "schema_version": "fleet-census/v1",
   "generated_at": "2026-07-27T23:59:59Z",
-  "host": "CJs-MacBook-Pro",
+  "host": "example-host",
   "machine": {"os": "Darwin 25.5.0", "cores": 18, "ram_gb": 128},
   "totals": {"items": 168, "keep": 129, "investigate": 39, "close": 0, "remove": 0},
   "domains": [ /* see below */ ],

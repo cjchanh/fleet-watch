@@ -96,12 +96,12 @@ def test_parse_launchctl_list_reads_pid_exit_and_signal_death():
     parsed = probes.parse_launchctl_list(
         "PID\tStatus\tLabel\n"
         "1502\t0\tcom.logi.cp-dev-mgr\n"
-        "-\t78\tcom.cds.signalcheck-refresh\n"
+        "-\t78\tcom.example.nightly-refresh\n"
         "-\t-9\tcom.cj.boot-reconciler\n"
     )
     assert parsed["com.logi.cp-dev-mgr"].pid == 1502
-    assert parsed["com.cds.signalcheck-refresh"].pid is None
-    assert parsed["com.cds.signalcheck-refresh"].last_exit == 78
+    assert parsed["com.example.nightly-refresh"].pid is None
+    assert parsed["com.example.nightly-refresh"].last_exit == 78
     assert parsed["com.cj.boot-reconciler"].last_exit == -9
     assert "Label" not in parsed
 
@@ -233,11 +233,11 @@ def test_interpreter_script_path_containing_a_space_is_not_truncated(tmp_path):
     """
     script_dir = tmp_path / "Signal Check"
     script_dir.mkdir()
-    script = script_dir / "refresh_signalcheck.sh"
+    script = script_dir / "refresh_nightly.sh"
     script.write_text("#!/bin/bash\n")
     plist = probes.ParsedPlist(
-        path=tmp_path / "com.cds.signalcheck-refresh.plist",
-        label="com.cds.signalcheck-refresh",
+        path=tmp_path / "com.example.nightly-refresh.plist",
+        label="com.example.nightly-refresh",
         target="/bin/bash",
         program_arguments=("/bin/bash", str(script)),
         triggers=("StartCalendarInterval",),
