@@ -944,3 +944,28 @@ def test_domain_ids_are_stable_and_match_the_builders():
         "fleet-layer",
     )
     assert len(domains.DOMAIN_BUILDERS) == len(domains.DOMAIN_IDS)
+
+
+def test_login_items_dedup_to_one_item_per_app_keeping_the_worst_verdict():
+    """BTM registers the same app repeatedly; the census reports it once."""
+    enabled = probes.LoginItem(
+        uid=501,
+        name="Docker",
+        item_type="app",
+        disposition="enabled",
+        identifier="com.docker.docker",
+        executable="/usr/bin/true",
+    )
+    dupe = probes.LoginItem(
+        uid=501,
+        name="Docker",
+        item_type="login item",
+        disposition="enabled",
+        identifier="com.docker.helper",
+        executable="/nonexistent/docker-helper",
+    )
+    domain = domains.build_cron_login_items(_snapshot(login_items=[enabled, dupe]))
+    docker = [i for i in domain.items if i.label == "login item: Docker"]
+    assert len(docker) == 1
+    assert docker[0].verdict == "remove"
+    assert "2 registration(s)" in docker[0].evidence

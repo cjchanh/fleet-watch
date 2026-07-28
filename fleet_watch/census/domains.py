@@ -27,6 +27,7 @@ from fleet_watch.census.probes import (
     GLOBAL_LAUNCH_AGENTS,
     GLOBAL_LAUNCH_DAEMONS,
     USER_LAUNCH_AGENTS,
+    LoginItem,
     ParsedPlist,
     ProcInfo,
     SystemSnapshot,
@@ -38,6 +39,9 @@ from fleet_watch.census.probes import (
 
 #: Reported process clusters, ranked by aggregate resident memory.
 TOP_CLUSTERS = 20
+
+#: Attention order when one label collapses several judged records.
+_VERDICT_ATTENTION = {"remove": 0, "close": 1, "investigate": 2, "keep": 3}
 
 _HOME = str(Path.home())
 
@@ -569,18 +573,36 @@ def build_cron_login_items(snapshot: SystemSnapshot) -> CensusDomain:
             )
         )
 
-    for item in sorted(snapshot.login_items, key=lambda i: (i.uid, i.name)):
-        _, exists = resolve_target(item.executable)
+    # BTM registers one app several times (per type, per UID); duplicate labels
+    # would also collide in drift keys, so the census reports one item per app.
+    grouped: dict[str, list[LoginItem]] = defaultdict(list)
+    for login_item in snapshot.login_items:
+        grouped[login_item.name].append(login_item)
+
+    for name in sorted(grouped):
+        records = sorted(grouped[name], key=lambda i: (i.uid, i.item_type))
+        judged = [
+            (record, verdicts.judge_login_item(record, resolve_target(record.executable)[1]))
+            for record in records
+        ]
+        record, judgment = min(
+            judged, key=lambda pair: _VERDICT_ATTENTION[pair[1].verdict]
+        )
+        _, exists = resolve_target(record.executable)
+        registrations = "; ".join(
+            f"uid={r.uid} type={r.item_type} disposition={r.disposition}"
+            for r in records
+        )
         items.append(
             _item(
-                label=f"login item: {item.name}",
-                path=item.executable or "(no executable path recorded)",
+                label=f"login item: {name}",
+                path=record.executable or "(no executable path recorded)",
                 evidence=(
-                    f"sfltool dumpbtm: uid={item.uid}, type={item.item_type}, "
-                    f"disposition={item.disposition}, identifier={item.identifier}, "
+                    f"sfltool dumpbtm: {len(records)} registration(s) [{registrations}], "
+                    f"identifier={record.identifier}, "
                     f"target={'EXISTS' if exists else 'MISSING' if exists is False else 'not declared'}"
                 ),
-                judgment=verdicts.judge_login_item(item, exists),
+                judgment=judgment,
                 resource="login item",
             )
         )
@@ -603,8 +625,8 @@ def build_cron_login_items(snapshot: SystemSnapshot) -> CensusDomain:
 
     active_brew = sum(1 for s in snapshot.brew if s.status.lower() != "none")
     summary = (
-        f"{len(snapshot.cron)} crontab entr(ies), {len(snapshot.login_items)} login "
-        f"item(s) from the background task manager, and {active_brew} active brew "
+        f"{len(snapshot.cron)} crontab entr(ies), {len(grouped)} login item(s) "
+        f"({len(snapshot.login_items)} BTM registration(s)), and {active_brew} active brew "
         f"service(s) out of {len(snapshot.brew)} known. "
         f"{snapshot.probe_evidence('crontab')}; {snapshot.probe_evidence('sfltool')}; "
         f"{snapshot.probe_evidence('services list')}."
