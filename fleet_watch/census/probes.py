@@ -46,7 +46,7 @@ SYNTHETIC_LABEL_PREFIXES = ("application.", "com.apple.")
 #: `sfltool dumpbtm` reads the background-task database and routinely stalls for
 #: minutes on a loaded machine. Keep the default census fast and honest about the
 #: gap; `--deep` buys full coverage when the operator wants it.
-LOGIN_ITEM_TIMEOUT = 10.0
+LOGIN_ITEM_TIMEOUT = 30.0
 LOGIN_ITEM_DEEP_TIMEOUT = 180.0
 
 
