@@ -16,6 +16,7 @@ cannot be understood is emitted as ``unknown``/``investigate``, never dropped.
 
 from __future__ import annotations
 
+import shlex
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,13 +137,16 @@ def _plist_evidence(plist: ParsedPlist, target: str | None, note: str) -> str:
     )
 
 
+def _count_rules(items: list[CensusItem], suffix: str) -> int:
+    """Derive a domain counter from the items themselves, not a parallel tally."""
+    return sum(1 for item in items if item.rule.endswith(suffix))
+
+
 def build_user_launch_agents(snapshot: SystemSnapshot) -> CensusDomain:
     items: list[CensusItem] = []
     on_disk_labels: set[str] = set()
-    missing_target = 0
-    nonzero_exit = 0
     not_loaded = 0
-    unparseable = 0
+    nonzero_exit = 0
 
     for plist in sorted(snapshot.user_agents, key=lambda p: (p.label, str(p.path))):
         on_disk_labels.add(plist.label)
@@ -153,10 +157,6 @@ def build_user_launch_agents(snapshot: SystemSnapshot) -> CensusDomain:
             plist, entry, disabled, target_exists, target, note
         )
 
-        if plist.parse_error is not None:
-            unparseable += 1
-        if target_exists is False:
-            missing_target += 1
         if entry is None:
             not_loaded += 1
         elif entry.last_exit not in (None, 0):
@@ -190,12 +190,10 @@ def build_user_launch_agents(snapshot: SystemSnapshot) -> CensusDomain:
         | {p.label for p in snapshot.global_daemons}
         | set(snapshot.system_labels)
     )
-    orphans = 0
     for label in sorted(snapshot.launchctl):
         if label in known_labels or is_synthetic_label(label):
             continue
         entry = snapshot.launchctl[label]
-        orphans += 1
         items.append(
             _item(
                 label=label,
@@ -210,6 +208,10 @@ def build_user_launch_agents(snapshot: SystemSnapshot) -> CensusDomain:
                 judgment=verdicts.judge_orphan_label(entry),
             )
         )
+
+    missing_target = _count_rules(items, "/missing-target")
+    unparseable = _count_rules(items, "/unparseable")
+    orphans = sum(1 for item in items if item.rule.startswith("orphan/"))
 
     summary = (
         f"{len(snapshot.user_agents)} plist file(s) in {_tilde(USER_LAUNCH_AGENTS)}; "
@@ -265,8 +267,11 @@ def _match_process(target: str | None, processes: list[ProcInfo]) -> ProcInfo | 
     for proc in processes:
         if Path(proc.argv0).name == name:
             return proc
+    # Whole-token match only. An unanchored substring test would match any
+    # unrelated process that merely mentions this path in its arguments (an
+    # editor, `tail`, a backup job) and report a dead daemon as running.
     for proc in processes:
-        if target in proc.command:
+        if target in proc.command.split():
             return proc
     return None
 
@@ -281,7 +286,6 @@ def build_global_daemons(snapshot: SystemSnapshot) -> CensusDomain:
     """
     items: list[CensusItem] = []
     apple_skipped = 0
-    missing_target = 0
     agents = 0
 
     for plist in sorted(snapshot.global_daemons, key=lambda p: (p.label, str(p.path))):
@@ -289,8 +293,6 @@ def build_global_daemons(snapshot: SystemSnapshot) -> CensusDomain:
             apple_skipped += 1
             continue
         target, target_exists, note = resolve_job_target(plist)
-        if target_exists is False:
-            missing_target += 1
 
         is_agent = plist.path.parent == GLOBAL_LAUNCH_AGENTS
         if is_agent:
@@ -336,6 +338,7 @@ def build_global_daemons(snapshot: SystemSnapshot) -> CensusDomain:
             )
         )
 
+    missing_target = _count_rules(items, "/missing-target")
     summary = (
         f"{len(items)} third-party job(s) under /Library: {agents} agent(s) in "
         f"{GLOBAL_LAUNCH_AGENTS} (launchctl is authoritative) and "
@@ -437,7 +440,9 @@ def build_processes(snapshot: SystemSnapshot) -> CensusDomain:
         f"{len(zombies)} zombie(s) and {len(hot)} process(es) at or above "
         f"{verdicts.HIGH_CPU_PERCENT:.0f}% CPU. Cluster membership is deterministic: "
         "app bundles collapse to <App>.app, generic runtimes are qualified by their "
-        f"first non-flag argument. {snapshot.probe_evidence('ps -Ao')}."
+        f"first non-flag argument. {snapshot.ps_unparsed_lines} ps line(s) could not "
+        f"be parsed and are not represented anywhere in this census. "
+        f"{snapshot.probe_evidence('ps -Ao')}."
     )
     if not procs:
         summary = f"No process snapshot available: {snapshot.probe_evidence('ps -Ao')}."
@@ -452,6 +457,7 @@ def build_processes(snapshot: SystemSnapshot) -> CensusDomain:
             "clusters_itemized": min(TOP_CLUSTERS, len(clusters)),
             "zombies": len(zombies),
             "high_cpu_processes": len(hot),
+            "ps_unparsed_lines": snapshot.ps_unparsed_lines,
             "cores": snapshot.machine.cores,
             "ram_gb": snapshot.machine.ram_gb,
         },
@@ -527,12 +533,20 @@ def build_network_listeners(snapshot: SystemSnapshot) -> CensusDomain:
 
 
 def _cron_target(command: str) -> str | None:
-    for token in command.split():
-        if token.startswith("-"):
-            continue
-        if "/" in token or token.endswith((".sh", ".py")):
+    """First executable token of a cron command line, quoting respected.
+
+    `"/Signal Check/refresh.sh"` and `/Signal\\ Check/refresh.sh` are both valid
+    cron syntax for ONE path containing a space. Splitting on whitespace would
+    truncate them into a path that does not exist and mark a healthy job for
+    removal — the same failure shape already fixed for launchd interpreters.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        if token and not token.startswith("-"):
             return token
-        return token
     return None
 
 

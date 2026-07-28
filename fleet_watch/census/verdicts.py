@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fleet_watch.census.probes import (
+    TARGET_UNVERIFIABLE,
     BrewService,
     CronEntry,
     LaunchctlEntry,
@@ -135,6 +136,13 @@ def judge_launchd_agent(
         )
 
     if target_exists is None:
+        if target_note.startswith(TARGET_UNVERIFIABLE):
+            return Judgment(
+                status="unknown",
+                verdict="investigate",
+                reason=f"target could not be checked ({target_note}).",
+                rule=f"{rule_prefix}/target-unverifiable",
+            )
         return Judgment(
             status="unknown",
             verdict="investigate",
@@ -269,6 +277,13 @@ def judge_global_daemon(
         )
 
     if target_exists is None:
+        if target_note.startswith(TARGET_UNVERIFIABLE):
+            return Judgment(
+                status="unknown",
+                verdict="investigate",
+                reason=f"target could not be checked ({target_note}).",
+                rule="global-daemon/target-unverifiable",
+            )
         return Judgment(
             status="unknown",
             verdict="investigate",
@@ -521,7 +536,11 @@ def judge_registry_process(pid: int | None, alive: bool) -> Judgment:
         return Judgment(
             status="running",
             verdict="keep",
-            reason=f"registered pid {pid} is live in ps.",
+            reason=(
+                f"registered pid {pid} is live in ps; identity is not cross-checked "
+                "(the processes table records no create-time, so a recycled pid "
+                "would read as alive)."
+            ),
             rule="registry/live",
         )
     return Judgment(

@@ -38,7 +38,8 @@ _REQUIRED_TOP = (
     "domains",
     "drift",
 )
-_REQUIRED_ITEM = ("label", "path", "status", "evidence", "verdict", "reason")
+_REQUIRED_ITEM = ("label", "path", "status", "evidence", "verdict", "reason", "rule")
+_REQUIRED_DOMAIN = ("domain_id", "domain", "summary")
 _TOTAL_KEYS = ("items", "keep", "investigate", "close", "remove")
 
 
@@ -105,12 +106,15 @@ def validate(payload: Any) -> list[str]:
         if not isinstance(domain, dict):
             errors.append(f"{where} must be an object")
             continue
-        for key in ("domain", "summary"):
+        for key in _REQUIRED_DOMAIN:
             value = domain.get(key)
             if not isinstance(value, str) or not value.strip():
                 errors.append(f"{where}.{key} must be a non-empty string")
-        if not isinstance(domain.get("totals"), dict):
+        domain_totals = domain.get("totals")
+        if not isinstance(domain_totals, dict):
             errors.append(f"{where}.totals must be an object")
+            domain_totals = {}
+        domain_counted = {key: 0 for key in _TOTAL_KEYS}
         items = domain.get("items")
         if not isinstance(items, list):
             errors.append(f"{where}.items must be an array")
@@ -133,10 +137,24 @@ def validate(payload: Any) -> list[str]:
                 )
             else:
                 counted[verdict] += 1
+                domain_counted[verdict] += 1
             counted["items"] += 1
+            domain_counted["items"] += 1
             for optional in ("resource", "close_command"):
                 if optional in item and not isinstance(item[optional], str):
                     errors.append(f"{item_where}.{optional} must be a string when present")
+
+        # A domain's own roll-up must agree with its own items, not just the
+        # grand total — otherwise a per-domain miscount hides inside a correct sum.
+        for key in _TOTAL_KEYS:
+            value = domain_totals.get(key)
+            if not isinstance(value, int):
+                errors.append(f"{where}.totals.{key} must be an integer")
+            elif value != domain_counted[key]:
+                errors.append(
+                    f"{where}.totals.{key} is {value} but {domain_counted[key]} "
+                    "were counted in that domain's items"
+                )
 
     if counted["items"] == 0:
         errors.append(
@@ -191,7 +209,16 @@ def _item_keys(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
             label = str(item.get("label", ""))
             if not label:
                 continue
-            keys[f"{domain_id}::{label}"] = {
+            key = f"{domain_id}::{label}"
+            if key in keys:
+                # Two items can legitimately share a label inside one domain
+                # (two plists declaring the same Label). Disambiguate rather
+                # than let the later one silently erase the earlier from drift.
+                suffix = 2
+                while f"{key}#{suffix}" in keys:
+                    suffix += 1
+                key = f"{key}#{suffix}"
+            keys[key] = {
                 "domain": domain_name,
                 "label": label,
                 "verdict": str(item.get("verdict", "")),

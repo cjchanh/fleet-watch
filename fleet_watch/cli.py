@@ -2469,7 +2469,9 @@ def _census_registry_rows() -> list[dict[str, Any]]:
         conn.close()
 
 
-def _render_census(payload: dict[str, Any], result: Any) -> list[str]:
+def _render_census(
+    payload: dict[str, Any], result: census_mod.CensusResult
+) -> list[str]:
     totals = payload["totals"]
     machine = payload.get("machine", {})
     lines = [
@@ -2590,12 +2592,23 @@ def census(
         )
         return
 
-    result = census_mod.run_census(
-        registry_processes=_census_registry_rows(),
-        receipt_dir=receipt_dir or census_mod.RECEIPT_DIR,
-        write=not no_receipt,
-        deep=deep,
-    )
+    try:
+        result = census_mod.run_census(
+            registry_processes=_census_registry_rows(),
+            receipt_dir=receipt_dir or census_mod.RECEIPT_DIR,
+            write=not no_receipt,
+            deep=deep,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed, never traceback
+        # The staged launchd job runs this unattended; a raw traceback there is
+        # an unreadable failure. Refuse out loud instead.
+        click.echo(
+            f"REFUSAL: census crashed before producing a receipt "
+            f"({type(exc).__name__}: {exc}).",
+            err=True,
+        )
+        click.echo("  latest.json was left untouched.", err=True)
+        sys.exit(1)
 
     if result.refusal:
         if as_json:

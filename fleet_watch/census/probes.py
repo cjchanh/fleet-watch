@@ -83,6 +83,10 @@ def run_probe(argv: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> ProbeRes
             list(argv),
             capture_output=True,
             text=True,
+            # `ps` echoes raw argv, which is not guaranteed to be valid UTF-8.
+            # Strict decoding would raise UnicodeDecodeError — not an OSError,
+            # so it would escape this handler and break "probes never raise".
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -199,6 +203,7 @@ class ParsedPlist:
     program_arguments: tuple[str, ...] = ()
     triggers: tuple[str, ...] = ()
     disabled_in_plist: bool = False
+    working_directory: str | None = None
     keys: tuple[str, ...] = ()
     parse_error: str | None = None
 
@@ -262,6 +267,7 @@ def parse_plist_file(path: Path) -> ParsedPlist:
     label_raw = data.get("Label")
     label = label_raw.strip() if isinstance(label_raw, str) and label_raw.strip() else path.stem
     target, args = _target_of(data)
+    workdir = data.get("WorkingDirectory")
     return ParsedPlist(
         path=path,
         label=label,
@@ -269,6 +275,7 @@ def parse_plist_file(path: Path) -> ParsedPlist:
         program_arguments=args,
         triggers=_infer_triggers(data),
         disabled_in_plist=bool(data.get("Disabled")),
+        working_directory=workdir if isinstance(workdir, str) and workdir else None,
         keys=tuple(sorted(str(k) for k in data)),
     )
 
@@ -325,26 +332,153 @@ def resolve_target(target: str | None) -> tuple[Path | None, bool | None]:
         return expanded, False
 
 
-def _script_candidates(args: Sequence[str]) -> list[str]:
-    """Ways to read the first path-shaped argument after argv[0].
+#: `resolve_job_target` note meaning "we could not check this target at all".
+#: Distinct from "declared and missing" — an unverifiable target must never be
+#: reported as healthy, and must never be reported as a removal candidate.
+TARGET_UNVERIFIABLE = "unverifiable"
 
-    ``bash /Signal Check/refresh.sh`` is ONE path containing a space, while
-    ``bash -c "/x/run.sh --flag"`` is a command string whose first token is the
-    path. Both are returned as candidates, whole-argument first, and the caller
-    takes the first one that exists — truncating at the space unconditionally
-    would report a healthy job as missing and mark it for removal.
+
+def _path_candidates(arg: str) -> list[str]:
+    """Ways to read one argument as a path: whole argument, then first token.
+
+    ``bash "/Signal Check/refresh.sh"`` is ONE path containing a space, while
+    ``bash "/x/run.sh --flag"`` is a command whose first token is the path.
+    Truncating at the space unconditionally reported a healthy job as missing
+    and marked it for removal.
     """
-    for arg in args[1:]:
-        if not arg or arg.startswith("-"):
+    candidates = [arg]
+    first_token = arg.split()[0] if arg.split() else arg
+    if first_token != arg:
+        candidates.append(first_token)
+    return candidates
+
+
+def _is_relative(candidate: str) -> bool:
+    return not candidate.startswith(("/", "~"))
+
+
+#: Absolute (or ~) path-shaped tokens inside an inline shell command.
+_ABS_PATH_RE = re.compile(r"(?<![\w=])((?:/|~/)[^\s'\";|&)>]+)")
+
+
+def _inline_command_paths(command: str) -> list[str]:
+    return _ABS_PATH_RE.findall(command)
+
+
+def _resolve_inline_command(interpreter: str, command: str) -> tuple[str, bool | None, str]:
+    """Judge `sh -c "<command>"`, which is a program, not a path.
+
+    We cannot execute a shell parser, so the best available evidence is the
+    absolute paths the command references. Missing ones are worth a look but
+    are never a removal candidate: an absolute path in a shell line can just as
+    easily be an output file that does not exist yet.
+    """
+    referenced = _inline_command_paths(command)
+    if not referenced:
+        return (
+            command,
+            None,
+            f"{TARGET_UNVERIFIABLE}: {interpreter} runs an inline command that "
+            "references no absolute path",
+        )
+    missing = [path for path in referenced if resolve_target(path)[1] is False]
+    if missing:
+        return (
+            missing[0],
+            None,
+            f"{TARGET_UNVERIFIABLE}: {interpreter} runs an inline command "
+            f"referencing {missing[0]!r}, which is missing",
+        )
+    return (
+        referenced[0],
+        True,
+        f"inline {interpreter} command; all {len(referenced)} referenced "
+        "absolute path(s) exist",
+    )
+
+
+def _resolve_interpreter_target(
+    interpreter_path: str, args: Sequence[str], workdir: str | None, depth: int = 0
+) -> tuple[str | None, bool | None, str]:
+    """Work out what an interpreter actually runs.
+
+    Only an ABSOLUTE script path can produce "missing" (and therefore a removal
+    candidate). A relative argument may be a module name, a subcommand, or a
+    path resolved against a WorkingDirectory we cannot see — guessing "missing"
+    there is how a healthy job gets marked for deletion.
+    """
+    interpreter = Path(interpreter_path).name
+
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not arg:
+            index += 1
             continue
-        if not arg.startswith(("/", "~")):
+
+        if interpreter == "env" and "=" in arg and not arg.startswith(("-", "/", "~")):
+            index += 1  # env VAR=VALUE ... prefix assignment
             continue
-        candidates = [arg]
-        first_token = arg.split()[0]
-        if first_token != arg:
-            candidates.append(first_token)
-        return candidates
-    return []
+
+        if arg in {"-c", "-e", "--command"}:
+            if index + 1 < len(args):
+                return _resolve_inline_command(interpreter, args[index + 1])
+            return (
+                arg,
+                None,
+                f"{TARGET_UNVERIFIABLE}: {interpreter} was given {arg} with no command",
+            )
+
+        if arg == "-m":
+            module = args[index + 1] if index + 1 < len(args) else "(none)"
+            return (
+                f"-m {module}",
+                None,
+                f"{TARGET_UNVERIFIABLE}: {interpreter} runs the module {module!r}, "
+                "which is an import name and not a file path",
+            )
+
+        if arg.startswith("-"):
+            index += 1
+            continue
+
+        # env re-dispatches to the real interpreter.
+        if interpreter == "env" and depth < 2:
+            resolved, _ = resolve_target(arg)
+            name = Path(arg).name
+            if RUNTIME_WRAPPER_RE.match(name):
+                return _resolve_interpreter_target(
+                    str(resolved or arg), args[index + 1 :], workdir, depth + 1
+                )
+
+        if _is_relative(arg):
+            if workdir:
+                for candidate in _path_candidates(arg):
+                    joined = str(Path(workdir) / candidate)
+                    if resolve_target(joined)[1]:
+                        return joined, True, f"run by {interpreter}; script exists"
+            return (
+                arg,
+                None,
+                f"{TARGET_UNVERIFIABLE}: {interpreter} runs the relative argument "
+                f"{arg!r}, which may be a subcommand or a path this plist does not "
+                "anchor",
+            )
+
+        for candidate in _path_candidates(arg):
+            if resolve_target(candidate)[1]:
+                return candidate, True, f"run by {interpreter}; script exists"
+        return (
+            arg,
+            False,
+            f"interpreter {interpreter} exists but the script it runs is missing",
+        )
+
+    return (
+        interpreter_path,
+        None,
+        f"{TARGET_UNVERIFIABLE}: {interpreter} was given no argument to run",
+    )
 
 
 def resolve_job_target(plist: ParsedPlist) -> tuple[str | None, bool | None, str]:
@@ -352,7 +486,8 @@ def resolve_job_target(plist: ParsedPlist) -> tuple[str | None, bool | None, str
 
     ``/bin/bash /Users/cj/bin/watchdog.sh`` reports on ``watchdog.sh``, not on
     bash — otherwise every broken script hides behind an interpreter that always
-    exists. Returns ``(display_target, exists, note)``.
+    exists. Returns ``(display_target, exists, note)`` where ``exists`` is
+    ``None`` for "could not be checked", which is neither healthy nor removable.
     """
     primary = plist.target
     if not primary:
@@ -363,22 +498,9 @@ def resolve_job_target(plist: ParsedPlist) -> tuple[str | None, bool | None, str
         return primary, False, "declared target missing from disk"
 
     if RUNTIME_WRAPPER_RE.match(Path(primary).name):
-        candidates = _script_candidates(plist.program_arguments)
-        for candidate in candidates:
-            _, exists = resolve_target(candidate)
-            if exists:
-                return (
-                    candidate,
-                    True,
-                    f"run by {Path(primary).name}; script exists",
-                )
-        if candidates:
-            return (
-                candidates[0],
-                False,
-                f"interpreter {Path(primary).name} exists but the script it runs "
-                "is missing",
-            )
+        return _resolve_interpreter_target(
+            primary, plist.program_arguments[1:], plist.working_directory
+        )
 
     return primary, primary_exists, "target exists"
 
@@ -441,11 +563,20 @@ def parse_etime(raw: str) -> int:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
-def parse_ps(stdout: str) -> list[ProcInfo]:
+def parse_ps(stdout: str) -> tuple[list[ProcInfo], int]:
+    """Parse `ps -Ao ...`. Returns ``(processes, unparsed_line_count)``.
+
+    Unparsed lines are counted rather than silently discarded: a process that
+    vanishes from the snapshot also vanishes from listener attribution and
+    daemon matching, and a census that cannot say so is not testifying.
+    """
     procs: list[ProcInfo] = []
+    unparsed = 0
     for line in stdout.splitlines():
         match = _PS_RE.match(line)
         if match is None:
+            if line.strip():
+                unparsed += 1
             continue
         pid, ppid, stat, etime, pcpu, rss, user, command = match.groups()
         procs.append(
@@ -460,12 +591,17 @@ def parse_ps(stdout: str) -> list[ProcInfo]:
                 command=command.strip(),
             )
         )
-    return sorted(procs, key=lambda p: p.pid)
+    return sorted(procs, key=lambda p: p.pid), unparsed
 
 
-def ps_snapshot(timeout: float = DEFAULT_TIMEOUT) -> tuple[list[ProcInfo], ProbeResult]:
+def ps_snapshot(
+    timeout: float = DEFAULT_TIMEOUT,
+) -> tuple[list[ProcInfo], int, ProbeResult]:
     result = run_probe(["ps", "-Ao", _PS_FORMAT], timeout=timeout)
-    return (parse_ps(result.stdout) if result.ok else []), result
+    if not result.ok:
+        return [], 0, result
+    procs, unparsed = parse_ps(result.stdout)
+    return procs, unparsed, result
 
 
 def cluster_key(command: str) -> str:
@@ -790,6 +926,7 @@ class SystemSnapshot:
     launchctl: dict[str, LaunchctlEntry] = field(default_factory=dict)
     disabled: dict[str, bool] = field(default_factory=dict)
     processes: list[ProcInfo] = field(default_factory=list)
+    ps_unparsed_lines: int = 0
     listeners: list[Listener] = field(default_factory=list)
     cron: list[CronEntry] = field(default_factory=list)
     login_items: list[LoginItem] = field(default_factory=list)
@@ -837,7 +974,7 @@ def collect_snapshot(
     disabled, disabled_probe = launchctl_print_disabled(domain)
     probes.append(disabled_probe)
 
-    processes, ps_probe = ps_snapshot()
+    processes, ps_unparsed, ps_probe = ps_snapshot()
     probes.append(ps_probe)
 
     listeners, lsof_probe = tcp_listeners()
@@ -867,6 +1004,7 @@ def collect_snapshot(
         launchctl=launchctl_entries,
         disabled=disabled,
         processes=processes,
+        ps_unparsed_lines=ps_unparsed,
         listeners=listeners,
         cron=cron,
         login_items=items,

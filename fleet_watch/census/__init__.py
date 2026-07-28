@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 
 from fleet_watch.census.domains import (
     DOMAIN_IDS,
@@ -177,6 +178,9 @@ def render_launchd_plist(
     --emit-launchd-plist`` to get it with the path resolved for this machine.
     """
     log_path = "/tmp/fleet-census.log"
+    # The path is interpolated into XML, and '&' or '<' are legal in filenames.
+    # An unescaped one emits a plist that launchd cannot parse.
+    executable = xml_escape(executable)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '

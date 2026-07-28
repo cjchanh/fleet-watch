@@ -57,6 +57,7 @@ def _minimal_payload(verdict: str = "keep") -> dict:
         "evidence": "launchctl list: PID 1",
         "verdict": verdict,
         "reason": "it runs",
+        "rule": "user-agent/running",
     }
     totals = {"items": 1, "keep": 0, "investigate": 0, "close": 0, "remove": 0}
     totals[verdict] = 1
@@ -71,7 +72,7 @@ def _minimal_payload(verdict: str = "keep") -> dict:
                 "domain_id": "user-launch-agents",
                 "domain": "user LaunchAgents (~/Library/LaunchAgents)",
                 "summary": "one job",
-                "totals": {"items": 1},
+                "totals": dict(totals),
                 "items": [item],
             }
         ],
@@ -132,7 +133,7 @@ def test_parse_etime(raw, expected):
 
 
 def test_parse_ps_extracts_full_command_with_spaces():
-    procs = probes.parse_ps(
+    procs, unparsed = probes.parse_ps(
         "    1     0 Ss   01-05:00:33   0.7  29376 root             /sbin/launchd\n"
         " 70256     1 R    00:12         99.3 145456 cj               node tests/bench.js 5\n"
     )
@@ -140,6 +141,18 @@ def test_parse_ps_extracts_full_command_with_spaces():
     assert procs[1].command == "node tests/bench.js 5"
     assert procs[1].cpu_percent == 99.3
     assert procs[0].etime_seconds == 104433
+    assert unparsed == 0
+
+
+def test_parse_ps_counts_malformed_lines_instead_of_dropping_them_silently():
+    """A process that vanishes from the snapshot must leave a trace."""
+    procs, unparsed = probes.parse_ps(
+        "    1     0 Ss   01-05:00:33   0.7  29376 root             /sbin/launchd\n"
+        "garbage line the regex cannot match\n"
+        "\n"
+    )
+    assert len(procs) == 1
+    assert unparsed == 1  # blank lines do not count; real garbage does
 
 
 def test_parse_lsof_dedupes_dual_stack_and_prefers_the_exposed_binding():
@@ -260,6 +273,121 @@ def test_missing_script_behind_a_present_interpreter_is_reported_missing(tmp_pat
     assert exists is False
     assert target == "/Users/cj/gone/watchdog.sh"
     assert "script it runs is missing" in note
+
+
+def test_relative_script_with_a_working_directory_is_resolved_against_it(tmp_path):
+    script = tmp_path / "worker.py"
+    script.write_text("print('hi')\n")
+    plist = probes.ParsedPlist(
+        path=tmp_path / "job.plist",
+        label="job",
+        target="/usr/bin/python3",
+        program_arguments=("/usr/bin/python3", "worker.py"),
+        working_directory=str(tmp_path),
+    )
+    target, exists, _ = probes.resolve_job_target(plist)
+    assert exists is True and target == str(script)
+
+    # A relative argument that does not resolve is UNVERIFIABLE, never
+    # "missing": it may be a subcommand (`uv run`) rather than a file, and a
+    # relative name must never be able to produce a `remove` verdict.
+    plist_gone = probes.ParsedPlist(
+        path=tmp_path / "job.plist",
+        label="job",
+        target="/usr/bin/python3",
+        program_arguments=("/usr/bin/python3", "deleted.py"),
+        working_directory=str(tmp_path),
+    )
+    _, exists_gone, note = probes.resolve_job_target(plist_gone)
+    assert exists_gone is None
+    assert note.startswith(probes.TARGET_UNVERIFIABLE)
+
+
+def test_python_module_argument_is_never_treated_as_a_file_path(tmp_path):
+    """Regression: `python -m pkg.mod` is an import name, not a path.
+
+    Joining it to WorkingDirectory produced a path that never exists, which
+    marked three healthy jobs `remove` on a live machine.
+    """
+    plist = probes.ParsedPlist(
+        path=tmp_path / "job.plist",
+        label="ai.cds.mlx-worker",
+        target="/usr/bin/python3",
+        program_arguments=("/usr/bin/python3", "-m", "sovereign_stack.providers.mlx_worker"),
+        working_directory=str(tmp_path),
+    )
+    target, exists, note = probes.resolve_job_target(plist)
+    assert exists is None, "a module name must never read as a missing file"
+    assert "sovereign_stack.providers.mlx_worker" in target
+    assert "import name" in note
+
+
+def test_inline_shell_command_is_judged_by_the_paths_it_references(tmp_path):
+    """Regression: `bash -c "cd /repo && ..."` is a program, not a path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    healthy = probes.ParsedPlist(
+        path=tmp_path / "a.plist",
+        label="com.x.a",
+        target="/bin/bash",
+        program_arguments=("/bin/bash", "-c", f"cd {repo} && exec bash scripts/ingest.sh"),
+    )
+    target, exists, note = probes.resolve_job_target(healthy)
+    assert exists is True and str(repo) in target
+    assert "referenced" in note
+
+    broken = probes.ParsedPlist(
+        path=tmp_path / "b.plist",
+        label="com.x.b",
+        target="/bin/bash",
+        program_arguments=("/bin/bash", "-c", f"cd {tmp_path / 'gone'} && ./run.sh"),
+    )
+    _, exists_broken, note_broken = probes.resolve_job_target(broken)
+    # Worth a look, but never a removal candidate: an absolute path in a shell
+    # line is as likely to be an output file as an input.
+    assert exists_broken is None
+    assert note_broken.startswith(probes.TARGET_UNVERIFIABLE)
+
+
+def test_env_redispatches_to_the_real_interpreter(tmp_path):
+    script = tmp_path / "bridge.py"
+    script.write_text("x = 1\n")
+    plist = probes.ParsedPlist(
+        path=tmp_path / "job.plist",
+        label="com.x.bridge",
+        target="/usr/bin/env",
+        program_arguments=("/usr/bin/env", "python3", str(script)),
+    )
+    target, exists, _ = probes.resolve_job_target(plist)
+    assert exists is True and target == str(script)
+
+
+def test_relative_script_without_a_working_directory_is_unverifiable_not_healthy(
+    tmp_path,
+):
+    """Regression: the interpreter existing must not stand in for the script.
+
+    `python3 worker.py` with no WorkingDirectory used to fall through to
+    "target exists" because /usr/bin/python3 exists — a fake-green that would
+    report a job whose script was deleted as `keep`.
+    """
+    plist = probes.ParsedPlist(
+        path=tmp_path / "job.plist",
+        label="com.x.job",
+        target="/usr/bin/python3",
+        program_arguments=("/usr/bin/python3", "worker.py"),
+        keys=("Label", "ProgramArguments"),
+    )
+    target, exists, note = probes.resolve_job_target(plist)
+    assert exists is None, "unverifiable must not be reported as existing"
+    assert note.startswith(probes.TARGET_UNVERIFIABLE)
+    assert target == "worker.py"
+
+    judgment = verdicts.judge_launchd_agent(
+        plist, probes.LaunchctlEntry("com.x.job", None, 0), False, exists, target, note
+    )
+    assert (judgment.status, judgment.verdict) == ("unknown", "investigate")
+    assert judgment.rule == "user-agent/target-unverifiable"
 
 
 def test_job_with_no_program_reports_undeclared_not_missing(tmp_path):
@@ -474,6 +602,45 @@ def test_empty_snapshot_produces_domains_with_probe_returned_nothing_summaries()
     assert any("probe" in domain.summary for domain in built)
 
 
+@pytest.mark.parametrize("style", ["quoted", "escaped"])
+def test_cron_script_path_containing_a_space_is_not_truncated(tmp_path, style):
+    """Regression: a quoted or escaped cron path is ONE path, not two.
+
+    Truncating at the space reported a working cron job as missing and emitted
+    `remove` with a "delete the line" instruction for the operator.
+    """
+    script_dir = tmp_path / "Signal Check"
+    script_dir.mkdir()
+    script = script_dir / "refresh.sh"
+    script.write_text("#!/bin/bash\n")
+    rendered = f'"{script}"' if style == "quoted" else str(script).replace(" ", "\\ ")
+
+    entry = probes.CronEntry(
+        line=f"0 8 * * * {rendered}", schedule="0 8 * * *", command=rendered
+    )
+    domain = domains.build_cron_login_items(_snapshot(cron=[entry]))
+    assert domain.items[0].verdict == "keep"
+    assert domain.items[0].status == "idle-loaded"
+
+
+def test_daemon_matching_requires_a_whole_token_not_a_substring():
+    """A `tail` on the daemon's path must not read as the daemon running."""
+    plist = probes.ParsedPlist(
+        path=probes.GLOBAL_LAUNCH_DAEMONS / "com.x.d.plist",
+        label="com.x.d",
+        target="/usr/bin/true",  # exists, so the missing-target rule cannot fire
+        triggers=("RunAtLoad",),
+        keys=("Label",),
+    )
+    # Mentions the target path as a substring; must not count as the daemon.
+    bystander = _proc(50, "/usr/bin/tail -f /usr/bin/true.log")
+    domain = domains.build_global_daemons(
+        _snapshot(global_daemons=[plist], processes=[bystander])
+    )
+    assert domain.items[0].verdict == "investigate"
+    assert domain.items[0].status == "dead"
+
+
 def test_process_domain_clusters_and_flags_zombies():
     procs = [_proc(i, "/opt/homebrew/bin/git fsmonitor--daemon run") for i in range(1, 60)]
     procs.append(_proc(900, "/usr/bin/defunct", stat="Z+"))
@@ -522,6 +689,26 @@ def test_missing_required_key_is_reported_without_crashing():
     assert receipt.validate(payload) == ["missing required key: drift"]
 
 
+def test_validation_enforces_the_fields_the_contract_says_are_required():
+    """`rule` and `domain_id` are load-bearing: drift keys off domain_id and
+    the receipt's testify guarantee rests on rule. A validator that documents
+    them without enforcing them is a gate that never fires."""
+    payload = _minimal_payload()
+    del payload["domains"][0]["items"][0]["rule"]
+    assert any(".rule" in error for error in receipt.validate(payload))
+
+    payload = _minimal_payload()
+    del payload["domains"][0]["domain_id"]
+    assert any("domain_id" in error for error in receipt.validate(payload))
+
+
+def test_validation_catches_a_per_domain_miscount_hidden_by_a_correct_grand_total():
+    payload = _minimal_payload()
+    payload["domains"][0]["totals"]["keep"] = 7  # grand total still says 1
+    errors = receipt.validate(payload)
+    assert any("domains[0].totals.keep is 7" in error for error in errors)
+
+
 def test_write_receipt_lands_dated_file_and_latest_pointer(tmp_path):
     dated, latest = receipt.write_receipt(_minimal_payload(), tmp_path)
     assert dated.name == "census-20260727T120000Z.json"
@@ -541,6 +728,60 @@ def test_a_bad_payload_never_clobbers_a_good_latest_json(tmp_path):
         receipt.write_receipt(bad, tmp_path)
 
     assert (tmp_path / receipt.LATEST_NAME).read_text() == good
+
+
+def test_readback_gate_refuses_when_what_landed_on_disk_is_not_what_passed(
+    tmp_path, monkeypatch
+):
+    """The read-back re-validation must actually block, not just exist.
+
+    Simulates the dated receipt being corrupted between write and swap; a good
+    latest.json must survive.
+    """
+    receipt.write_receipt(_minimal_payload(), tmp_path)
+    good = (tmp_path / receipt.LATEST_NAME).read_text()
+
+    real_write = receipt._atomic_write
+    calls = {"n": 0}
+
+    def corrupting_write(path, text):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the dated receipt
+            real_write(path, "{ corrupted on the way to disk")
+        else:
+            real_write(path, text)
+
+    monkeypatch.setattr(receipt, "_atomic_write", corrupting_write)
+
+    payload = _minimal_payload()
+    payload["generated_at"] = "2026-07-28T12:00:00Z"
+    with pytest.raises(receipt.CensusRefusal) as excinfo:
+        receipt.write_receipt(payload, tmp_path)
+
+    assert "after write" in str(excinfo.value)
+    assert (tmp_path / receipt.LATEST_NAME).read_text() == good
+    assert calls["n"] == 1, "latest.json must not be written after a failed read-back"
+
+
+def test_drift_keeps_both_items_when_two_share_a_label_in_one_domain():
+    def payload_with_duplicate_labels(second_verdict: str) -> dict:
+        payload = _minimal_payload()
+        duplicate = dict(payload["domains"][0]["items"][0])
+        duplicate["verdict"] = second_verdict
+        duplicate["path"] = "/Library/LaunchAgents/com.example.job.plist"
+        payload["domains"][0]["items"].append(duplicate)
+        payload["totals"]["items"] = 2
+        payload["totals"][second_verdict] += 1
+        return payload
+
+    drift = receipt.compute_drift(
+        payload_with_duplicate_labels("investigate"),
+        payload_with_duplicate_labels("keep"),
+        "/tmp/latest.json",
+    )
+    assert drift["new_items"] == [] and drift["disappeared"] == []
+    assert len(drift["verdict_changes"]) == 1
+    assert drift["verdict_changes"][0]["key"].endswith("#2")
 
 
 def test_load_latest_reports_absent_invalid_and_ok(tmp_path):
