@@ -19,6 +19,7 @@ import click
 from fleet_watch import autonomous as autonomous_mod
 from fleet_watch import boot_coverage as boot_coverage_mod
 from fleet_watch import census as census_mod
+from fleet_watch import boot_map as boot_map_mod
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch import pkill as pkill_mod
@@ -2453,6 +2454,8 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
     for entry in failed:
         click.echo(f"FAIL: PID {entry['pid']} ({entry['name']}) — {entry.get('reason', 'unknown')}", err=True)
     sys.exit(1 if failed else 0)
+
+
 def _census_registry_rows() -> list[dict[str, Any]]:
     """Read the Fleet Watch registry for the census. Never creates the DB."""
     try:
@@ -2680,6 +2683,59 @@ def census(
 
     click.echo("\n".join(_render_census(result.payload, result)))
 
+
+@cli.command("boot-map")
+@click.option(
+    "--receipt",
+    "receipt_path",
+    default=None,
+    type=click.Path(),
+    help=f"Census receipt JSON (default: {boot_map_mod.DEFAULT_RECEIPT_PATH})",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    default=None,
+    type=click.Path(),
+    help=f"Output directory (default: {boot_map_mod.DEFAULT_OUT_DIR})",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the build receipt as JSON")
+def boot_map(receipt_path: str | None, out_dir: str | None, as_json: bool):
+    """Build the boot map: census receipt -> graph JSON + local 3D HTML.
+
+    Deterministic and offline: same receipt produces the same graph and the same
+    self-contained page. Exits 3 (fail-closed) when the receipt is absent,
+    unparseable, structurally invalid, or degenerate.
+    """
+    try:
+        built = boot_map_mod.build(receipt=receipt_path, out_dir=out_dir)
+    except boot_map_mod.BootMapError as exc:
+        click.echo(f"REFUSAL: {exc}", err=True)
+        sys.exit(3)
+
+    if as_json:
+        click.echo(json.dumps(built, indent=2, sort_keys=True))
+        return
+
+    stats = built["stats"]
+    source = built["source_receipt"]
+    click.echo(
+        f"Boot map built from {source['path']}\n"
+        f"  census:  {source['item_count']} items / {source['domain_count']} domains"
+        f" (host {source['host'] or 'unnamed'}, {source['generated_at'] or 'undated'})\n"
+        f"  graph:   {stats['node_count']} nodes / {stats['edge_count']} edges"
+    )
+    for kind, count in stats["counts_by_kind"].items():
+        click.echo(f"    {kind:<9} {count}")
+    verdicts = ", ".join(f"{k} {v}" for k, v in stats["counts_by_verdict"].items())
+    click.echo(f"  verdicts: {verdicts}")
+    if built["warnings"]:
+        click.echo(f"  warnings: {len(built['warnings'])} (kept + flagged, never dropped)")
+    for output in built["outputs"]:
+        click.echo(f"  wrote {output['path']}  sha256 {output['sha256'][:16]}…")
+    html = next((o["path"] for o in built["outputs"] if o["path"].endswith(".html")), None)
+    if html:
+        click.echo(f"View: open {html}")
 
 def main():
     """Run the Fleet Watch CLI entrypoint."""

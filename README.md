@@ -211,6 +211,7 @@ Top-level keys:
 | `fleet census` | What boots and runs on this machine, and what's stale |
 | `fleet census --json` | Full census receipt (`fleet-census/v1`) |
 | `fleet census --emit-launchd-plist` | Print the staged daily-census launchd job; installs nothing |
+| `fleet boot-map` | Census receipt → boot graph + local interactive 3D page |
 
 #### `fleet census`
 
@@ -268,6 +269,58 @@ Receipt contract: [`docs/fleet-census-receipt-contract-v1.md`](docs/fleet-census
 | `fleet thunder claim` | Attach ownership to a Thunder instance |
 | `fleet thunder heartbeat` | Refresh Thunder resource heartbeat |
 | `fleet thunder release` | Remove a Thunder instance |
+
+## Boot Map
+
+One question: **what boots on this machine, and where does it go?**
+
+`fleet boot-map` turns a `fleet-census/v1` receipt into a node/link graph and one
+self-contained HTML page you rotate, zoom, and click through locally.
+
+```bash
+# Default: the latest census receipt -> ~/.governance/graph/boot-map/
+fleet boot-map
+
+# Any receipt, any output directory
+fleet boot-map --receipt ./census.json --out /tmp/boot-map
+open /tmp/boot-map/index.html
+```
+
+**What lands in the graph.** Launchd jobs, the scripts and binaries they launch,
+the repos and system areas those live in, the ports they bind, live processes,
+and the domains that group them. Verdict and status ride along as node
+attributes, so colour is the census verdict — `keep`, `investigate`, `close`,
+`remove`. Filled nodes were rated by the census; hollow nodes inherit the worst
+verdict of what reaches them (a repo reads red when something red lives in it),
+and say so in the detail panel. A red ring means a port bound to all interfaces.
+
+**Outputs** (`graph.json`, `index.html`, `receipt.json`) are regenerable, so they
+live outside the repo. Same receipt in, byte-identical graph and page out — no
+wall-clock, no randomness, no layout drift.
+
+**Local and sovereign.** Zero network at build time and at view time: no CDN, no
+fonts, no images, no XHR, no libraries. The page ships a
+`default-src 'none'; connect-src 'none'` CSP, and the test suite asserts the
+artifact contains no `http(s)://` literal at all.
+
+**Fail-closed.** Exit `3` and a `REFUSAL:` line when the receipt is absent,
+unreadable, unparseable, structurally invalid, or degenerate. There is no
+bundled-fixture fallback: rendering a stand-in as if it were this machine is a
+fake-green, which is worse than no map. Zero domains or zero items is a refusal,
+not a clean bill of health. Items missing a `status` or `verdict` are never
+dropped — they are kept, coerced toward `investigate` (a human should look), and
+flagged in `warnings`; off-enum values survive verbatim with a `*_valid: false`
+marker so the graph cannot launder bad input into good-looking input.
+
+The page refuses too: an empty or corrupted data island paints a REFUSAL panel,
+never a clean-looking empty canvas. That behaviour is covered, not assumed —
+`scripts/verify_boot_map_render.js` executes the emitted JS against a DOM stub
+and counts canvas draw calls, so a page that loads clean and paints nothing
+fails:
+
+```bash
+node scripts/verify_boot_map_render.js ~/.governance/graph/boot-map/index.html --expect render
+```
 
 ## GPU Working Set Estimation
 
