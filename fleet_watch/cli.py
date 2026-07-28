@@ -2620,7 +2620,9 @@ def census(
         # stderr so the plist can be redirected to a file while the operator
         # still sees what to run. Fleet Watch does not install it.
         click.echo(
-            "\nStaged only — nothing was installed. To install the daily census:\n"
+            "\nPrinted only — `--emit-launchd-plist` never installs anything itself.\n"
+            "A `launchctl bootstrap` you run (or piped after this) is what installs. "
+            "From scratch:\n"
             f"  {census_mod.INSTALL_COMMAND}\n"
             "To remove it:\n"
             f"  {census_mod.UNINSTALL_COMMAND}",
