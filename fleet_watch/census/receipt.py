@@ -179,6 +179,29 @@ def validate(payload: Any) -> list[str]:
             if not isinstance(drift.get(key), list):
                 errors.append(f"drift.{key} must be an array")
 
+    # Optional on v1 receipts written before ranking existed; when present it
+    # must be a well-formed array of ranked investigate entries.
+    if "ranked_investigate" in payload:
+        ranked = payload["ranked_investigate"]
+        if not isinstance(ranked, list):
+            errors.append("ranked_investigate must be an array when present")
+        else:
+            for index, entry in enumerate(ranked):
+                where = f"ranked_investigate[{index}]"
+                if not isinstance(entry, dict):
+                    errors.append(f"{where} must be an object")
+                    continue
+                if not isinstance(entry.get("label"), str) or not entry["label"].strip():
+                    errors.append(f"{where}.label must be a non-empty string")
+                rank = entry.get("rank")
+                if not isinstance(rank, int) or rank < 1:
+                    errors.append(f"{where}.rank must be a positive integer")
+                score = entry.get("score")
+                if not isinstance(score, (int, float)):
+                    errors.append(f"{where}.score must be a number")
+                if entry.get("verdict") not in (None, "investigate"):
+                    errors.append(f"{where}.verdict must be 'investigate' when present")
+
     return errors
 
 

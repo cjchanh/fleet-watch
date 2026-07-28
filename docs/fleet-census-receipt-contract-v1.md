@@ -35,6 +35,7 @@ Consumers **must** handle the absent state: no `latest.json` means
   "host": "example-host",
   "machine": {"os": "Darwin 25.5.0", "cores": 18, "ram_gb": 128},
   "totals": {"items": 168, "keep": 129, "investigate": 39, "close": 0, "remove": 0},
+  "ranked_investigate": [ /* see below; always present on new receipts, top-N */ ],
   "domains": [ /* see below */ ],
   "probes":  [ /* see below */ ],
   "drift":   { /* see below */ }
@@ -44,6 +45,14 @@ Consumers **must** handle the absent state: no `latest.json` means
 `generated_at` is always UTC `YYYY-MM-DDTHH:MM:SSZ`.
 `totals` is the exact roll-up of every item across every domain; validation
 fails if the counts disagree with the domains.
+
+`ranked_investigate` is the top-N (default 10) items with `verdict: investigate`,
+ordered by operator cost: aggregate RSS MB, then CPU %, then failing/orphan
+status weight, then large-cluster / high-cpu rules. It is **optional** on
+receipts written before ranking existed; when present it must be an array of
+objects with at least `label`, `rank` (positive int), and `score` (number).
+Producers always emit it (possibly empty). Consumers may recompute from items
+if the field is absent.
 
 ## Domain
 
@@ -107,6 +116,32 @@ plist does not anchor with `WorkingDirectory` — resolves to
 `*/target-unverifiable` (`status: unknown`, `verdict: investigate`). Unverifiable
 is neither healthy nor removable; guessing in either direction is how a working
 job gets deleted or a dead one gets a clean bill of health.
+
+## Ranked investigate
+
+```json
+{
+  "rank": 1,
+  "label": "git fsmonitor--daemon",
+  "domain_id": "processes",
+  "domain": "live process census",
+  "status": "running",
+  "verdict": "investigate",
+  "score": 10241.0,
+  "rss_mb": 1482,
+  "cpu_pct": 0.4,
+  "proc_count": 171,
+  "cost_drivers": ["rss_mb=1482", "procs=171", "status=running", "large-cluster"],
+  "reason": "171 processes in one cluster holding 1482 MB resident; large fan-out worth confirming.",
+  "rule": "process/large-cluster-count",
+  "resource": "171 procs / 1482 MB RSS / 0.4% CPU"
+}
+```
+
+Optional on each entry when known: `rss_mb`, `cpu_pct`, `proc_count`,
+`resource`, `close_command`. `cost_drivers` is a short string list of which
+signals contributed. Fleet Watch never acts on a ranked entry — ranking is
+attention order only.
 
 ## Probes
 

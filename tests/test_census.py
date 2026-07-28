@@ -969,3 +969,149 @@ def test_login_items_dedup_to_one_item_per_app_keeping_the_worst_verdict():
     assert len(docker) == 1
     assert docker[0].verdict == "remove"
     assert "2 registration(s)" in docker[0].evidence
+
+
+# --------------------------------------------------------------------------
+# ranked investigate
+# --------------------------------------------------------------------------
+
+
+def test_parse_cost_signals_from_cluster_resource():
+    from fleet_watch.census import rank
+
+    signals = rank.parse_cost_signals(
+        {
+            "resource": "171 procs / 1482 MB RSS / 0.4% CPU",
+            "reason": "noise",
+            "evidence": "noise",
+        }
+    )
+    assert signals == {"rss_mb": 1482, "cpu_pct": 0.4, "proc_count": 171}
+
+
+def test_score_investigate_orders_rss_above_quiet_dead():
+    from fleet_watch.census import rank
+
+    heavy = {
+        "verdict": "investigate",
+        "status": "running",
+        "resource": "10 procs / 8000 MB RSS / 1.0% CPU",
+        "reason": "cluster holds 8000 MB",
+        "rule": "process/large-cluster-rss",
+        "label": "Python",
+    }
+    quiet = {
+        "verdict": "investigate",
+        "status": "dead",
+        "resource": "system daemon",
+        "reason": "plist never loaded",
+        "rule": "daemon/never-loaded",
+        "label": "com.adobe.unused",
+    }
+    s_heavy, _ = rank.score_investigate(heavy)
+    s_quiet, _ = rank.score_investigate(quiet)
+    assert s_heavy > s_quiet
+
+
+def test_rank_investigate_top_n_and_only_investigate():
+    from fleet_watch.census import rank
+
+    domains = [
+        {
+            "domain_id": "processes",
+            "domain": "live processes",
+            "items": [
+                {
+                    "label": "keep.me",
+                    "verdict": "keep",
+                    "status": "running",
+                    "resource": "50 procs / 9000 MB RSS / 0% CPU",
+                    "reason": "fine",
+                    "rule": "process/ok",
+                },
+                {
+                    "label": "big.ram",
+                    "verdict": "investigate",
+                    "status": "running",
+                    "resource": "10 procs / 8000 MB RSS / 0.1% CPU",
+                    "reason": "large rss",
+                    "rule": "process/large-cluster-rss",
+                },
+                {
+                    "label": "hot.cpu",
+                    "verdict": "investigate",
+                    "status": "running",
+                    "resource": "99.5% CPU",
+                    "reason": "hot",
+                    "rule": "process/high-cpu",
+                },
+                {
+                    "label": "failing.job",
+                    "verdict": "investigate",
+                    "status": "failing",
+                    "reason": "exit 1",
+                    "rule": "user-agent/last-exit-nonzero",
+                },
+            ],
+        }
+    ]
+    ranked = rank.rank_investigate(domains, top_n=2)
+    assert len(ranked) == 2
+    assert ranked[0]["rank"] == 1
+    assert ranked[0]["label"] == "big.ram"
+    assert ranked[0]["rss_mb"] == 8000
+    assert ranked[1]["label"] in {"hot.cpu", "failing.job"}
+    assert all(e["verdict"] == "investigate" for e in ranked)
+
+
+def test_build_payload_includes_ranked_investigate(tmp_path):
+    snap = _snapshot(
+        processes=[
+            _proc(1, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(2, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(3, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(4, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(5, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(6, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(7, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(8, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(9, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(10, "Python worker", rss_kb=9_000_000, cpu_percent=0.0),
+            _proc(11, "node hot.js", rss_kb=50_000, cpu_percent=95.0),
+        ]
+    )
+    payload = census.build_payload(snap, receipt_dir=tmp_path)
+    assert "ranked_investigate" in payload
+    assert receipt.validate(payload) == []
+    ranked = payload["ranked_investigate"]
+    assert ranked, "expected at least one investigate from the large Python cluster"
+    assert ranked[0]["rank"] == 1
+    assert "Python" in ranked[0]["label"] or ranked[0].get("rss_mb", 0) >= 1000
+
+
+def test_ranked_investigate_validation_rejects_bad_entries():
+    payload = _minimal_payload()
+    payload["ranked_investigate"] = [{"label": "x", "rank": 0, "score": 1}]
+    errors = receipt.validate(payload)
+    assert any("rank" in e for e in errors)
+
+    payload["ranked_investigate"] = "not-a-list"
+    assert any("ranked_investigate" in e for e in receipt.validate(payload))
+
+
+def test_format_rank_line_includes_cost():
+    from fleet_watch.census import rank
+
+    line = rank.format_rank_line(
+        {
+            "rank": 1,
+            "label": "git fsmonitor--daemon",
+            "rss_mb": 1482,
+            "cpu_pct": 0.4,
+            "proc_count": 171,
+            "reason": "large fan-out",
+        }
+    )
+    assert line.startswith("#1 git fsmonitor--daemon")
+    assert "1482 MB" in line
+    assert "171 procs" in line

@@ -2506,6 +2506,19 @@ def _render_census(
         "",
     ]
 
+    ranked = payload.get("ranked_investigate") or []
+    if ranked:
+        lines.append(
+            f"  Top investigate (ranked by RAM / CPU / failure cost, "
+            f"{len(ranked)} of {totals.get('investigate', len(ranked))}):"
+        )
+        for entry in ranked:
+            lines.append(f"      {census_mod.format_rank_line(entry)}")
+        lines.append("")
+    elif totals.get("investigate", 0) == 0:
+        lines.append("  Top investigate: none.")
+        lines.append("")
+
     for domain in payload["domains"]:
         domain_totals = domain["totals"]
         lines.append(f"  [{domain['domain']}] {domain_totals['items']} items")

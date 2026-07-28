@@ -31,6 +31,11 @@ from fleet_watch.census.domains import (
     build_domains,
 )
 from fleet_watch.census.probes import SystemSnapshot, collect_snapshot
+from fleet_watch.census.rank import (
+    DEFAULT_TOP_N,
+    format_rank_line,
+    rank_investigate,
+)
 from fleet_watch.census.receipt import (
     LATEST_NAME,
     RECEIPT_DIR,
@@ -49,6 +54,7 @@ __all__ = [
     "CensusItem",
     "CensusRefusal",
     "CensusResult",
+    "DEFAULT_TOP_N",
     "DOMAIN_IDS",
     "INSTALL_COMMAND",
     "LATEST_NAME",
@@ -58,6 +64,8 @@ __all__ = [
     "SystemSnapshot",
     "build_payload",
     "collect_snapshot",
+    "format_rank_line",
+    "rank_investigate",
     "render_launchd_plist",
     "run_census",
     "validate",
@@ -110,13 +118,17 @@ def build_payload(
 ) -> dict[str, Any]:
     """Build the contract-shaped payload, including drift against latest.json."""
     domains = build_domains(snapshot)
+    domain_dicts = [domain.to_dict() for domain in domains]
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at or now_iso(),
         "host": snapshot.machine.host,
         "machine": snapshot.machine.to_dict(),
         "totals": _rollup(domains),
-        "domains": [domain.to_dict() for domain in domains],
+        "domains": domain_dicts,
+        # Always present (possibly empty): top investigate by RAM/CPU/failure
+        # cost so operators and the ORDER boot pane don't drown in flat ambers.
+        "ranked_investigate": rank_investigate(domain_dicts, top_n=DEFAULT_TOP_N),
         "probes": [probe.to_dict() for probe in snapshot.probes],
         "drift": {
             "prior_receipt": None,
