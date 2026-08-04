@@ -704,6 +704,10 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
                 port=proc.port,
                 gpu_mb=proc.gpu_mb,
                 repo_dir=None,
+                # discover FOUND this listener — it is the port's holder, not a
+                # rival for it. Without this the OS probe rejects every live
+                # listener for holding the port it was discovered on.
+                owner_pid=proc.pid,
             )
             if failures:
                 reason = "; ".join(f.reason for f in failures)

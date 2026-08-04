@@ -817,7 +817,16 @@ def check(
         if decision.allowed:
             click.echo(f"Port {port}: available")
         else:
-            click.echo(f"Port {port}: TAKEN by PID {decision.holder['pid']} ({decision.holder['name']})", err=True)
+            # holder is None when the OS holds the port but nothing in the
+            # registry claims it — which is the case this whole check exists
+            # to catch, so it must not be the one that crashes.
+            if decision.holder is not None:
+                click.echo(
+                    f"Port {port}: TAKEN by PID {decision.holder['pid']} ({decision.holder['name']})",
+                    err=True,
+                )
+            else:
+                click.echo(f"Port {port}: TAKEN — {decision.reason}", err=True)
             failed = True
 
     if repo_dir is not None:

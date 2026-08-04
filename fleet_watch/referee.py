@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -85,16 +86,81 @@ def _overlap_paths(requested: list[str], held: list[str]) -> list[str]:
     return overlaps
 
 
-def check_port(conn: sqlite3.Connection, port: int) -> Decision:
-    """Return whether a port is currently available."""
+def os_port_held(port: int) -> bool:
+    """True when the OS cannot bind this TCP port on loopback.
+
+    Why this exists: ``check_port`` previously returned "port available" when
+    ``registry.get_process_by_port`` was empty. That measured the claim table,
+    not the socket table — so any unregistered listener (proof: Decision Card
+    Kernel on 8765, ``fleet guard --json --port 8765`` → allowed:true while
+    ``socket.bind(("127.0.0.1", 8765))`` raised [Errno 48]) made the guard
+    fail-open in the direction operators rely on ("allowed:false → stop").
+
+    Registry absence is not availability. The OS bind is the authority on
+    whether a port can still be claimed. Loopback only: this is a local
+    single-user tool; non-loopback holders are out of scope for this probe.
+    """
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        # Invalid port is not "available" — fail closed for bad input.
+        return True
+    for family, address in (
+        (socket.AF_INET, "127.0.0.1"),
+        (socket.AF_INET6, "::1"),
+    ):
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            # Family unsupported on this host (common for AF_INET6) — try next.
+            continue
+        try:
+            # SO_REUSEADDR left at default 0 so an existing listener is not
+            # masked by a second bind that would otherwise succeed.
+            sock.bind((address, port))
+        except OSError:
+            return True
+        finally:
+            sock.close()
+    return False
+
+
+def check_port(
+    conn: sqlite3.Connection, port: int, *, owner_pid: int | None = None
+) -> Decision:
+    """Return whether a port is available for a new claim.
+
+    Two independent authorities, both required:
+    1. Fleet registry — no registered process already claimed this port.
+    2. OS socket table — loopback bind must succeed (see ``os_port_held``).
+
+    Either alone is insufficient: an unregistered listener must still block,
+    and a registered-but-dead claim is handled by the registry path's holder
+    record (discover/clean reaps dead PIDs elsewhere).
+
+    ``owner_pid`` is for the one caller that is not asking "may I bind this?":
+    ``discover``, which has just FOUND a live listener and is registering it.
+    For that caller the OS holding the port is the premise, not a conflict —
+    the port is held by the very process being registered. Without this, the
+    OS probe made discover unable to register any listener at all, because
+    every listener holds its own port. The registry half still applies: a
+    DIFFERENT registered process claiming the port is a real conflict.
+    """
     holder = registry.get_process_by_port(conn, port)
-    if holder is None:
-        return Decision(allowed=True, reason="port available")
-    return Decision(
-        allowed=False,
-        reason=f"port {port} claimed by PID {holder['pid']} ({holder['name']})",
-        holder=holder,
-    )
+    if holder is not None:
+        return Decision(
+            allowed=False,
+            reason=f"port {port} claimed by PID {holder['pid']} ({holder['name']})",
+            holder=holder,
+        )
+    if owner_pid is None and os_port_held(port):
+        return Decision(
+            allowed=False,
+            reason=(
+                f"port {port} held by the OS (not in fleet registry) — "
+                "registry absence is not availability"
+            ),
+            holder=None,
+        )
+    return Decision(allowed=True, reason="port available")
 
 
 def check_repo(conn: sqlite3.Connection, repo_dir: str) -> Decision:
@@ -322,12 +388,13 @@ def preflight_register(
     current_session_id: str | None = None,
     write_scopes: list[str] | tuple[str, ...] | None = None,
     exclusive_repo_lock: bool = False,
+    owner_pid: int | None = None,
 ) -> list[Decision]:
     """Run all checks before registration. Returns list of failed decisions (empty = all clear)."""
     failures: list[Decision] = []
 
     if port is not None:
-        d = check_port(conn, port)
+        d = check_port(conn, port, owner_pid=owner_pid)
         if not d.allowed:
             failures.append(d)
 
