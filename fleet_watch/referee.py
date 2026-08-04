@@ -123,7 +123,9 @@ def os_port_held(port: int) -> bool:
     return False
 
 
-def check_port(conn: sqlite3.Connection, port: int) -> Decision:
+def check_port(
+    conn: sqlite3.Connection, port: int, *, owner_pid: int | None = None
+) -> Decision:
     """Return whether a port is available for a new claim.
 
     Two independent authorities, both required:
@@ -133,6 +135,14 @@ def check_port(conn: sqlite3.Connection, port: int) -> Decision:
     Either alone is insufficient: an unregistered listener must still block,
     and a registered-but-dead claim is handled by the registry path's holder
     record (discover/clean reaps dead PIDs elsewhere).
+
+    ``owner_pid`` is for the one caller that is not asking "may I bind this?":
+    ``discover``, which has just FOUND a live listener and is registering it.
+    For that caller the OS holding the port is the premise, not a conflict —
+    the port is held by the very process being registered. Without this, the
+    OS probe made discover unable to register any listener at all, because
+    every listener holds its own port. The registry half still applies: a
+    DIFFERENT registered process claiming the port is a real conflict.
     """
     holder = registry.get_process_by_port(conn, port)
     if holder is not None:
@@ -141,7 +151,7 @@ def check_port(conn: sqlite3.Connection, port: int) -> Decision:
             reason=f"port {port} claimed by PID {holder['pid']} ({holder['name']})",
             holder=holder,
         )
-    if os_port_held(port):
+    if owner_pid is None and os_port_held(port):
         return Decision(
             allowed=False,
             reason=(
@@ -378,12 +388,13 @@ def preflight_register(
     current_session_id: str | None = None,
     write_scopes: list[str] | tuple[str, ...] | None = None,
     exclusive_repo_lock: bool = False,
+    owner_pid: int | None = None,
 ) -> list[Decision]:
     """Run all checks before registration. Returns list of failed decisions (empty = all clear)."""
     failures: list[Decision] = []
 
     if port is not None:
-        d = check_port(conn, port)
+        d = check_port(conn, port, owner_pid=owner_pid)
         if not d.allowed:
             failures.append(d)
 
