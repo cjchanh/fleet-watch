@@ -1,6 +1,7 @@
 """Tests for the referee — claim logic and budget enforcement."""
 
 import os
+import socket
 import sqlite3
 
 from fleet_watch import events, referee, registry
@@ -17,19 +18,90 @@ def _fresh_conn() -> sqlite3.Connection:
     return conn
 
 
+def _free_ephemeral_port() -> int:
+    """Bind 0, read the OS-assigned free port, release it. Race-tolerant for tests."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def test_port_available():
     conn = _fresh_conn()
-    d = referee.check_port(conn, 8100)
+    port = _free_ephemeral_port()
+    d = referee.check_port(conn, port)
     assert d.allowed is True
+    assert d.reason == "port available"
 
 
 def test_port_taken():
     conn = _fresh_conn()
-    registry.register_process(conn, pid=1234, name="mlx", workstream="ws", port=8100)
-    d = referee.check_port(conn, 8100)
+    port = _free_ephemeral_port()
+    registry.register_process(conn, pid=1234, name="mlx", workstream="ws", port=port)
+    d = referee.check_port(conn, port)
     assert d.allowed is False
     assert d.holder is not None
     assert d.holder["pid"] == 1234
+
+
+def test_port_held_by_os_unregistered_is_denied():
+    """Registry-empty + OS-held must refuse — the 8765 fail-open class.
+
+    Proof shape (production): fleet guard --json --port 8765 returned
+    allowed:true while socket.bind raised [Errno 48]. This test holds a real
+    listener, leaves the registry empty, and asserts check_port refuses with
+    the OS reason. Mutation-tested: without os_port_held in check_port, this
+    assertion fails (allowed becomes True).
+    """
+    conn = _fresh_conn()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    try:
+        # Positive control: OS really holds it.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port))
+            raise AssertionError("positive control failed: OS did not hold port")
+        except OSError:
+            pass
+        finally:
+            probe.close()
+
+        d = referee.check_port(conn, port)
+        assert d.allowed is False, (
+            "registry was empty but OS held the port — must refuse, not "
+            f"clear (got allowed={d.allowed!r} reason={d.reason!r})"
+        )
+        assert "not in fleet registry" in d.reason
+        assert "registry absence is not availability" in d.reason
+        assert d.holder is None
+    finally:
+        listener.close()
+
+
+def test_os_port_held_true_when_listening():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    try:
+        assert referee.os_port_held(port) is True
+    finally:
+        listener.close()
+
+
+def test_os_port_held_false_when_free():
+    port = _free_ephemeral_port()
+    assert referee.os_port_held(port) is False
+
+
+def test_os_port_held_refuses_invalid_port():
+    """Bad port numbers are not 'available' — fail closed."""
+    assert referee.os_port_held(0) is True
+    assert referee.os_port_held(-1) is True
+    assert referee.os_port_held(70000) is True
 
 
 def test_repo_available():
