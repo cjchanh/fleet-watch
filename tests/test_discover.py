@@ -295,6 +295,14 @@ def test_sync_reassigns_parent_to_listener(tmp_path, monkeypatch):
         raise FileNotFoundError("tnr not found")
 
     monkeypatch.setattr(discover.subprocess, "run", _fake_thunder)
+    # The referee verifies that a registering PID really owns its port, so
+    # this fixture must declare the socket table it is pretending to have
+    # discovered. Without it the test reads the HOST's table, where 4343 is
+    # owned by whatever is really running — an unisolated fixture, not a
+    # defect in the reassignment logic under test.
+    monkeypatch.setattr(
+        discover.referee, "socket_table_listeners", lambda: [(1242, 4343)]
+    )
 
     result = discover.sync(conn)
 

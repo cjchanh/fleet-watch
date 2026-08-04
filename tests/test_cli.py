@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -1128,3 +1129,94 @@ def test_census_emit_launchd_plist_warns_when_installed_fleet_lacks_census(monke
     assert "io.fleet-watch.census" in result.output  # plist still emitted
     assert "does not support `census`" in result.stderr
     assert "reinstall" in result.stderr.lower()
+
+
+# --- Port truth at the CLI boundary ----------------------------------------
+
+
+def _held_port():
+    """A real listener on an OS-assigned port, plus the socket keeping it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    return sock, int(sock.getsockname()[1])
+
+
+def test_check_port_survives_an_os_held_port_with_no_registry_row(tmp_path, monkeypatch):
+    """`fleet check --port` crashed on the exact case the check exists for.
+
+    The OS-held branch returns holder=None and the CLI read
+    decision.holder['pid'] unconditionally: TypeError, 'NoneType' object is
+    not subscriptable. The one input the guard was built to catch was the one
+    that took the CLI down.
+    """
+    _patch_paths(monkeypatch, tmp_path)
+    sock, port = _held_port()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli_module.cli, ["check", "--port", str(port)])
+
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            f"check must report, not raise (got {result.exception!r})"
+        )
+        assert result.exit_code == 1
+        assert "TAKEN" in result.stderr
+    finally:
+        sock.close()
+
+    # Positive control: the same command on a now-free port reports available,
+    # so the exit 1 above came from the listener and not from any port failing.
+    result = CliRunner().invoke(cli_module.cli, ["check", "--port", str(port)])
+    assert result.exit_code == 0
+    assert "available" in result.output
+
+
+def test_guard_json_denies_an_os_held_port_with_no_registry_row(tmp_path, monkeypatch):
+    """The operator guardrail is `allowed: false -> stop`; it must fire here."""
+    _patch_paths(monkeypatch, tmp_path)
+    sock, port = _held_port()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli_module.cli, ["guard", "--port", str(port), "--json"])
+
+        payload = json.loads(result.output)
+        assert payload["allowed"] is False
+        assert payload["checks"]["port"]["holder"] is None
+        assert port not in payload["checks"]["port"]["suggested_ports"], (
+            "denied the port, then suggested it"
+        )
+    finally:
+        sock.close()
+
+
+def test_register_can_claim_a_port_the_registering_process_holds(tmp_path, monkeypatch):
+    """The documented explicit-registration path, refused by the OS probe.
+
+    Without this the registry can never learn about a live listener, and the
+    registry is what lets `guard` name a holder PID.
+    """
+    _patch_paths(monkeypatch, tmp_path)
+    sock, port = _held_port()
+    try:
+        runner = CliRunner()
+
+        # Impostor FIRST, against an empty registry — otherwise the registry
+        # half denies it and this proves nothing about ownership verification.
+        impostor = runner.invoke(cli_module.cli, [
+            "register", "--pid", "2147483646", "--name", "impostor",
+            "--workstream", "test", "--port", str(port),
+        ])
+        assert impostor.exit_code == 1, (
+            "a PID that does not hold the port must not be able to register it"
+        )
+        assert "DENY" in impostor.stderr
+
+        # The real holder is accepted, so the refusal above is about identity
+        # and not a blanket refusal of every registration on a held port.
+        result = runner.invoke(cli_module.cli, [
+            "register", "--pid", str(os.getpid()), "--name", "probe",
+            "--workstream", "test", "--port", str(port),
+        ])
+        assert result.exit_code == 0, f"self-registration refused: {result.stderr}"
+    finally:
+        sock.close()

@@ -129,101 +129,21 @@ def preferred_ports(config: dict[str, Any] | None = None) -> list[int]:
 
 
 def _get_listeners() -> dict[int, int]:
-    """Return {pid: port} for all TCP listeners."""
-    result = _get_listeners_from_ss()
-    if result:
-        return result
+    """Return {pid: port} for all TCP listeners.
 
-    result = _get_listeners_from_netstat()
-    if result:
-        return result
+    Reads the socket table through ``referee.socket_table_listeners`` — the
+    same enumeration the referee uses to VERIFY that a discovered PID really
+    owns the port it is about to be registered on. Sharing one reader is the
+    point: if the finder and the verifier read different tables, discovery
+    can register a listener the verifier will then refuse.
 
-    return _get_listeners_from_lsof()
-
-
-def _get_listeners_from_ss() -> dict[int, int]:
-    """Fallback TCP listener discovery for platforms where lsof is unavailable."""
+    The dict keeps the historical shape (first port seen per PID) and is
+    lossy for a process listening on several ports; ownership verification
+    uses the full pair list instead, so nothing depends on this narrowing.
+    """
     result: dict[int, int] = {}
-    try:
-        out = subprocess.run(
-            ["ss", "-ltnp"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return result
-    if out.returncode != 0:
-        return result
-
-    for line in out.stdout.splitlines():
-        if "LISTEN" not in line or "pid=" not in line:
-            continue
-        port_match = re.search(r":(\d+)\s", line)
-        pid_match = re.search(r"pid=(\d+)", line)
-        if not port_match or not pid_match:
-            continue
-        pid = int(pid_match.group(1))
-        port = int(port_match.group(1))
+    for pid, port in referee.socket_table_listeners() or ():
         result.setdefault(pid, port)
-    return result
-
-
-def _get_listeners_from_netstat() -> dict[int, int]:
-    """Parse macOS netstat output into a pid->port mapping."""
-    result: dict[int, int] = {}
-    try:
-        out = subprocess.run(
-            ["netstat", "-anv", "-p", "tcp"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return result
-    if out.returncode != 0:
-        return result
-
-    for line in out.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 11 or parts[0] not in {"tcp4", "tcp6", "tcp46"}:
-            continue
-        if parts[5] != "LISTEN":
-            continue
-        port_match = re.search(r"\.(\d+)$", parts[3])
-        pid_match = re.search(r":(\d+)$", parts[10])
-        if not port_match or not pid_match:
-            continue
-        pid = int(pid_match.group(1))
-        port = int(port_match.group(1))
-        result.setdefault(pid, port)
-    return result
-
-
-def _get_listeners_from_lsof() -> dict[int, int]:
-    """System-wide lsof fallback for platforms without ss/netstat support."""
-    result: dict[int, int] = {}
-    try:
-        out = subprocess.run(
-            ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return result
-    if out.returncode != 0:
-        return result
-
-    current_pid = None
-    for line in out.stdout.splitlines():
-        if line.startswith("p"):
-            current_pid = int(line[1:])
-        elif line.startswith("n") and current_pid is not None:
-            # Parse "n127.0.0.1:8100" or "n*:8100"
-            match = re.search(r":(\d+)\b", line)
-            if match:
-                port = int(match.group(1))
-                if current_pid not in result:
-                    result[current_pid] = port
     return result
 
 
@@ -706,7 +626,10 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
                 repo_dir=None,
                 # discover FOUND this listener — it is the port's holder, not a
                 # rival for it. Without this the OS probe rejects every live
-                # listener for holding the port it was discovered on.
+                # listener for holding the port it was discovered on, so
+                # discover registers nothing and `guard` loses the only source
+                # that lets it name a holder PID. The referee re-checks the
+                # claim against the socket table; it is not taken on trust.
                 owner_pid=proc.pid,
             )
             if failures:
