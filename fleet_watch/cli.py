@@ -759,6 +759,13 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
         gpu_mb=gpu_mb,
         repo_dir=repo_dir,
         current_session_id=session_id,
+        # A process registering a port it ALREADY holds is the documented
+        # explicit path ("Use `fleet register` when explicit claims are more
+        # reliable than discovery"), and it was refused with "port held by the
+        # OS" — held by the very PID being registered. The referee verifies
+        # this PID against the socket table, so a fabricated --pid cannot use
+        # it to switch the OS check off.
+        owner_pid=pid,
     )
     if failures:
         for f in failures:

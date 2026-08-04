@@ -123,6 +123,36 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+# Below macOS's ephemeral range (net.inet.ip.portrange.first, 49152). Fixture
+# ports MUST live here. `_free_port()` returns an EPHEMERAL port, and these
+# fixtures then assumed port+1..port+N were free too. Both halves are unsafe
+# now that suggestions are OS-checked: the neighbours were never verified, and
+# even a verified ephemeral port can be taken moments later as the SOURCE port
+# of an outbound connection — `_wait_for_port` opens one on every test. That is
+# exactly what was observed: the last port of a verified run kept disappearing
+# between setup and assertion, which reads as a suggestion bug and is not one.
+_FIXTURE_PORT_BASE = 39000
+_FIXTURE_PORT_CEILING = 49000
+
+
+def _free_port_run(count: int) -> list[int]:
+    """``count`` consecutive non-ephemeral ports proven bindable right now."""
+    for base in range(_FIXTURE_PORT_BASE, _FIXTURE_PORT_CEILING - count, count):
+        held: list[socket.socket] = []
+        try:
+            for offset in range(count):
+                sock = socket.socket()
+                sock.bind(("127.0.0.1", base + offset))
+                held.append(sock)
+        except OSError:
+            continue
+        finally:
+            for sock in held:
+                sock.close()
+        return [base + offset for offset in range(count)]
+    raise AssertionError(f"no run of {count} consecutive free ports available")
+
+
 def _wait_for_port(port: int, timeout: float = 5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -190,8 +220,9 @@ def _sleep_process():
 
 def test_discover_finds_live_listener_and_cleans_dead_process(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    port = _free_port()
-    _write_test_config(tmp_path, preferred_ports=[port, port + 1, port + 2, port + 3])
+    preferred = _free_port_run(4)
+    port = preferred[0]
+    _write_test_config(tmp_path, preferred_ports=preferred)
     runner = CliRunner()
 
     with _listener_process(port) as proc:
@@ -216,8 +247,9 @@ def test_discover_finds_live_listener_and_cleans_dead_process(tmp_path, monkeypa
 
 def test_discover_cleans_dead_listener_on_second_sync(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    port = _free_port()
-    _write_test_config(tmp_path, preferred_ports=[port, port + 1, port + 2, port + 3])
+    preferred = _free_port_run(4)
+    port = preferred[0]
+    _write_test_config(tmp_path, preferred_ports=preferred)
     runner = CliRunner()
 
     with _listener_process(port) as proc:
@@ -299,8 +331,8 @@ def test_register_denies_gpu_claim_exceeding_budget(tmp_path, monkeypatch):
 
 def test_guard_json_reports_holder_and_suggested_ports_for_taken_port(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    port = _free_port()
-    preferred = [port, port + 1, port + 2, port + 3, port + 4, port + 5]
+    preferred = _free_port_run(6)
+    port = preferred[0]
     _write_test_config(tmp_path, preferred_ports=preferred)
     runner = CliRunner()
 
@@ -377,8 +409,8 @@ def test_status_json_shows_live_process_then_clean_removes_it(tmp_path, monkeypa
 
 def test_discover_writes_state_json_with_required_contract_fields(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    port = _free_port()
-    preferred = [port, port + 1, port + 2, port + 3, port + 4, port + 5]
+    preferred = _free_port_run(6)
+    port = preferred[0]
     _write_test_config(tmp_path, preferred_ports=preferred)
     runner = CliRunner()
 
