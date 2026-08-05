@@ -76,6 +76,18 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "suggested_max_mb",
         "working_set",
         "detail",
+        # Added deliberately: available_mb is no longer ledger arithmetic, so
+        # the payload must say what produced it. Additive only — the
+        # fleet_guard_hook consumer reads keys via .get(), never a key set.
+        "provenance",
+    }
+    assert set(payload["checks"]["gpu"]["provenance"].keys()) == {
+        "ledger_allocated_mb",
+        "telemetry_resident_mb",
+        "telemetry_status",
+        "telemetry_sources",
+        "unmeasured_runtimes",
+        "detail",
     }
     assert set(payload["checks"]["memory_pressure"].keys()) == {
         "allowed",

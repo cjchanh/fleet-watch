@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import signal
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -430,21 +434,286 @@ def check_port(
     return Decision(allowed=False, reason=reason, holder=None)
 
 
+# ── Repo occupancy: writer evidence independent of the registry ──────────────
+#
+# WHY THIS EXISTS. ``check_repo`` had the same shape the port bug had. Its only
+# authority was ``registry.get_process_by_repo``, and the ``os.kill(pid, 0)``
+# liveness probe was reachable ONLY AFTER that lookup returned a row — a
+# liveness check ON A REGISTRY ROW, never an independent one. Measured on this
+# host 2026-08-04: a live process holding ``<repo>/.git/index.lock`` open (its
+# PID visible to ``lsof``) produced ``check_repo(...) -> allowed=True,
+# reason="repo available"``. Registry absence was being reported as vacancy,
+# in the direction operators rely on ("allowed: false -> stop").
+#
+# WHAT COUNTS AS EVIDENCE — the load-bearing judgement here, because a wrong
+# signal produces false refusals that teach the operator to ignore the guard,
+# which is strictly worse than the disclosed gap. Three candidate signals were
+# evaluated against one question: does this prove a WRITER, or merely activity?
+#
+#   * A live process whose cwd is inside the repo — REJECTED. Proves presence,
+#     not writing. Every terminal tab, editor, file browser and ``tail`` would
+#     match. On this machine that is a near-permanent false DENY.
+#   * An uncommitted, recently-modified tree — REJECTED. Proves PAST activity,
+#     and never clears: every active dev repo is dirty by construction.
+#   * A git lockfile whose fd is held open by a LIVE process — ACCEPTED. Git
+#     creates these O_CREAT|O_EXCL and holds the descriptor until the write
+#     commits or rolls back, so an attributable holder is a writer by
+#     construction, in exactly the window where a second writer does damage.
+#
+# WHY ATTRIBUTION IS MANDATORY AND PRESENCE IS NOT ENOUGH. Measured on this
+# machine 2026-08-04: ``~/Workspace/active/flight-atlas/.git/index.lock`` —
+# 0 bytes, 171.6 hours old, zero open file descriptors. Crash debris from a
+# week earlier sitting in a live repo. A "lockfile present => DENY" rule would
+# have refused that repo permanently and for nothing. Only a lock we can
+# attribute to a live PID denies.
+#
+# WHY A POSITIVE CONTROL IS REQUIRED. "lsof found no holder" and "lsof did not
+# work" are the SAME observation: exit status 1 with empty stdout. An absence
+# claim is worthless until the same search finds a known instance — so when a
+# lock exists and no holder is found, the probe re-runs the identical query
+# against a file THIS process is holding open. Control passes => the empty
+# answer was a real measurement (stale debris; no DENY, per flight-atlas).
+# Control fails => we genuinely cannot measure (UNDETERMINED; DENY).
+#
+# HONEST SCOPE. This detects git's whole-repo write locks. A non-git writer
+# (an editor saving a file, an agent writing source directly) holds no lock and
+# remains undetectable; so does a single-ref update under ``.git/refs/``, which
+# is both unbounded to scan and not a whole-repo write. ``allowed: true`` from
+# this probe therefore means "no registered holder AND no live git writer",
+# never "nobody is writing" — and the decision reason says so rather than
+# leaving it to a docstring the operator never reads.
+
+REPO_WRITER_NONE = "none"
+REPO_WRITER_HELD = "held"
+REPO_WRITER_STALE = "stale"
+REPO_WRITER_UNDETERMINED = "undetermined"
+
+# Git lockfiles that represent a WHOLE-REPO write in progress. Per-ref locks
+# under .git/refs/ are deliberately excluded: scanning them is unbounded (a repo
+# may hold thousands of loose refs) and a single ref update does not conflict
+# with another session's file edits.
+_GIT_WHOLE_REPO_LOCKS: tuple[str, ...] = (
+    "index.lock",
+    "HEAD.lock",
+    "config.lock",
+    "packed-refs.lock",
+    "MERGE_HEAD.lock",
+    "ORIG_HEAD.lock",
+    "shallow_lock",
+)
+
+
+@dataclass(frozen=True)
+class RepoWriterProbe:
+    """What the filesystem says about a live git writer in one repo.
+
+    ``status`` separates four answers a boolean would conflate: ``held`` (a
+    live PID holds a git lock open), ``stale`` (a lock exists and was POSITIVELY
+    proven unheld), ``undetermined`` (a lock exists and attribution failed), and
+    ``none`` (no lock to attribute — which is not proof of no writer, only the
+    absence of this particular evidence).
+    """
+
+    status: str
+    detail: str
+    pids: tuple[int, ...] = ()
+    lock_path: str | None = None
+
+    @property
+    def blocks(self) -> bool:
+        """True when this probe must refuse — proven writer or failed measurement."""
+        return self.status in (REPO_WRITER_HELD, REPO_WRITER_UNDETERMINED)
+
+
+def _git_dir(repo_dir: str) -> Path | None:
+    """Resolve a repo's git directory, or ``None`` when there is not one.
+
+    Handles the worktree/submodule form where ``.git`` is a FILE containing
+    ``gitdir: <path>`` rather than a directory — those are exactly the repos a
+    parallel-worktree operator runs, so missing them would blind the probe on
+    its most important case.
+    """
+    try:
+        base = Path(repo_dir).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    dot_git = base / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git
+        if dot_git.is_file():
+            text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if not text.startswith("gitdir:"):
+                return None
+            target = Path(text.split(":", 1)[1].strip()).expanduser()
+            if not target.is_absolute():
+                target = base / target
+            resolved = target.resolve()
+            return resolved if resolved.is_dir() else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _open_file_holders(path: Path) -> set[int] | None:
+    """PIDs holding ``path`` open, or ``None`` if the query could not run.
+
+    ``None`` (tool absent/timed out) is distinct from an empty set (the tool ran
+    and attributed the file to nobody). The caller must never read an empty set
+    as "no holder" without first passing the positive control — lsof exits 1
+    with empty stdout both when it finds nothing and when it fails.
+    """
+    try:
+        completed = subprocess.run(
+            ["lsof", "-t", "--", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+        return None
+    pids: set[int] = set()
+    for line in completed.stdout.split():
+        if line.isdigit():
+            pids.add(int(line))
+    return pids
+
+
+def _lsof_can_attribute_open_files() -> bool:
+    """Positive control: can lsof see a file THIS process is holding open?
+
+    Run only when a lock exists and no holder was found, to tell a real empty
+    answer (stale debris) from a broken measurement. Uses the identical query
+    shape as the real lookup — a control that took a different path would prove
+    nothing about the path that produced the absence.
+    """
+    handle = None
+    control_path: str | None = None
+    try:
+        fd, control_path = tempfile.mkstemp(prefix="fleet_watch_lsof_control_")
+        handle = os.fdopen(fd, "w")
+        handle.write("fleet-watch lsof positive control")
+        handle.flush()
+        holders = _open_file_holders(Path(control_path))
+        return holders is not None and os.getpid() in holders
+    except OSError:
+        return False
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if control_path is not None:
+            try:
+                os.unlink(control_path)
+            except OSError:
+                pass
+
+
+def probe_repo_writers(repo_dir: str) -> RepoWriterProbe:
+    """Ask the filesystem whether a live git writer holds this repo right now.
+
+    The registry-independent half of the repo decision — the analogue of
+    ``probe_port`` for repos. See the section comment above for why a held git
+    lockfile is the only one of three candidate signals that proves a WRITER,
+    and why attribution (not presence) is the load-bearing step.
+    """
+    git_dir = _git_dir(repo_dir)
+    if git_dir is None:
+        return RepoWriterProbe(
+            REPO_WRITER_NONE,
+            f"{repo_dir} is not a git working tree — no git lock to attribute",
+        )
+
+    present: list[Path] = []
+    for name in _GIT_WHOLE_REPO_LOCKS:
+        candidate = git_dir / name
+        try:
+            if candidate.exists():
+                present.append(candidate)
+        except OSError:
+            continue
+    if not present:
+        return RepoWriterProbe(
+            REPO_WRITER_NONE,
+            f"no git write lock present in {git_dir}",
+        )
+
+    unattributed: list[Path] = []
+    for lock in present:
+        holders = _open_file_holders(lock)
+        if holders is None:
+            return RepoWriterProbe(
+                REPO_WRITER_UNDETERMINED,
+                (
+                    f"a git write lock exists at {lock} but its holder could not "
+                    f"be looked up (lsof unavailable)"
+                ),
+                lock_path=str(lock),
+            )
+        if holders:
+            return RepoWriterProbe(
+                REPO_WRITER_HELD,
+                (
+                    f"PID(s) {sorted(holders)} hold {lock} open — a git write is "
+                    f"in progress in this repo"
+                ),
+                pids=tuple(sorted(holders)),
+                lock_path=str(lock),
+            )
+        try:
+            still_there = lock.exists()
+        except OSError:
+            still_there = True
+        if still_there:
+            unattributed.append(lock)
+
+    if not unattributed:
+        # Every lock cleared while we were looking — the write finished.
+        return RepoWriterProbe(
+            REPO_WRITER_NONE,
+            f"git write lock(s) in {git_dir} cleared during the probe",
+        )
+
+    if _lsof_can_attribute_open_files():
+        return RepoWriterProbe(
+            REPO_WRITER_STALE,
+            (
+                f"git write lock(s) {[str(p) for p in unattributed]} exist but no "
+                f"process holds them open (verified: the same lookup does find "
+                f"this process's own open file) — stale lock, not a live writer"
+            ),
+            lock_path=str(unattributed[0]),
+        )
+    return RepoWriterProbe(
+        REPO_WRITER_UNDETERMINED,
+        (
+            f"a git write lock exists at {unattributed[0]} and no holder was "
+            f"found, but the lookup could not find this process's own open file "
+            f"either — the empty answer is unverified, so it is not evidence of "
+            f"a stale lock"
+        ),
+        lock_path=str(unattributed[0]),
+    )
+
+
 def check_repo(conn: sqlite3.Connection, repo_dir: str) -> Decision:
     """Return whether a repo path is available without session context.
 
     PROVENANCE — read before trusting an ``allowed=True`` from this call.
-    The answer is derived from the Fleet Watch registry (process rows,
-    external-resource rows, session leases) plus a liveness probe
-    (``os.kill(pid, 0)``) of holders the registry already knows about. There
-    is no OS-level equivalent of the port bind here: a checkout, editor, or
-    agent writing to this repo without a Fleet Watch registration is
-    INVISIBLE to this decision and will be reported as "repo available".
+    Two independent authorities are consulted, mirroring :func:`check_port`:
+    the Fleet Watch registry (process rows, external-resource rows, session
+    leases, each verified live) and the filesystem (:func:`probe_repo_writers`,
+    which attributes git write locks to live PIDs).
 
-    So the guardrail is asymmetric, and only one half is load-bearing:
-    ``allowed: false`` is evidence (a holder was found) and means stop;
-    ``allowed: true`` means "no REGISTERED holder", not "no holder".
-    Behaviour is unchanged by this note — the disclosure is the fix.
+    The asymmetry that remains is REAL and narrower than it was: a live git
+    write is now visible without any registration, but a non-git writer — an
+    editor saving a file, an agent writing source directly — holds no lock and
+    is still undetectable. ``allowed: false`` is evidence and means stop;
+    ``allowed: true`` means "no registered holder and no live git writer", not
+    "nobody is writing". The decision reason carries that provenance so it does
+    not depend on a reader finding this docstring.
     """
     return check_repo_with_session(conn, repo_dir, current_session_id=None)
 
@@ -458,12 +727,34 @@ def check_repo_with_session(
 ) -> Decision:
     """Return whether a repo path is available for the current session.
 
-    PROVENANCE: registry-only, same asymmetry as :func:`check_repo` — an
-    unregistered writer on this path cannot be seen by this decision, so
-    ``allowed: true`` means "no registered holder", not "nobody is writing".
+    PROVENANCE: registry + filesystem writer probe, same asymmetry as
+    :func:`check_repo` — an unregistered NON-GIT writer on this path still
+    cannot be seen, so ``allowed: true`` means "no registered holder and no
+    live git writer", not "nobody is writing".
     """
     resolved_repo_dir = str(Path(repo_dir).resolve())
     requested_scopes = normalize_write_scopes(resolved_repo_dir, write_scopes)
+
+    # Authority 1: the filesystem, independent of any registration. Checked
+    # FIRST and unconditionally — including against the current session, which
+    # is not an exemption but the honest answer: if a git write is in flight
+    # here, "wait" is correct no matter who started it, and the refusal names
+    # the PID and clears itself the moment the write finishes.
+    writer_probe = probe_repo_writers(resolved_repo_dir)
+    if writer_probe.blocks:
+        if writer_probe.status == REPO_WRITER_HELD:
+            reason = (
+                f"repo {resolved_repo_dir} has a git write in progress "
+                f"(not in fleet registry) — {writer_probe.detail}; registry "
+                f"absence is not availability"
+            )
+        else:
+            reason = (
+                f"repo {resolved_repo_dir} availability is undetermined — "
+                f"{writer_probe.detail}; refusing rather than guessing"
+            )
+        return Decision(allowed=False, reason=reason)
+
     holder = registry.get_process_by_repo(conn, resolved_repo_dir)
     if holder is None:
         external_holders = registry.get_external_resources_by_repo(conn, repo_dir)
@@ -574,17 +865,32 @@ def check_repo_with_session(
                 holder=external,
             )
         return Decision(allowed=True, reason="repo available (owned by current session)")
-    # Check if holder PID is still alive
-    try:
-        os.kill(holder["pid"], 0)
-    except ProcessLookupError:
-        # Holder is dead — auto-release
+    # Is the holder row's PID still the process that registered it?
+    #
+    # This was ``os.kill(holder["pid"], 0)``, which asks only "does this integer
+    # name a live process". It is not create-time aware, so a RECYCLED pid read
+    # as alive and the guard kept refusing the repo in a dead holder's name —
+    # and, worse, kept naming that PID authoritatively to an operator who may
+    # act on it. The session-lease path above has defeated PID reuse since
+    # Path C via ``registry._lease_owner_alive``; this path could not even in
+    # principle until ``processes.start_create_time`` existed to compare against.
+    #
+    # Direction of failure is preserved: ``process_owner_alive`` declares death
+    # only on positive evidence (PID gone, or create-time provably different)
+    # and degrades to PID existence on any unreadable evidence, so an error here
+    # keeps blocking rather than releasing another writer's lock.
+    if not registry.process_owner_alive(holder):
+        # The PID still existing while the owner is provably gone is the
+        # recycling case specifically; record which one it was, because the two
+        # need different operator responses.
+        recycled = registry._pid_exists(holder["pid"])
         registry.release_process(conn, holder["pid"])
         events.log_event(conn, "CLEAN", pid=holder["pid"], workstream=holder["workstream"],
-                         detail={"reason": "dead_pid", "repo_dir": repo_dir})
+                         detail={
+                             "reason": "recycled_pid" if recycled else "dead_pid",
+                             "repo_dir": repo_dir,
+                         })
         return Decision(allowed=True, reason="repo available (stale lock cleared)")
-    except PermissionError:
-        pass  # Process exists
 
     # Same-session bypass for local processes
     if current_session_id and holder.get("session_id") == current_session_id:
@@ -597,34 +903,204 @@ def check_repo_with_session(
     )
 
 
-def check_gpu_budget(conn: sqlite3.Connection, gpu_mb: int) -> Decision:
-    """Return whether a raw GPU budget claim fits the current ledger.
+# ── GPU residency: what the device actually holds ────────────────────────────
+#
+# WHY THIS EXISTS. ``check_gpu_budget`` consulted ``registry.get_gpu_budget``
+# and nothing else — arithmetic over DECLARED MB. A workload that never
+# registered was invisible and did not reduce ``available_mb``. Measured on
+# this host 2026-08-04: Ollama held 11,601MB resident (qwen3:8b at 11,249MB
+# plus nomic-embed-text at 352MB) while the ledger reported 0MB allocated and
+# 114,688MB available. The operator's standing rule is ``fleet guard --gpu``
+# with "avoid LOCAL-OLLAMA >5GB beside LOCAL-GPU"; a ledger that cannot see the
+# consumer cannot serve that rule, and this one could not see an 11GB model.
+#
+# The telemetry was not missing, only unwired: ``discover._query_ollama_vram``
+# has read ``/api/ps`` on every ``fleet discover`` (every 60s under launchd)
+# since long before this fix.
+#
+# READ-ONLY, AND THAT IS LOAD-BEARING. ``GET /api/ps`` enumerates models that
+# are ALREADY resident. It does not start the server, load, evict, or pull a
+# model; ``/api/generate``, ``/api/chat`` and ``/api/pull`` would, and are never
+# called from here. A guard that perturbed the resource it measures would be
+# unusable.
+#
+# WHY refused-connection IS A MEASUREMENT AND TIMEOUT IS NOT. The same
+# distinction ``socket_table_listeners`` draws between ``None`` and ``[]``: if
+# nothing is listening on the Ollama port, Ollama is not running, and a runtime
+# that is not running holds no VRAM — that is a determinate 0, not an unknown.
+# A timeout or an unparseable body is a FAILED MEASUREMENT, and a failed
+# measurement must never be reported as headroom.
+#
+# HONEST BLIND SPOT. This reads Ollama only. MLX (:8100) exposes no VRAM
+# figure — ``/v1/models`` lists names, not residency — and vLLM is not probed,
+# so memory held by either is not counted. The number below is therefore a
+# FLOOR on real consumption, never a ceiling, and the decision reason says so.
 
-    PROVENANCE — the numbers in this decision's ``reason`` are LEDGER
-    arithmetic, not GPU telemetry. ``allocated_mb`` is the sum of what
-    registered processes DECLARED they would use; ``available_mb`` is
-    ``total_mb - reserve_mb - allocated_mb``. Nothing here reads the device.
+GPU_TELEMETRY_MEASURED = "measured"
+GPU_TELEMETRY_UNAVAILABLE = "unavailable"
 
-    Two consequences the operator must not have to infer from the number:
-    an unregistered workload consuming VRAM is invisible and does not reduce
-    ``available_mb``; and a registered process that declared 8000MB while
-    actually using 20000MB is counted at its declaration. ``allowed: true``
-    therefore means "fits the declared ledger", not "the GPU has room".
-    ``allowed: false`` is the load-bearing half and means stop.
-    Behaviour is unchanged by this note — the disclosure is the fix.
+# Runtimes whose residency this probe cannot read. Named explicitly so the
+# blind spot travels with the number instead of living only in a comment.
+GPU_UNMEASURED_RUNTIMES = ("MLX", "vLLM")
+
+
+@dataclass(frozen=True)
+class GpuResidencyProbe:
+    """Live VRAM residency reported by local runtimes, or a failed measurement."""
+
+    status: str
+    resident_mb: int
+    detail: str
+    sources: tuple[str, ...] = ()
+
+    @property
+    def measured(self) -> bool:
+        """True only when every consulted source gave a determinate answer."""
+        return self.status == GPU_TELEMETRY_MEASURED
+
+
+def _ollama_resident_mb(port: int = 11434) -> tuple[int | None, str]:
+    """Resident VRAM in MB from Ollama, or ``(None, why)`` if undeterminable.
+
+    Loopback only (CLAUDE.md Invariant #4 permits local-runtime probes; all
+    egress is forbidden). READ-ONLY: ``/api/ps`` lists resident models and
+    loads nothing.
+    """
+    url = f"http://127.0.0.1:{port}/api/ps"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status != 200:
+                return None, f"ollama /api/ps returned HTTP {resp.status}"
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return None, f"ollama /api/ps returned HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        cause = exc.reason
+        if isinstance(cause, ConnectionRefusedError) or (
+            isinstance(cause, OSError) and cause.errno == errno.ECONNREFUSED
+        ):
+            # Determinate: nothing is listening, so Ollama holds no VRAM.
+            return 0, f"ollama is not running on port {port} — it holds no VRAM"
+        return None, f"ollama /api/ps unreachable: {cause}"
+    except (TimeoutError, OSError, ValueError) as exc:
+        return None, f"ollama /api/ps unreadable: {type(exc).__name__}: {exc}"
+
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return None, "ollama /api/ps returned no 'models' list"
+    total_bytes = 0
+    for model in models:
+        if not isinstance(model, dict):
+            return None, "ollama /api/ps returned a malformed model entry"
+        size_vram = model.get("size_vram")
+        if not isinstance(size_vram, int) or isinstance(size_vram, bool):
+            # A model resident with no readable size means the total would
+            # UNDERSTATE consumption. Under-counting is the defect being fixed,
+            # so this is a failed measurement, not a zero.
+            return None, (
+                f"ollama /api/ps reported model "
+                f"{model.get('name', '<unnamed>')!r} without a readable "
+                f"size_vram"
+            )
+        total_bytes += size_vram
+    resident_mb = total_bytes // (1024 * 1024)
+    return resident_mb, (
+        f"ollama /api/ps reports {len(models)} model(s) resident "
+        f"totalling {resident_mb}MB"
+    )
+
+
+def probe_gpu_residency(ollama_port: int = 11434) -> GpuResidencyProbe:
+    """Measure VRAM currently held by local runtimes this host can report.
+
+    Returns ``GPU_TELEMETRY_UNAVAILABLE`` when a source was reachable but
+    unreadable — a state the caller must refuse on, never round down to zero.
+    """
+    resident_mb, detail = _ollama_resident_mb(ollama_port)
+    if resident_mb is None:
+        return GpuResidencyProbe(
+            GPU_TELEMETRY_UNAVAILABLE, 0, detail, sources=("ollama",)
+        )
+    return GpuResidencyProbe(
+        GPU_TELEMETRY_MEASURED, resident_mb, detail, sources=("ollama",)
+    )
+
+
+def check_gpu_budget(
+    conn: sqlite3.Connection,
+    gpu_mb: int,
+    *,
+    residency: GpuResidencyProbe | None = None,
+) -> Decision:
+    """Return whether a GPU claim fits both the ledger and the device.
+
+    Two independent authorities, mirroring :func:`check_port`:
+    1. Fleet ledger — the sum of what registered processes DECLARED.
+    2. Live telemetry — VRAM local runtimes report actually resident.
+
+    They are combined with ``max``, not a sum: a REGISTERED Ollama appears in
+    both, so adding them would double-count it and manufacture false refusals,
+    while an UNREGISTERED consumer appears only in telemetry. ``max`` is the
+    conservative floor that never double-counts and never under-counts the
+    single-consumer case that was measured failing.
+
+    Remaining honest limit: a registered non-Ollama process declaring 8GB
+    beside an unregistered Ollama holding 12GB reads as 12GB, not 20GB, and
+    MLX/vLLM residency is not readable at all. So the number is a FLOOR on real
+    consumption. ``allowed: false`` is evidence and means stop; ``allowed:
+    true`` means "fits the larger of the declared ledger and the residency we
+    can see". Telemetry that cannot be read refuses outright rather than
+    silently falling back to a confident ledger-only allow.
+
+    ``residency`` is injectable so tests assert against a stated device state
+    instead of whatever this host happens to be running.
     """
     if gpu_mb <= 0:
         return Decision(allowed=True, reason="no GPU claim")
+
     budget = registry.get_gpu_budget(conn)
-    if gpu_mb <= budget["available_mb"]:
-        return Decision(allowed=True, reason=f"{gpu_mb}MB fits in {budget['available_mb']}MB available")
+    probe = residency if residency is not None else probe_gpu_residency()
+    unmeasured = "/".join(GPU_UNMEASURED_RUNTIMES)
+
+    if not probe.measured:
+        # Fail closed. The ledger still has a number here, and returning it
+        # would be the original defect wearing a confident face.
+        return Decision(
+            allowed=False,
+            reason=(
+                f"GPU headroom for {gpu_mb}MB is undetermined — {probe.detail}; "
+                f"the ledger's {budget['available_mb']}MB counts only DECLARED MB "
+                f"and cannot see the device, so it is not headroom. Refusing "
+                f"rather than reporting a ledger as a measurement"
+            ),
+        )
+
+    allocatable_mb = budget["total_mb"] - budget["reserve_mb"]
+    effective_allocated_mb = max(budget["allocated_mb"], probe.resident_mb)
+    available_mb = allocatable_mb - effective_allocated_mb
+    bound_by = (
+        "live telemetry"
+        if probe.resident_mb > budget["allocated_mb"]
+        else "the declared ledger"
+    )
+    provenance = (
+        f"{effective_allocated_mb}MB in use per {bound_by} "
+        f"(ledger declared {budget['allocated_mb']}MB, {probe.detail}); "
+        f"{unmeasured} residency is not measured, so this is a floor"
+    )
+
+    if gpu_mb <= available_mb:
+        return Decision(
+            allowed=True,
+            reason=f"{gpu_mb}MB fits in {available_mb}MB available — {provenance}",
+        )
     return Decision(
         allowed=False,
         reason=(
             f"GPU budget exceeded: requesting {gpu_mb}MB but only "
-            f"{budget['available_mb']}MB available "
-            f"({budget['allocated_mb']}MB allocated of "
-            f"{budget['total_mb'] - budget['reserve_mb']}MB allocatable)"
+            f"{available_mb}MB available "
+            f"({effective_allocated_mb}MB allocated of "
+            f"{allocatable_mb}MB allocatable) — {provenance}"
         ),
     )
 
@@ -709,8 +1185,13 @@ def preflight_register(
     write_scopes: list[str] | tuple[str, ...] | None = None,
     exclusive_repo_lock: bool = False,
     owner_pid: int | None = None,
+    residency: GpuResidencyProbe | None = None,
 ) -> list[Decision]:
-    """Run all checks before registration. Returns list of failed decisions (empty = all clear)."""
+    """Run all checks before registration. Returns list of failed decisions (empty = all clear).
+
+    ``residency`` is forwarded to :func:`check_gpu_budget` so callers (and
+    tests) can state the device residency instead of probing the live host.
+    """
     failures: list[Decision] = []
 
     if port is not None:
@@ -719,7 +1200,7 @@ def preflight_register(
             failures.append(d)
 
     if gpu_mb > 0:
-        d = check_gpu_budget(conn, gpu_mb)
+        d = check_gpu_budget(conn, gpu_mb, residency=residency)
         if not d.allowed:
             failures.append(d)
 
@@ -797,6 +1278,31 @@ def preempt_port(
         return Decision(
             allowed=False,
             reason=f"cannot preempt port {port}: {probe.detail}; {attribution}",
+        )
+
+    # Same PID-recycling defect as check_repo had, but this path ACTS on the
+    # answer by sending SIGTERM. Signalling a registry PID whose owner already
+    # died means killing whatever unrelated process inherited that integer, so
+    # the identity check is verified BEFORE the priority comparison: a dead
+    # holder is not preempted, it is released.
+    if not registry.process_owner_alive(holder):
+        registry.release_process(conn, holder["pid"])
+        events.log_event(
+            conn, "CLEAN",
+            pid=holder["pid"],
+            workstream=holder["workstream"],
+            detail={
+                "reason": "recycled_pid" if registry._pid_exists(holder["pid"]) else "dead_pid",
+                "port": port,
+            },
+        )
+        return Decision(
+            allowed=True,
+            reason=(
+                f"port {port} released without preemption: registered holder PID "
+                f"{holder['pid']} ({holder['name']}) is no longer the process that "
+                f"claimed it — not signalling a PID we cannot prove is the holder"
+            ),
         )
 
     if new_priority <= holder["priority"]:

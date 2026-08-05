@@ -6,7 +6,12 @@
       "port": 4242
     },
     "expected_allowed": false,
-    "expected_reason": "port 4242 claimed by PID 999 (demo)"
+    "expected_reason": "port 4242 claimed by PID 999 (demo)",
+    "short_circuits_before_os": true,
+    "mirrors_python": true,
+    "agrees_on_this_host": true,
+    "python_allowed": false,
+    "python_reason": "port 4242 claimed by PID 999 (demo)"
   },
   {
     "scenario": "port_free",
@@ -15,7 +20,13 @@
       "port": 5000
     },
     "expected_allowed": true,
-    "expected_reason": "port available"
+    "expected_reason": "port available",
+    "short_circuits_before_os": false,
+    "mirrors_python": false,
+    "agrees_on_this_host": true,
+    "python_allowed": true,
+    "python_reason": "port available",
+    "divergence": "COINCIDENTAL AGREEMENT ONLY. The answers happen to match on this host, but the Python path reaches an authority the Rust kernel does not implement, so the match is a property of current host state and not of the code. Evidence: referee.check_port denied an unregistered live listener on an ephemeral port: 'port 59312 held by the OS (not in fleet registry) \u2014 registry absence is not availability'"
   },
   {
     "scenario": "gpu_zero",
@@ -24,7 +35,12 @@
       "gpu_mb": 0
     },
     "expected_allowed": true,
-    "expected_reason": "no GPU claim"
+    "expected_reason": "no GPU claim",
+    "short_circuits_before_os": true,
+    "mirrors_python": true,
+    "agrees_on_this_host": true,
+    "python_allowed": true,
+    "python_reason": "no GPU claim"
   },
   {
     "scenario": "gpu_fits",
@@ -33,7 +49,13 @@
       "gpu_mb": 8192
     },
     "expected_allowed": true,
-    "expected_reason": "8192MB fits in 73728MB available"
+    "expected_reason": "8192MB fits in 73728MB available",
+    "short_circuits_before_os": false,
+    "mirrors_python": false,
+    "agrees_on_this_host": false,
+    "python_allowed": true,
+    "python_reason": "8192MB fits in 73728MB available \u2014 40960MB in use per the declared ledger (ledger declared 40960MB, generator: idle device); MLX/vLLM residency is not measured, so this is a floor",
+    "divergence": "The Rust kernel answers from the registry alone; the Python referee now consults an additional authority (OS socket table for ports, live VRAM residency for GPU). The OS-truth layer was deliberately NOT ported. Evidence: referee.check_port denied an unregistered live listener on an ephemeral port: 'port 59312 held by the OS (not in fleet registry) \u2014 registry absence is not availability'"
   },
   {
     "scenario": "gpu_exceeds",
@@ -42,6 +64,12 @@
       "gpu_mb": 100000
     },
     "expected_allowed": false,
-    "expected_reason": "GPU budget exceeded: requesting 100000MB but only 73728MB available (40960MB allocated of 114688MB allocatable)"
+    "expected_reason": "GPU budget exceeded: requesting 100000MB but only 73728MB available (40960MB allocated of 114688MB allocatable)",
+    "short_circuits_before_os": false,
+    "mirrors_python": false,
+    "agrees_on_this_host": false,
+    "python_allowed": false,
+    "python_reason": "GPU budget exceeded: requesting 100000MB but only 73728MB available (40960MB allocated of 114688MB allocatable) \u2014 40960MB in use per the declared ledger (ledger declared 40960MB, generator: idle device); MLX/vLLM residency is not measured, so this is a floor",
+    "divergence": "The Rust kernel answers from the registry alone; the Python referee now consults an additional authority (OS socket table for ports, live VRAM residency for GPU). The OS-truth layer was deliberately NOT ported. Evidence: referee.check_port denied an unregistered live listener on an ephemeral port: 'port 59312 held by the OS (not in fleet registry) \u2014 registry absence is not availability'"
   }
 ]

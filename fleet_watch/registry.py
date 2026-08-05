@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS processes (
     start_time     TEXT NOT NULL,
     last_heartbeat TEXT NOT NULL,
     expected_duration_min INTEGER,
+    -- Kernel create-time of `pid`, captured at registration. Used ONLY for
+    -- equality against a later read, which proves whether the integer PID still
+    -- names the same process (see registry._owner_still_alive). Declared LAST so
+    -- a fresh DB and a DB migrated by _ensure_column agree on column order —
+    -- _row_to_dict maps `SELECT *` positionally.
+    start_create_time TEXT,
     UNIQUE(port),
     UNIQUE(repo_dir)
 );
@@ -239,6 +245,35 @@ def _pid_create_time(pid: int | None) -> str | None:
     return line
 
 
+def _owner_still_alive(pid: int | None, recorded_create_time: str | None) -> bool:
+    """Positively confirm ``pid`` still names the SAME process it named when
+    ``recorded_create_time`` was captured.
+
+    PID existence alone cannot answer this: the OS recycles PIDs, so a dead
+    owner's integer can be handed to an unrelated process and read as "alive".
+    A recorded create-time that no longer matches positively proves the original
+    owner is gone.
+
+    Every uncertainty resolves toward "alive" (keep blocking), never toward
+    release: a missing create-time (pre-migration row) or an unreadable live
+    create-time degrades to PID existence, which is the prior behaviour. Death
+    is only ever declared on positive evidence.
+
+    Single implementation shared by the session-lease path and the process path
+    — the two used to differ, and the process path was the one without it.
+    """
+    if pid is None:
+        return False
+    if not _pid_exists(pid):
+        return False
+    if not recorded_create_time:
+        return True
+    live = _pid_create_time(pid)
+    if live is None:
+        return True
+    return live == recorded_create_time
+
+
 def _lease_owner_alive(lease: dict[str, Any] | None) -> bool:
     """Positively confirm a lease's owner process is the SAME process that opened
     it — PID exists AND, when a create-time was recorded, the live PID's
@@ -250,22 +285,20 @@ def _lease_owner_alive(lease: dict[str, Any] | None) -> bool:
     """
     if lease is None:
         return False
-    owner_pid = lease.get("owner_pid")
-    if owner_pid is None:
+    return _owner_still_alive(lease.get("owner_pid"), lease.get("owner_create_time"))
+
+
+def process_owner_alive(process: dict[str, Any] | None) -> bool:
+    """Confirm a registered PROCESS row's PID still names the same process.
+
+    The process-row analogue of :func:`_lease_owner_alive`. Callers that act on
+    a registry row's PID — refusing a repo in its name, or SIGTERMing it —
+    must use this rather than a bare ``os.kill(pid, 0)``, which cannot tell a
+    live owner from a recycled integer.
+    """
+    if process is None:
         return False
-    if not _pid_exists(owner_pid):
-        return False
-    recorded = lease.get("owner_create_time")
-    if not recorded:
-        # No create-time evidence on this (likely pre-migration) lease — degrade
-        # to PID existence, which is the prior behavior. Never fail-open.
-        return True
-    live = _pid_create_time(owner_pid)
-    if live is None:
-        # Could not read live create-time; do not declare death on missing
-        # evidence — fall back to PID existence (already confirmed True above).
-        return True
-    return live == recorded
+    return _owner_still_alive(process.get("pid"), process.get("start_create_time"))
 
 
 def current_fencing_epoch(conn: sqlite3.Connection, session_id: str) -> int | None:
@@ -452,6 +485,13 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     # existence; epoch defaults to 1).
     _ensure_column(conn, "session_leases", "owner_create_time", "TEXT")
     _ensure_column(conn, "session_leases", "fencing_epoch", "INTEGER NOT NULL DEFAULT 1")
+    # Same migration for PROCESS rows. The session-lease path has defeated PID
+    # reuse since Path C; the process path could not even in principle, because
+    # the evidence was never recorded — ``processes`` had no create-time column,
+    # so ``check_repo``'s ``os.kill(pid, 0)`` could only ask "does this integer
+    # name a live process", never "is it still the SAME process". Appended last
+    # (ALTER TABLE ADD COLUMN), which is where ``_row_to_dict`` expects it.
+    _ensure_column(conn, "processes", "start_create_time", "TEXT")
     # Ensure gpu_budget singleton exists
     conn.execute(
         "INSERT OR IGNORE INTO gpu_budget (id, total_mb, reserve_mb, allocated_mb) "
@@ -713,10 +753,15 @@ def register_process(
         """INSERT INTO processes
            (pid, session_id, workstream, name, priority, port, gpu_mb, repo_dir,
             model, restart_policy, start_cmd, start_time, last_heartbeat,
-            expected_duration_min)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            expected_duration_min, start_create_time)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (pid, sid, workstream, name, priority, port, gpu_mb, resolved_repo,
-         model, restart_policy, start_cmd, now, now, expected_duration_min),
+         model, restart_policy, start_cmd, now, now, expected_duration_min,
+         # Kernel create-time of the process being registered, captured at
+         # registration. Its ONLY use is equality against a later read, which
+         # positively proves whether the integer PID still names the same
+         # process — see ``_owner_still_alive``.
+         _pid_create_time(pid)),
     )
     # Update GPU budget
     if gpu_mb > 0:
@@ -1423,6 +1468,10 @@ def _row_to_dict(row: tuple, conn: sqlite3.Connection) -> dict[str, Any]:
         "pid", "session_id", "workstream", "name", "priority",
         "port", "gpu_mb", "repo_dir", "model", "restart_policy",
         "start_cmd", "start_time", "last_heartbeat", "expected_duration_min",
+        # Appended by _ensure_column migration, so it is the last SELECT * value.
+        # zip() silently truncates to the shorter side: omitting this name did
+        # not error, it just made the create-time evidence unreadable.
+        "start_create_time",
     ]
     return dict(zip(cols, row))
 

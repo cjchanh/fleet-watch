@@ -384,14 +384,38 @@ def _build_guard_payload(
         }
         payload["checks"]["memory_pressure"] = pressure_check
 
-        decision = referee.check_gpu_budget(conn, gpu_mb)
+        # Probe once and pass the SAME measurement to both the decision and the
+        # reported numbers. ``available_mb``/``suggested_max_mb`` used to be
+        # computed straight from the ledger, independent of the decision — so a
+        # correct DENY still handed the operator a confident ledger figure as
+        # though it were device headroom. The keys are unchanged (the
+        # fleet_guard_hook reads them); only their provenance is now real.
+        residency = referee.probe_gpu_residency()
+        decision = referee.check_gpu_budget(conn, gpu_mb, residency=residency)
+        effective_allocated_mb = max(budget["allocated_mb"], residency.resident_mb)
+        effective_available_mb = (
+            budget["total_mb"] - budget["reserve_mb"] - effective_allocated_mb
+        )
         gpu_check: dict[str, Any] = {
             "allowed": decision.allowed,
             "reason": decision.reason,
             "requested_mb": gpu_mb,
-            "available_mb": max(0, budget["available_mb"]),
-            "suggested_max_mb": max(0, budget["available_mb"]),
+            "available_mb": max(0, effective_available_mb),
+            "suggested_max_mb": max(0, effective_available_mb),
+            "provenance": {
+                "ledger_allocated_mb": budget["allocated_mb"],
+                "telemetry_resident_mb": residency.resident_mb,
+                "telemetry_status": residency.status,
+                "telemetry_sources": list(residency.sources),
+                "unmeasured_runtimes": list(referee.GPU_UNMEASURED_RUNTIMES),
+                "detail": residency.detail,
+            },
         }
+        if not residency.measured:
+            # An unreadable device is not 'all of it is free'. Report no
+            # headroom rather than a number the measurement does not support.
+            gpu_check["available_mb"] = 0
+            gpu_check["suggested_max_mb"] = 0
 
         # Working set estimation — catches memory overcommit
         physical_ram = mem.total_mb if mem.is_available else 0

@@ -2,11 +2,87 @@
 
 import contextlib
 import errno
+import json
 import os
+import re
+import shutil
 import socket
 import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+from pathlib import Path
+
+import pytest
 
 from fleet_watch import events, referee, registry
+
+
+@contextlib.contextmanager
+def _live_child():
+    """Yield the PID of a real, live child process for the block's life.
+
+    Some guard paths act on a registered PID (SIGTERM in preempt_port) or
+    verify its create-time. A synthetic never-existed PID makes those paths
+    take the dead-holder branch, so a test that means to exercise the live
+    path must supply a process that is actually alive.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield proc.pid
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def _git_repo_with_held_lock(tmp_path, lock_name: str = "index.lock"):
+    """Create a git repo whose ``.git/<lock_name>`` is held open by a live process.
+
+    This is what a git write in flight looks like on disk: the lockfile exists
+    AND a live process holds its descriptor. Both halves matter — presence
+    alone is also what week-old crash debris looks like.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    lock = repo / ".git" / lock_name
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "f = open(sys.argv[1], 'w')\n"
+            "f.write('held')\n"
+            "f.flush()\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n",
+            str(lock),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready", "lock holder failed to start"
+        # The descriptor is open by the time 'ready' is printed.
+        deadline = time.monotonic() + 5
+        while not lock.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        yield repo, proc.pid
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
 
 
 @contextlib.contextmanager
@@ -395,21 +471,27 @@ def test_preempt_refuses_a_port_it_cannot_preempt():
 # --- S2-f: registry-only decisions must disclose their provenance ----------
 
 
-def test_registry_only_decisions_disclose_their_provenance():
+def test_decisions_disclose_their_remaining_provenance():
     """A number whose provenance is invisible is the defect.
 
-    check_repo and check_gpu_budget cannot see an unregistered holder. That
-    limit must stay written down where the next reader meets the function.
+    Both checks now consult an authority independent of the registry, so the
+    old disclosure ("registry-only", "not GPU telemetry") would itself be a
+    false claim. What must stay written down is the limit that is STILL real:
+    check_repo cannot see a non-git writer, and check_gpu_budget reads a floor.
     """
     for func in (referee.check_repo, referee.check_repo_with_session):
         doc = func.__doc__ or ""
         assert "registered" in doc.lower()
         assert "allowed: true" in doc.lower()
+        assert "git" in doc.lower(), "must name which writers it can and cannot see"
 
     gpu_doc = referee.check_gpu_budget.__doc__ or ""
     assert "ledger" in gpu_doc.lower()
-    assert "not gpu telemetry" in gpu_doc.lower()
-    assert "invisible" in gpu_doc.lower()
+    assert "telemetry" in gpu_doc.lower()
+    assert "floor" in gpu_doc.lower(), "must disclose that the number under-counts"
+    assert "not gpu telemetry" not in gpu_doc.lower(), (
+        "stale disclosure: this function now reads telemetry"
+    )
 
 
 def test_repo_available():
@@ -687,21 +769,44 @@ def test_claim_port_conflict_logs_event():
     assert len(evts) == 1
 
 
+# Port number for the preempt tests. Inert: preempt_port only probes the OS when
+# the registry has NO holder, and these tests register one, so nothing is bound
+# and no real service is consulted. (The previous fixture used 8100, which is
+# MLX's port on this host — a test should not name a port the machine runs.)
+_PREEMPT_FIXTURE_PORT = 4242
+
+
 def test_preempt_higher_priority():
     conn = _fresh_conn()
-    registry.register_process(conn, pid=2147483646, name="low", workstream="ws", port=8100, priority=2)
-    # Use grace=0 for test speed — PID won't exist anyway
-    d = referee.preempt_port(conn, 8100, new_priority=5, reason="test", grace_seconds=0)
+    # A LIVE holder, not a synthetic dead PID. preempt_port now releases a
+    # holder whose owner is provably gone BEFORE comparing priorities, so a
+    # dead-PID fixture would satisfy this assertion without ever reaching the
+    # priority logic it exists to cover.
+    with _live_child() as pid:
+        registry.register_process(
+            conn, pid=pid, name="low", workstream="ws",
+            port=_PREEMPT_FIXTURE_PORT, priority=2,
+        )
+        d = referee.preempt_port(
+            conn, _PREEMPT_FIXTURE_PORT, new_priority=5, reason="test", grace_seconds=0
+        )
     assert d.allowed is True
-    # Port should be free now
-    assert registry.get_process_by_port(conn, 8100) is None
+    assert "preempted" in d.reason
+    assert registry.get_process_by_port(conn, _PREEMPT_FIXTURE_PORT) is None
 
 
 def test_preempt_lower_priority_denied():
     conn = _fresh_conn()
-    registry.register_process(conn, pid=2147483646, name="high", workstream="ws", port=8100, priority=5)
-    d = referee.preempt_port(conn, 8100, new_priority=3, reason="test", grace_seconds=0)
+    with _live_child() as pid:
+        registry.register_process(
+            conn, pid=pid, name="high", workstream="ws",
+            port=_PREEMPT_FIXTURE_PORT, priority=5,
+        )
+        d = referee.preempt_port(
+            conn, _PREEMPT_FIXTURE_PORT, new_priority=3, reason="test", grace_seconds=0
+        )
     assert d.allowed is False
+    assert "priority" in d.reason
 
 
 def test_preempt_empty_port():
@@ -733,3 +838,416 @@ def test_suggest_ports_skips_taken_and_requested():
     assert taken_b not in ports
     assert requested not in ports
     assert ports[0] == offered
+
+
+# ── S1: repo occupancy must not be a registry lookup wearing a liveness probe ──
+#
+# The defect these cover, measured 2026-08-04: a live process holding
+# <repo>/.git/index.lock open produced check_repo(...) -> allowed=True
+# "repo available", because the only authority was registry.get_process_by_repo
+# and the os.kill(pid, 0) probe was reachable only AFTER that returned a row.
+
+
+def test_repo_denied_for_live_unregistered_git_writer(tmp_path):
+    """THE FAILING CASE. A git write in flight, nothing registered, must DENY."""
+    conn = _fresh_conn()
+    with _git_repo_with_held_lock(tmp_path) as (repo, holder_pid):
+        d = referee.check_repo(conn, str(repo))
+        assert d.allowed is False, (
+            f"a live git writer must block, got allowed={d.allowed} "
+            f"reason={d.reason!r}"
+        )
+        assert str(holder_pid) in d.reason, (
+            f"the refusal must name the holding PID to be actionable, "
+            f"got {d.reason!r}"
+        )
+        assert "index.lock" in d.reason
+
+
+def test_repo_available_when_git_lock_is_stale_debris(tmp_path):
+    """POSITIVE CONTROL for the refusal — it must not fire on lock PRESENCE.
+
+    Measured on this machine: ~/Workspace/active/flight-atlas/.git/index.lock,
+    0 bytes, 171.6 hours old, zero open descriptors. A "lock exists => DENY"
+    rule refuses a repo like that forever, which teaches the operator to ignore
+    the guard. Only an ATTRIBUTED lock may deny.
+    """
+    conn = _fresh_conn()
+    repo = tmp_path / "stale"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "index.lock").write_text("")  # nobody holds it open
+
+    probe = referee.probe_repo_writers(str(repo))
+    assert probe.status == referee.REPO_WRITER_STALE, (
+        f"unheld lock must read as stale debris, got {probe.status}: {probe.detail}"
+    )
+    d = referee.check_repo(conn, str(repo))
+    assert d.allowed is True, f"stale lock must not refuse, got {d.reason!r}"
+
+
+def test_repo_writer_probe_has_a_working_positive_control():
+    """The control that separates 'no holder' from 'lookup broken' must work.
+
+    lsof exits 1 with empty stdout both when it finds nothing and when it
+    fails, so the stale verdict above is only trustworthy if the same lookup
+    can find a file this process is holding open.
+    """
+    if shutil.which("lsof") is None:
+        pytest.skip("lsof not installed — the control genuinely cannot run here")
+    assert referee._lsof_can_attribute_open_files() is True
+
+
+def test_repo_writer_probe_fails_closed_when_lookup_unavailable(tmp_path, monkeypatch):
+    """A lock we cannot attribute is UNDETERMINED, and undetermined must refuse."""
+    conn = _fresh_conn()
+    repo = tmp_path / "unknowable"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "index.lock").write_text("")
+
+    monkeypatch.setattr(referee, "_open_file_holders", lambda path: None)
+    probe = referee.probe_repo_writers(str(repo))
+    assert probe.status == referee.REPO_WRITER_UNDETERMINED
+    d = referee.check_repo(conn, str(repo))
+    assert d.allowed is False, "an unmeasurable repo must not be reported available"
+    assert "undetermined" in d.reason.lower()
+
+
+def test_repo_writer_probe_fails_closed_when_control_fails(tmp_path, monkeypatch):
+    """No holder found AND the control cannot confirm the lookup works => refuse.
+
+    This is the branch that keeps the stale verdict honest: without it, a
+    broken lookup would be indistinguishable from proven-stale and would
+    silently return allow.
+    """
+    conn = _fresh_conn()
+    repo = tmp_path / "uncontrolled"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "index.lock").write_text("")
+
+    monkeypatch.setattr(referee, "_open_file_holders", lambda path: set())
+    monkeypatch.setattr(referee, "_lsof_can_attribute_open_files", lambda: False)
+    probe = referee.probe_repo_writers(str(repo))
+    assert probe.status == referee.REPO_WRITER_UNDETERMINED
+    assert referee.check_repo(conn, str(repo)).allowed is False
+
+
+def test_repo_writer_probe_sees_worktree_gitdir(tmp_path):
+    """A worktree's .git is a FILE pointing elsewhere — the parallel-session case."""
+    separate_gitdir = tmp_path / "separate_gitdir"
+    separate_gitdir.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {separate_gitdir}\n")
+    (separate_gitdir / "index.lock").write_text("")
+
+    probe = referee.probe_repo_writers(str(worktree))
+    assert probe.status != referee.REPO_WRITER_NONE, (
+        "a worktree's gitdir must be followed, or every worktree is invisible"
+    )
+    assert str(separate_gitdir) in (probe.lock_path or "")
+
+
+def test_repo_writer_probe_is_silent_on_non_git_paths(tmp_path):
+    """No git dir means this probe has nothing to say — it must not manufacture
+    a refusal for every non-repo path the guard is asked about."""
+    conn = _fresh_conn()
+    plain = tmp_path / "not_a_repo"
+    plain.mkdir()
+    assert referee.probe_repo_writers(str(plain)).status == referee.REPO_WRITER_NONE
+    assert referee.check_repo(conn, str(plain)).allowed is True
+
+
+# ── S1: a recycled PID is not a live holder ───────────────────────────────────
+#
+# os.kill(pid, 0) asks "does this integer name a live process", never "is it
+# still the SAME process". The session-lease path has been create-time aware
+# since Path C; the process path had no create-time recorded to compare against.
+
+
+def _recycle(conn, pid: int) -> None:
+    """Simulate PID reuse: the integer still names a live process, but not the
+    one that registered — exactly what the OS does when it recycles a PID."""
+    conn.execute(
+        "UPDATE processes SET start_create_time = ? WHERE pid = ?",
+        ("Thu Jan  1 00:00:00 1970", pid),
+    )
+    conn.commit()
+
+
+def test_repo_released_when_holder_pid_was_recycled():
+    """THE FAILING CASE. A live-but-different process must not hold the repo."""
+    conn = _fresh_conn()
+    with _live_child() as pid:
+        registry.register_process(
+            conn, pid=pid, name="ghost", workstream="ws",
+            repo_dir="/tmp/fw-recycle-repo", session_id="sess-old",
+        )
+        _recycle(conn, pid)
+        d = referee.check_repo(conn, "/tmp/fw-recycle-repo")
+    assert d.allowed is True, (
+        f"a recycled PID is not the holder; the repo must release, got {d.reason!r}"
+    )
+    assert registry.get_process_by_repo(conn, "/tmp/fw-recycle-repo") is None
+
+
+def test_repo_stays_locked_for_a_genuinely_live_holder():
+    """POSITIVE CONTROL. The recycle check must not release every holder."""
+    conn = _fresh_conn()
+    with _live_child() as pid:
+        registry.register_process(
+            conn, pid=pid, name="real", workstream="ws",
+            repo_dir="/tmp/fw-live-repo", session_id="sess-other",
+        )
+        d = referee.check_repo(conn, "/tmp/fw-live-repo")
+        assert d.allowed is False, (
+            f"a live registered holder must still block, got {d.reason!r}"
+        )
+        assert str(pid) in d.reason
+
+
+def test_preempt_does_not_signal_a_recycled_pid():
+    """THE FAILING CASE with the worst blast radius: preempt SIGTERMs the PID
+    it reads from the registry. If the owner already died, that signal lands on
+    whatever unrelated process inherited the integer."""
+    conn = _fresh_conn()
+    with _live_child() as pid:
+        registry.register_process(
+            conn, pid=pid, name="ghost", workstream="ws",
+            port=_PREEMPT_FIXTURE_PORT, priority=1,
+        )
+        _recycle(conn, pid)
+        d = referee.preempt_port(
+            conn, _PREEMPT_FIXTURE_PORT, new_priority=5, reason="test", grace_seconds=0
+        )
+        # The innocent process must be untouched.
+        time.sleep(0.2)
+        assert registry._pid_exists(pid) is True, (
+            "preempt signalled a PID it could not prove was the holder"
+        )
+    assert d.allowed is True
+    assert "not signalling" in d.reason
+    assert registry.get_process_by_port(conn, _PREEMPT_FIXTURE_PORT) is None
+
+
+def test_process_owner_alive_degrades_to_pid_existence_without_create_time():
+    """Pre-migration rows carry no create-time. Missing evidence must degrade to
+    'still alive / keep blocking', never to a release."""
+    assert registry.process_owner_alive(
+        {"pid": os.getpid(), "start_create_time": None}
+    ) is True
+    assert registry.process_owner_alive(
+        {"pid": os.getpid(), "start_create_time": "Thu Jan  1 00:00:00 1970"}
+    ) is False
+    assert registry.process_owner_alive(None) is False
+
+
+def test_register_process_records_owner_create_time():
+    """The comparison above is only possible if the evidence is captured."""
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=os.getpid(), name="self", workstream="ws")
+    row = conn.execute(
+        "SELECT start_create_time FROM processes WHERE pid = ?", (os.getpid(),)
+    ).fetchone()
+    assert row[0], "no create-time recorded — the recycle check has nothing to compare"
+
+
+# ── S1: a GPU ledger that cannot see the device is not a GPU guard ────────────
+#
+# Measured 2026-08-04: Ollama held 11,601MB resident (qwen3:8b 11,249MB +
+# nomic-embed-text 352MB) while the ledger reported 0MB allocated and
+# check_gpu_budget(conn, 100000) returned allowed=True.
+
+
+def _residency(mb: int) -> referee.GpuResidencyProbe:
+    return referee.GpuResidencyProbe(
+        referee.GPU_TELEMETRY_MEASURED, mb, f"test: {mb}MB resident", ("test",)
+    )
+
+
+_UNAVAILABLE = referee.GpuResidencyProbe(
+    referee.GPU_TELEMETRY_UNAVAILABLE, 0, "test: telemetry unreadable", ("test",)
+)
+
+
+def test_gpu_denied_when_device_is_full_and_ledger_is_empty():
+    """THE FAILING CASE. Empty ledger, device nearly full — must DENY."""
+    conn = _fresh_conn()
+    d = referee.check_gpu_budget(conn, 100000, residency=_residency(110000))
+    assert d.allowed is False, (
+        f"an unregistered consumer holding the device must block, got {d.reason!r}"
+    )
+    assert "110000" in d.reason
+
+
+def test_gpu_allowed_when_device_has_room():
+    """POSITIVE CONTROL. The telemetry path must not deny everything."""
+    conn = _fresh_conn()
+    d = referee.check_gpu_budget(conn, 8192, residency=_residency(352))
+    assert d.allowed is True, f"a nearly-idle device must allow, got {d.reason!r}"
+    assert "352" in d.reason
+
+
+def test_gpu_fails_closed_when_telemetry_unreadable():
+    """A failed measurement must never be served as the ledger's confident number."""
+    conn = _fresh_conn()
+    d = referee.check_gpu_budget(conn, 1024, residency=_UNAVAILABLE)
+    assert d.allowed is False, (
+        f"unreadable telemetry must refuse, not fall back to the ledger, "
+        f"got {d.reason!r}"
+    )
+    assert "undetermined" in d.reason.lower()
+
+
+def test_gpu_does_not_double_count_a_registered_consumer():
+    """Ledger and telemetry describe the SAME memory for a registered runtime.
+    Summing them would invent false refusals; max() is the honest floor.
+
+    The request is chosen to STRADDLE the two arithmetics. Allocatable here is
+    114688MB, so with 12000 declared and 12000 resident: max leaves 102688MB
+    free and sum leaves 90688MB. A 90000MB request fits under both and proves
+    nothing — the first version of this test used 90000 and a sum-instead-of-max
+    mutation survived it. 100000MB fits only under max.
+    """
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=1, name="ollama", workstream="ws", gpu_mb=12000)
+    d = referee.check_gpu_budget(conn, 100000, residency=_residency(12000))
+    assert d.allowed is True, (
+        f"12000 declared + 12000 resident is 12000MB of real use, not 24000: "
+        f"{d.reason!r}"
+    )
+    assert "102688MB available" in d.reason, (
+        f"headroom must be computed from the larger of the two, not their sum: "
+        f"{d.reason!r}"
+    )
+
+
+def test_gpu_telemetry_overrides_an_understated_declaration():
+    """A process that declared 1000MB while holding 40000MB is counted at what
+    it actually holds."""
+    conn = _fresh_conn()
+    registry.register_process(conn, pid=1, name="liar", workstream="ws", gpu_mb=1000)
+    d = referee.check_gpu_budget(conn, 90000, residency=_residency(40000))
+    assert d.allowed is False
+    assert "40000" in d.reason
+
+
+def test_ollama_probe_reads_refused_connection_as_a_real_zero(monkeypatch):
+    """Nothing listening means Ollama is not running, which means it holds no
+    VRAM. That is a determinate measurement, not an unknown."""
+    def _refused(url, timeout=None):
+        raise urllib.error.URLError(
+            ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+        )
+
+    monkeypatch.setattr(referee.urllib.request, "urlopen", _refused)
+    probe = referee.probe_gpu_residency()
+    assert probe.measured is True
+    assert probe.resident_mb == 0
+
+
+def test_ollama_probe_reads_timeout_as_unavailable(monkeypatch):
+    """A timeout is a FAILED measurement and must not round down to zero."""
+    def _timeout(url, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(referee.urllib.request, "urlopen", _timeout)
+    probe = referee.probe_gpu_residency()
+    assert probe.measured is False
+
+
+def test_ollama_probe_refuses_a_model_with_no_readable_size(monkeypatch):
+    """A resident model with an unreadable size would make the total UNDERSTATE
+    consumption — the exact defect being fixed. Refuse instead."""
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps({"models": [{"name": "x", "size": 1}]}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        referee.urllib.request, "urlopen", lambda url, timeout=None: _Resp()
+    )
+    assert referee.probe_gpu_residency().measured is False
+
+
+def test_ollama_probe_sums_resident_models(monkeypatch):
+    """POSITIVE CONTROL for the parser: a well-formed reply must produce the
+    real total, or every assertion above is vacuous."""
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps(
+                {
+                    "models": [
+                        {"name": "qwen3:8b", "size_vram": 11249 * 1024 * 1024},
+                        {"name": "nomic-embed-text", "size_vram": 352 * 1024 * 1024},
+                    ]
+                }
+            ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        referee.urllib.request, "urlopen", lambda url, timeout=None: _Resp()
+    )
+    probe = referee.probe_gpu_residency()
+    assert probe.measured is True
+    assert probe.resident_mb == 11601
+
+
+def test_gpu_telemetry_only_ever_requests_the_listing_endpoint(monkeypatch):
+    """READ-ONLY is load-bearing: a guard that loads a model to measure VRAM
+    changes the thing it measures. Asserted on the URL actually requested —
+    a source grep would be satisfied by a comment."""
+    requested: list[str] = []
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps({"models": []}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _capture(url, timeout=None):
+        requested.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(referee.urllib.request, "urlopen", _capture)
+    referee.probe_gpu_residency()
+
+    assert requested, "the probe made no request at all"
+    for url in requested:
+        assert url.startswith("http://127.0.0.1:"), f"non-loopback target {url!r}"
+        assert url.endswith("/api/ps"), (
+            f"only the listing endpoint may be called; got {url!r}"
+        )
+
+
+def test_referee_embeds_no_model_loading_url_literal():
+    """Guards the same rule against a FUTURE call site: no URL literal in this
+    module may name an endpoint that loads, pulls, or creates a model.
+
+    Scans URL literals only — the prose above deliberately names those
+    endpoints to explain why they are excluded.
+    """
+    source = Path(referee.__file__).read_text(encoding="utf-8")
+    urls = re.findall(r"http://[^\s\"']+", source)
+    assert urls, "no URL literal found — has the probe moved? (regex drift)"
+    for url in urls:
+        assert "/api/ps" in url, f"unexpected endpoint literal in referee: {url!r}"
