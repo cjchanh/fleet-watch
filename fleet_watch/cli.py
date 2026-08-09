@@ -17,14 +17,28 @@ from typing import Any
 import click
 
 from fleet_watch import autonomous as autonomous_mod
-from fleet_watch import boot_coverage as boot_coverage_mod
-from fleet_watch import census as census_mod
 from fleet_watch import boot_map as boot_map_mod
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
-from fleet_watch import pkill as pkill_mod
 from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
+
+# fleet_watch.census, fleet_watch.boot_coverage, and fleet_watch.pkill are
+# imported lazily inside the functions that use them (below) — each has a
+# single subcommand-scoped call site and none is referenced at decorator
+# (import-time) evaluation, so every other subcommand (e.g. `session list`,
+# `guard`) skips their import cost (census alone pulls in urllib.request +
+# xml.sax.saxutils, ~40ms+).
+#
+# ollama_runners/orphan_detector/memory_pressure and mcp_orphan_detector
+# stay module-level: fleet_watch.discover (kept eager here since discover_mod
+# is used by 9 call sites incl. discover()/watch()) already imports all four
+# unconditionally as its own dependencies, so lazily re-importing them from
+# _build_guard_payload()/status() measured zero net change to session-list
+# import cost — moving them would add diff surface with no verified benefit.
+# discover()/watch() themselves are deliberately left untouched to avoid
+# overlapping the in-flight --auto-kill fail-closed fix on fleet_watch/cli.py
+# (uncommitted on main at time of writing).
 
 
 def _get_conn():
@@ -1061,6 +1075,8 @@ def pkill(pattern: str, confirm: bool, cascade: bool):
 
     Never invokable from other Fleet Watch code paths — operator-typed only.
     """
+    from fleet_watch import pkill as pkill_mod
+
     result = pkill_mod.execute_pkill(pattern, cascade=cascade, confirm=confirm)
 
     gate_counters = counters.load_counters()
@@ -2180,6 +2196,8 @@ def health(as_json: bool):
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
 def boot_coverage(as_json: bool):
     """Cross-check fleet-registered processes against launchd-loaded services."""
+    from fleet_watch import boot_coverage as boot_coverage_mod
+
     conn = _get_conn()
     procs = registry.get_all_processes(conn)
     conn.close()
@@ -2535,6 +2553,8 @@ def _executable_supports_census(executable: str) -> bool:
 def _render_census(
     payload: dict[str, Any], result: census_mod.CensusResult
 ) -> list[str]:
+    from fleet_watch import census as census_mod
+
     totals = payload["totals"]
     machine = payload.get("machine", {})
     lines = [
@@ -2654,6 +2674,8 @@ def census(
     emit_launchd_plist: bool,
 ):
     """Census what boots and runs on this machine, and what is stale."""
+    from fleet_watch import census as census_mod
+
     if emit_launchd_plist:
         executable = shutil.which("fleet") or census_mod.DEFAULT_FLEET_BIN
         click.echo(census_mod.render_launchd_plist(executable), nl=False)
