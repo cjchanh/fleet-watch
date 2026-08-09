@@ -3,6 +3,7 @@
 import json
 import os
 
+import pytest
 from click.testing import CliRunner
 
 from fleet_watch import cli as cli_module
@@ -452,6 +453,37 @@ class TestDiscoveryPattern:
 
 
 class TestDaemonRunawayLogging:
+    @pytest.mark.parametrize(
+        ("extra_args", "expected_auto_kill"),
+        [([], False), (["--auto-kill"], True)],
+    )
+    def test_watch_propagates_explicit_auto_kill_option(
+        self, tmp_path, monkeypatch, extra_args, expected_auto_kill
+    ):
+        _patch_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            cli_module.discover_mod,
+            "sync",
+            lambda conn: {"added": [], "cleaned": [], "skipped": []},
+        )
+        monkeypatch.setattr(
+            cli_module.reporter,
+            "write_report",
+            lambda conn: (tmp_path / "r.md", tmp_path / "r.json"),
+        )
+        observed: list[bool] = []
+
+        def record_option(conn, tracker, *, auto_kill=True, tracker_path=None):
+            observed.append(auto_kill)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(cli_module, "_run_runaway_tick", record_option)
+
+        result = CliRunner().invoke(cli_module.cli, ["watch", *extra_args])
+
+        assert result.exit_code == 0
+        assert observed == [expected_auto_kill]
+
     def test_discover_logs_runaway_event(self, tmp_path, monkeypatch):
         """fleet discover logs RUNAWAY_DETECTED when tracker threshold is hit."""
         _patch_paths(monkeypatch, tmp_path)
@@ -497,8 +529,8 @@ class TestDaemonRunawayLogging:
         assert detail["runtime_seconds"] == 600
         conn.close()
 
-    def test_discover_auto_kills_runaway(self, tmp_path, monkeypatch):
-        """fleet discover kills runaway processes by default (auto_kill=True)."""
+    def test_discover_warns_without_killing_by_default(self, tmp_path, monkeypatch):
+        """A CPU-only heuristic must never signal a process by default."""
         _patch_paths(monkeypatch, tmp_path)
 
         monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
@@ -531,16 +563,15 @@ class TestDaemonRunawayLogging:
         for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
             runner.invoke(cli_module.cli, ["discover"])
 
-        assert killed_pids == [77777]
+        assert killed_pids == []
 
         conn = registry.connect()
         kill_events = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
-        assert len(kill_events) == 1
-        assert kill_events[0]["pid"] == 77777
+        assert kill_events == []
         conn.close()
 
-    def test_discover_no_auto_kill_flag(self, tmp_path, monkeypatch):
-        """fleet discover --no-auto-kill suppresses kills, only logs warnings."""
+    def test_discover_auto_kill_requires_explicit_flag(self, tmp_path, monkeypatch):
+        """The legacy automatic signal path is opt-in at the invocation boundary."""
         _patch_paths(monkeypatch, tmp_path)
 
         monkeypatch.setattr(cli_module.discover_mod, "sync", lambda conn, config=None: {
@@ -571,16 +602,17 @@ class TestDaemonRunawayLogging:
 
         runner = CliRunner()
         for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
-            result = runner.invoke(cli_module.cli, ["discover", "--no-auto-kill"])
+            result = runner.invoke(cli_module.cli, ["discover", "--auto-kill"])
             assert result.exit_code == 0
 
-        assert killed_pids == []
+        assert killed_pids == [77777]
 
         conn = registry.connect()
         detected = events.get_events(conn, hours=1, event_type="RUNAWAY_DETECTED")
         assert len(detected) == 1
         kill_events = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
-        assert len(kill_events) == 0
+        assert len(kill_events) == 1
+        assert kill_events[0]["pid"] == 77777
         conn.close()
 
     def test_discover_kill_failure_logs_failed_event(self, tmp_path, monkeypatch):
@@ -613,7 +645,7 @@ class TestDaemonRunawayLogging:
 
         runner = CliRunner()
         for _ in range(runaway.DAEMON_CONSECUTIVE_TICKS):
-            runner.invoke(cli_module.cli, ["discover"])
+            runner.invoke(cli_module.cli, ["discover", "--auto-kill"])
 
         conn = registry.connect()
         failed = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL_FAILED")

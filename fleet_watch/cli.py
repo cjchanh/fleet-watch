@@ -1898,9 +1898,13 @@ def _mcp_surface_lines(mcp: Any) -> list[str]:
 
 
 @cli.command()
-@click.option("--no-auto-kill", is_flag=True, default=False,
-              help="Log runaway processes without killing them")
-def discover(no_auto_kill: bool):
+@click.option(
+    "--auto-kill",
+    is_flag=True,
+    default=False,
+    help="Explicitly allow Fleet-owned runaway processes to be signaled",
+)
+def discover(auto_kill: bool):
     """Auto-discover running processes and sync registry + state.json."""
     config = discover_mod.load_config()
     conn = _get_conn()
@@ -1940,7 +1944,7 @@ def discover(no_auto_kill: bool):
     tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
     tracker = runaway.DaemonRunawayTracker.load(tracker_path)
     _run_runaway_tick(conn, tracker, tracker_path=tracker_path,
-                      auto_kill=not no_auto_kill)
+                      auto_kill=auto_kill)
 
     # NS-17 B3: read-only MCP-orphan surfacing (never kills here). Fail-soft —
     # a detector error must not break discover. The opt-in kill path
@@ -1956,14 +1960,18 @@ def discover(no_auto_kill: bool):
 
 @cli.command()
 @click.option("--interval", type=int, default=60, help="Seconds between scans")
-@click.option("--no-auto-kill", is_flag=True, default=False,
-              help="Log runaway processes without killing them")
+@click.option(
+    "--auto-kill",
+    is_flag=True,
+    default=False,
+    help="Explicitly allow Fleet-owned runaway processes to be signaled",
+)
 @click.option("--autonomous", is_flag=True, help="Run bounded autopilot reconciler instead of passive discovery")
 @click.option("--once", is_flag=True, help="Run one autonomous reconciliation cycle and exit")
 @click.option("--repo", "repo_dir", default=None, help="Repo root for autonomous reconciliation")
 @click.option("--policy", "policy_path", default=None, help="Autonomous reconciler policy path")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable autonomous result")
-def watch(interval: int, no_auto_kill: bool, autonomous: bool, once: bool,
+def watch(interval: int, auto_kill: bool, autonomous: bool, once: bool,
           repo_dir: str | None, policy_path: str | None, as_json: bool):
     """Run continuous discovery loop (foreground daemon)."""
     import signal
@@ -2007,8 +2015,8 @@ def watch(interval: int, no_auto_kill: bool, autonomous: bool, once: bool,
                     f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
                 )
 
-            # Runaway detection: kill by default, --no-auto-kill for warning only
-            _run_runaway_tick(conn, tracker, auto_kill=not no_auto_kill)
+            # CPU/runtime heuristics are advisory unless this invocation opts in.
+            _run_runaway_tick(conn, tracker, auto_kill=auto_kill)
 
             conn.close()
         except Exception as e:

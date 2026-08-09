@@ -607,6 +607,23 @@ def test_repo_allows_disjoint_write_scope():
     assert d.safe_mode == "cooperative-write"
 
 
+def test_normalize_write_scopes_rejects_repo_escape(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    with pytest.raises(ValueError, match="escapes repository root"):
+        referee.normalize_write_scopes(str(repo), ["../outside"])
+
+
+def test_normalize_write_scopes_accepts_repo_descendant(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert referee.normalize_write_scopes(str(repo), ["src/tool.py"]) == [
+        str((repo / "src/tool.py").resolve())
+    ]
+
+
 def test_repo_allowed_for_current_session_lease():
     conn = _fresh_conn()
     registry.upsert_session_lease(

@@ -146,12 +146,21 @@ def _resolve_write_scopes(repo_dir: str | None, write_scopes: list[str] | tuple[
     if not write_scopes:
         return []
     base = Path(repo_dir).expanduser().resolve() if repo_dir else None
+    if base is None:
+        raise ValueError("write scopes require a repository root")
     resolved: list[str] = []
     for raw in write_scopes:
         path = Path(raw).expanduser()
-        if not path.is_absolute() and base is not None:
+        if not path.is_absolute():
             path = base / path
-        value = str(path.resolve())
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(
+                f"write scope escapes repository root: {raw!r} is outside {base}"
+            ) from exc
+        value = str(resolved_path)
         if value not in resolved:
             resolved.append(value)
     return resolved
@@ -719,6 +728,18 @@ def list_active_session_leases(conn: sqlite3.Connection) -> list[dict[str, Any]]
         """
     ).fetchall()
     return [_session_lease_row_to_dict(row) for row in rows]
+
+
+def get_session_lease_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return compact live/history counts without materializing closed leases."""
+    active = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM session_leases "
+            "WHERE status = 'ACTIVE' AND shutdown_at IS NULL"
+        ).fetchone()[0]
+    )
+    total = int(conn.execute("SELECT COUNT(*) FROM session_leases").fetchone()[0])
+    return {"active": active, "closed": total - active, "total": total}
 
 
 def register_process(

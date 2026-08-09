@@ -9,9 +9,7 @@
     "scopes": [
       "/Users/cj/Workspace/active/fleet-watch"
     ],
-    "expected": [
-      "/Users/cj/Workspace/active/fleet-watch"
-    ]
+    "error": true
   },
   {
     "repo_dir": null,
@@ -19,9 +17,7 @@
       "/Users/cj/Workspace/active/fleet-watch",
       "/Users/cj/Workspace/active/fleet-watch"
     ],
-    "expected": [
-      "/Users/cj/Workspace/active/fleet-watch"
-    ]
+    "error": true
   },
   {
     "repo_dir": "/Users/cj/Workspace/active/fleet-watch",
@@ -55,27 +51,21 @@
     "scopes": [
       "~"
     ],
-    "expected": [
-      "/Users/cj"
-    ]
+    "error": true
   },
   {
     "repo_dir": null,
     "scopes": [
       "~/Workspace"
     ],
-    "expected": [
-      "/Users/cj/Workspace"
-    ]
+    "error": true
   },
   {
     "repo_dir": null,
     "scopes": [
       "/tmp/nonexistent_x"
     ],
-    "expected": [
-      "/private/tmp/nonexistent_x"
-    ]
+    "error": true
   },
   {
     "repo_dir": "/Users/cj/Workspace/active/fleet-watch",

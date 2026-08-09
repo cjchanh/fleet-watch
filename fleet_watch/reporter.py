@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,7 +90,8 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     gate_counters = counters.load_counters()
 
     state.update({
-        "session_leases": registry.list_session_leases(conn),
+        "session_leases": registry.list_active_session_leases(conn),
+        "session_lease_counts": registry.get_session_lease_counts(conn),
         "process_classifications": classifications,
         "stale_processes": stale,
         "recent_events": recent,
@@ -604,12 +607,37 @@ def _append_changelog(log_path: Path, entry: dict[str, Any]) -> None:
         pass  # Decay failure never blocks reporting
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Publish one report file without exposing a partial write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def write_report(conn: sqlite3.Connection, output_dir: Path | None = None) -> tuple[Path, Path]:
-    """Write STATE_REPORT.md, state.json, and append to state_changelog.jsonl."""
+    """Publish one report generation, using JSON as the final commit marker."""
     out = output_dir or registry.FLEET_DIR
     out.mkdir(parents=True, exist_ok=True)
 
     state = build_state(conn)
+    markdown_payload = generate_markdown(state)
+    json_payload = generate_json(state)
 
     # Diff against previous state for changelog
     json_path = out / "state.json"
@@ -619,15 +647,29 @@ def write_report(conn: sqlite3.Connection, output_dir: Path | None = None) -> tu
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
+    md_path = out / "STATE_REPORT.md"
+    prior_markdown_exists = md_path.exists()
+    prior_markdown = md_path.read_text(encoding="utf-8") if prior_markdown_exists else None
+    markdown_published = False
+    try:
+        # Markdown is staged first. JSON is canonical and flips last, so a
+        # failed first write leaves the prior generation committed. If the JSON
+        # commit fails, restore Markdown before returning the error.
+        _atomic_write_text(md_path, markdown_payload)
+        markdown_published = True
+        _atomic_write_text(json_path, json_payload)
+    except OSError:
+        if markdown_published:
+            if prior_markdown is None:
+                md_path.unlink(missing_ok=True)
+            else:
+                _atomic_write_text(md_path, prior_markdown)
+        raise
+
     delta = _diff_state(prev_state, state)
     if delta:
         log_path = out / "state_changelog.jsonl"
         entry = {"timestamp": state["generated_utc"], "delta": delta}
         _append_changelog(log_path, entry)
-
-    md_path = out / "STATE_REPORT.md"
-    md_path.write_text(generate_markdown(state))
-
-    json_path.write_text(generate_json(state))
 
     return md_path, json_path

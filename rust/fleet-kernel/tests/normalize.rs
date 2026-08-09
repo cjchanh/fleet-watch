@@ -26,6 +26,14 @@ fn normalize_matches_python() {
             .iter()
             .map(|v| v.as_str().expect("scope is string").to_string())
             .collect();
+        let actual = normalize_write_scopes(repo_dir, &scopes);
+        if case.get("error").and_then(Value::as_bool) == Some(true) {
+            assert!(
+                actual.is_err(),
+                "normalize_write_scopes(repo_dir={repo_dir:?}, scopes={scopes:?}) accepted invalid input"
+            );
+            continue;
+        }
         let expected: Vec<String> = case["expected"]
             .as_array()
             .expect("expected array")
@@ -33,7 +41,7 @@ fn normalize_matches_python() {
             .map(|v| v.as_str().expect("expected entry is string").to_string())
             .collect();
         assert_eq!(
-            normalize_write_scopes(repo_dir, &scopes),
+            actual.expect("valid parity vector must normalize"),
             expected,
             "normalize_write_scopes(repo_dir={repo_dir:?}, scopes={scopes:?}) disagreed with Python"
         );
@@ -42,12 +50,14 @@ fn normalize_matches_python() {
 
 #[test]
 fn normalize_empty_is_empty() {
-    assert!(normalize_write_scopes(Some("/Users/cj"), &[]).is_empty());
-    assert!(normalize_write_scopes(None, &[]).is_empty());
+    assert!(normalize_write_scopes(Some("/Users/cj"), &[])
+        .unwrap()
+        .is_empty());
+    assert!(normalize_write_scopes(None, &[]).unwrap().is_empty());
 }
 
 #[test]
-fn normalize_dedups_nonexistent_absolute() {
+fn normalize_dedups_nonexistent_absolute_inside_repo() {
     // A non-existent absolute path resolves lexically (no filesystem symlink),
     // so this case is host-independent.
     let scopes = vec![
@@ -55,7 +65,19 @@ fn normalize_dedups_nonexistent_absolute() {
         "/zzz_fk_nonexistent/a".to_string(),
     ];
     assert_eq!(
-        normalize_write_scopes(None, &scopes),
+        normalize_write_scopes(Some("/zzz_fk_nonexistent"), &scopes).unwrap(),
         vec!["/zzz_fk_nonexistent/a".to_string()]
     );
+}
+
+#[test]
+fn normalize_rejects_scopes_without_repo_root() {
+    let scopes = vec!["src/lib.rs".to_string()];
+    assert!(normalize_write_scopes(None, &scopes).is_err());
+}
+
+#[test]
+fn normalize_rejects_scope_outside_repo_root() {
+    let scopes = vec!["../outside".to_string()];
+    assert!(normalize_write_scopes(Some("/tmp/fleet-repo"), &scopes).is_err());
 }

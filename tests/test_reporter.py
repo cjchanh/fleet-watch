@@ -5,6 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from fleet_watch import registry, reporter
 
 
@@ -151,6 +153,90 @@ def test_write_report(tmp_path):
     assert "Fleet Watch" in md_path.read_text()
     parsed = json.loads(json_path.read_text())
     assert parsed["process_count"] == 1
+
+
+def test_build_state_excludes_closed_lease_history_from_live_snapshot(monkeypatch):
+    conn = _fresh_conn()
+    for index in range(250):
+        session_id = f"closed-{index:03d}"
+        registry.upsert_session_lease(conn, session_id, repo_dir="/tmp/repo")
+        registry.close_session_lease(conn, session_id)
+    registry.upsert_session_lease(conn, "active", repo_dir="/tmp/repo")
+
+    state = reporter.build_state(conn)
+
+    assert [lease["session_id"] for lease in state["session_leases"]] == ["active"]
+    assert state["session_lease_counts"] == {"active": 1, "closed": 250, "total": 251}
+
+
+def test_write_report_preserves_previous_json_if_atomic_replace_fails(tmp_path, monkeypatch):
+    conn = _fresh_conn()
+    json_path = tmp_path / "state.json"
+    md_path = tmp_path / "STATE_REPORT.md"
+    json_path.write_text('{"sentinel": true}\n')
+    md_path.write_text("old report\n")
+    replace_calls = 0
+    real_replace = os.replace
+
+    def fail_json_replace(source, destination):
+        nonlocal replace_calls
+        replace_calls += 1
+        if Path(destination) == json_path:
+            raise OSError("simulated interrupted publication")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reporter.os, "replace", fail_json_replace)
+
+    with pytest.raises(OSError, match="simulated interrupted publication"):
+        reporter.write_report(conn, output_dir=tmp_path)
+
+    assert json.loads(json_path.read_text()) == {"sentinel": True}
+    assert md_path.read_text() == "old report\n"
+
+
+def test_write_report_keeps_json_commit_marker_old_if_markdown_publish_fails(
+    tmp_path, monkeypatch
+):
+    conn = _fresh_conn()
+    json_path = tmp_path / "state.json"
+    md_path = tmp_path / "STATE_REPORT.md"
+    json_path.write_text('{"sentinel": true}\n')
+    md_path.write_text("old report\n")
+    real_replace = os.replace
+
+    def fail_markdown_replace(source, destination):
+        if Path(destination) == md_path:
+            raise OSError("simulated markdown publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reporter.os, "replace", fail_markdown_replace)
+
+    with pytest.raises(OSError, match="simulated markdown publication failure"):
+        reporter.write_report(conn, output_dir=tmp_path)
+
+    assert json.loads(json_path.read_text()) == {"sentinel": True}
+    assert md_path.read_text() == "old report\n"
+
+
+def test_write_report_preserves_generation_if_json_serialization_fails(
+    tmp_path, monkeypatch
+):
+    conn = _fresh_conn()
+    json_path = tmp_path / "state.json"
+    md_path = tmp_path / "STATE_REPORT.md"
+    json_path.write_text('{"sentinel": true}\n')
+    md_path.write_text("old report\n")
+
+    def fail_json_serialization(_state):
+        raise TypeError("simulated serialization failure")
+
+    monkeypatch.setattr(reporter, "generate_json", fail_json_serialization)
+
+    with pytest.raises(TypeError, match="simulated serialization failure"):
+        reporter.write_report(conn, output_dir=tmp_path)
+
+    assert json.loads(json_path.read_text()) == {"sentinel": True}
+    assert md_path.read_text() == "old report\n"
 
 
 def test_changelog_records_process_added(tmp_path):

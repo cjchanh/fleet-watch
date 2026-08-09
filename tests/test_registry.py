@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from fleet_watch import registry
 
 
@@ -292,6 +294,37 @@ def test_clean_stale_session_leases_limit_order_is_deterministic(monkeypatch):
     assert registry.get_session_lease(conn, "stale-049")["status"] == "CLOSED"
     assert registry.get_session_lease(conn, "stale-050")["status"] == "ACTIVE"
     assert registry.get_session_lease(conn, "stale-054")["status"] == "ACTIVE"
+
+
+def test_session_lease_rejects_write_scope_outside_repo(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    with pytest.raises(ValueError, match="escapes repository root"):
+        registry.upsert_session_lease(
+            conn,
+            "escaping-scope",
+            repo_dir=str(repo),
+            write_scopes=["../outside"],
+        )
+
+
+def test_session_lease_accepts_write_scope_inside_repo(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    registry.upsert_session_lease(
+        conn,
+        "contained-scope",
+        repo_dir=str(repo),
+        write_scopes=["src/tool.py"],
+    )
+
+    assert registry.get_session_lease(conn, "contained-scope")["write_scopes"] == [
+        str((repo / "src/tool.py").resolve())
+    ]
 
 
 def test_invalid_priority():

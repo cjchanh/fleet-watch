@@ -225,32 +225,39 @@ fn resolve(path: &Path) -> PathBuf {
 /// Resolve write scopes to stable absolute paths for overlap checks. Faithful
 /// port of `fleet_watch.referee.normalize_write_scopes`: each scope is
 /// `~`-expanded, joined onto the resolved `repo_dir` base when relative, then
-/// resolved; results are de-duplicated preserving first-seen order.
-///
-/// `repo_dir = None` (or empty) means no base — relative scopes then resolve
-/// against the current directory, exactly as Python's `Path.resolve()` does.
+/// resolved; results are de-duplicated preserving first-seen order. Non-empty
+/// scopes require a repository root and must remain inside it.
 /// Feeds [`overlap_paths`]; correct resolution is single-writer-load-bearing.
-pub fn normalize_write_scopes(repo_dir: Option<&str>, write_scopes: &[String]) -> Vec<String> {
+pub fn normalize_write_scopes(
+    repo_dir: Option<&str>,
+    write_scopes: &[String],
+) -> Result<Vec<String>, String> {
     if write_scopes.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let base: Option<PathBuf> = repo_dir
+    let base = repo_dir
         .filter(|s| !s.is_empty())
-        .map(|s| resolve(&expanduser(s)));
+        .map(|s| resolve(&expanduser(s)))
+        .ok_or_else(|| "write scopes require a repository root".to_owned())?;
     let mut resolved: Vec<String> = Vec::new();
     for raw in write_scopes {
         let mut path = expanduser(raw);
         if path.is_relative() {
-            if let Some(base) = &base {
-                path = base.join(path);
-            }
+            path = base.join(path);
         }
-        let value = resolve(&path).to_string_lossy().into_owned();
+        let resolved_path = resolve(&path);
+        if !resolved_path.starts_with(&base) {
+            return Err(format!(
+                "write scope escapes repository root: {raw:?} is outside {}",
+                base.display()
+            ));
+        }
+        let value = resolved_path.to_string_lossy().into_owned();
         if !resolved.contains(&value) {
             resolved.push(value);
         }
     }
-    resolved
+    Ok(resolved)
 }
 
 /// Resolve a repo path to its canonical absolute form.

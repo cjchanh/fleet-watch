@@ -195,6 +195,7 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
         "safe_ports",
         "repos_locked",
         "session_leases",
+        "session_lease_counts",
         "process_classifications",
         "stale_processes",
         "recent_events",

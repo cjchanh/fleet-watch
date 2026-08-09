@@ -155,7 +155,10 @@ pub fn check_repo_with_session<S: Signaller>(
     let resolved_repo = crate::resolve_repo(repo_dir);
 
     // Step 2: normalize write scopes (mirrors `normalize_write_scopes(resolved, ws)`).
-    let requested_scopes = crate::normalize_write_scopes(Some(&resolved_repo), write_scopes);
+    let requested_scopes = match crate::normalize_write_scopes(Some(&resolved_repo), write_scopes) {
+        Ok(scopes) => scopes,
+        Err(error) => return Decision::deny(error),
+    };
 
     // Step 3: check process holder.
     let holder = match registry::get_process_by_repo(conn, &resolved_repo) {
