@@ -1116,6 +1116,14 @@ def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
     assert called == [], "emitting the plist must not shell out to launchctl"
 
 
+def test_sitrep_help_is_wired():
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["sitrep", "--help"])
+    assert result.exit_code == 0
+    assert "No clone" in result.output
+    assert "invented SHA" in result.output
+
+
 def test_census_emit_launchd_plist_warns_when_installed_fleet_lacks_census(monkeypatch):
     """A job pointing at an older `fleet` would fail silently every morning."""
     monkeypatch.setattr(cli_module, "_executable_supports_census", lambda _e: False)

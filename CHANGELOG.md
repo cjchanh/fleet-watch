@@ -4,6 +4,7 @@
 
 ### Added
 
+- **`fleet sitrep`** — read-only GitHub fleet sitrep. One `gh api graphql` query lists viewer-owned (or `--owner`) repositories and copies default-branch object ids GitHub actually returned. No clone, no token flags, no invented or abbreviated SHA. Missing `gh` or a failed query is a `REFUSAL`, not a fake fleet. Receipts: `~/.governance/receipts/fleet-github-sitrep/` (`fleet-github-sitrep/v1`).
 - **`fleet census`** — deterministic, read-only census of every boot and runtime surface on the machine: user LaunchAgents (cross-referenced against `launchctl list` and `launchctl print-disabled`, with both-direction orphan detection), `/Library` daemons and agents, live processes clustered by what they actually run, TCP listeners attributed to their owning process, crontab, login items, brew services, and the Fleet Watch registry itself.
 - **Deterministic verdict engine** — every item gets `status`, `verdict` (`keep`/`investigate`/`close`/`remove`), evidence, and the named `rule` that produced it, so a receipt testifies which heuristic fired rather than just its conclusion.
 - **`fleet-census/v1` receipt contract** — dated receipts plus an atomically swapped `latest.json` at `~/.governance/receipts/fleet-census/`. The payload is validated before any write and re-validated from disk before the pointer swap; a receipt that fails validation never replaces a good one. Contract: `docs/fleet-census-receipt-contract-v1.md`.

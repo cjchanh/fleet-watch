@@ -23,12 +23,12 @@ from fleet_watch import events, gpu_estimator, referee, registry, reporter, runa
 from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
 
-# fleet_watch.census, fleet_watch.boot_coverage, and fleet_watch.pkill are
-# imported lazily inside the functions that use them (below) — each has a
-# single subcommand-scoped call site and none is referenced at decorator
-# (import-time) evaluation, so every other subcommand (e.g. `session list`,
-# `guard`) skips their import cost (census alone pulls in urllib.request +
-# xml.sax.saxutils, ~40ms+).
+# fleet_watch.census, fleet_watch.boot_coverage, fleet_watch.pkill, and
+# fleet_watch.github_sitrep are imported lazily inside the functions that use
+# them (below) — each has a single subcommand-scoped call site and none is
+# referenced at decorator (import-time) evaluation, so every other subcommand
+# (e.g. `session list`, `guard`) skips their import cost (census alone pulls in
+# urllib.request + xml.sax.saxutils, ~40ms+).
 #
 # ollama_runners/orphan_detector/memory_pressure and mcp_orphan_detector
 # stay module-level: fleet_watch.discover (kept eager here since discover_mod
@@ -668,7 +668,7 @@ def _render_launchd_plist(executable: str, interval: int) -> str:
 @click.group()
 @click.version_option(package_name="fleet-watch")
 def cli():
-    """Fleet Watch — Process governance for AI workloads."""
+    """Fleet Watch — local process governance, plus read-only GitHub fleet sitrep."""
     pass
 
 
@@ -2821,6 +2821,71 @@ def boot_map(receipt_path: str | None, out_dir: str | None, as_json: bool):
     html = next((o["path"] for o in built["outputs"] if o["path"].endswith(".html")), None)
     if html:
         click.echo(f"View: open {html}")
+
+
+@cli.command("sitrep")
+@click.option("--json", "as_json", is_flag=True, help="Emit the full sitrep as JSON")
+@click.option(
+    "--owner",
+    default=None,
+    help="GitHub login or org to list (default: repositories owned by the gh viewer)",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 100),
+    default=30,
+    show_default=True,
+    help="Maximum repositories to include (GitHub page size; truncated if more exist)",
+)
+@click.option("--no-receipt", is_flag=True, help="Print only; write no receipt")
+@click.option(
+    "--receipt-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Override the receipt directory",
+)
+def sitrep(as_json: bool, owner: str | None, limit: int, no_receipt: bool, receipt_dir: Path | None):
+    """Read-only GitHub fleet sitrep. No clone, no tokens, no invented SHA."""
+    from fleet_watch import github_sitrep as sitrep_mod
+
+    try:
+        result = sitrep_mod.run_sitrep(
+            owner=owner,
+            limit=limit,
+            receipt_dir=receipt_dir or sitrep_mod.RECEIPT_DIR,
+            write=not no_receipt,
+        )
+    except sitrep_mod.SitrepRefusal as exc:
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": sitrep_mod.SCHEMA_VERSION,
+                        "refusal": list(exc.errors),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            click.echo("REFUSAL: GitHub fleet sitrep not written.", err=True)
+            for error in exc.errors:
+                click.echo(f"  - {error}", err=True)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never traceback
+        click.echo(
+            f"REFUSAL: sitrep crashed before producing a receipt "
+            f"({type(exc).__name__}: {sitrep_mod.redact(str(exc))}).",
+            err=True,
+        )
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(result.payload, indent=2, sort_keys=True))
+        return
+
+    click.echo("\n".join(sitrep_mod.render_sitrep(result)))
+
 
 def main():
     """Run the Fleet Watch CLI entrypoint."""

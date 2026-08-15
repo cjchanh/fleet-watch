@@ -3,7 +3,9 @@
 ## Folder Purpose
 Process governance daemon that prevents port, GPU, and repo collisions across
 AI workloads on a single machine by maintaining a shared SQLite registry and
-exposing a fail-closed `fleet guard --json` decision interface.
+exposing a fail-closed `fleet guard --json` decision interface. Also exposes
+`fleet sitrep`, a read-only GitHub fleet view via the local `gh` CLI: no clone,
+no tokens in this repo, no invented SHA.
 
 ## Global Rules Inherited
 All rules from ~/.claude/CLAUDE.md apply. This file refines and extends them
@@ -43,15 +45,14 @@ for this folder only. On conflict, ~/.claude/CLAUDE.md is authoritative.
    in liveness inspection degrades to "still alive / keep blocking", never
    fail-open (verified by test_referee.py stale-lease cases and
    test_path_c_lease_liveness.py).
-4. No NON-LOOPBACK network calls anywhere in `fleet_watch/` (local-only,
-   zero-egress product invariant). Loopback probes to local runtimes
-   (`127.0.0.1`/`localhost`/`::1`, e.g. the Ollama orphan-runner check in
-   `discover.py` / `discovery/orphan_detector.py`) are permitted; all egress
-   is forbidden. Enforced by `tests/test_no_external_egress.py`: forbids
-   `requests`/`httpx`/`aiohttp` outright, and for any module importing
-   `urllib`/`http.client`/`socket` asserts every URL literal targets loopback
-   (replaces the old "zero matches" grep, which the loopback probes violated
-   while egress was still genuinely zero).
+4. No NON-LOOPBACK network calls anywhere in `fleet_watch/` except one
+   command-scoped path: `fleet sitrep` (`fleet_watch/github_sitrep.py`) talks to
+   GitHub only by subprocessing `gh api graphql`. It does not clone, does not
+   read or inject tokens, and does not use `requests`/`httpx`/`urllib`. Guard,
+   discover, census, and health stay zero-egress. Loopback probes to local
+   runtimes (`127.0.0.1`/`localhost`/`::1`, e.g. the Ollama orphan-runner check
+   in `discover.py` / `discovery/orphan_detector.py`) are permitted. Enforced by
+   `tests/test_no_external_egress.py` plus `tests/test_github_sitrep.py`.
 5. Boot-persistence plist `com.cj.fleet-watch-sync.plist` must reload without
    kernel state corruption: the launchd agent runs `fleet discover` every 60s
    and must not bind ports or mutate OS state (read + DB write only).

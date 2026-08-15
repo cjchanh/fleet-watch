@@ -4,7 +4,9 @@
 
 # Fleet Watch
 
-Process governance for AI workloads on a single machine.
+Local process governance for AI workloads on a single machine, and a read-only GitHub fleet sitrep.
+
+`fleet sitrep` lists repositories GitHub actually returns to the local `gh` CLI. It does not clone, does not read or store tokens, and it never fills in a commit SHA that GitHub did not supply as a full object id.
 
 ## The Problem
 
@@ -23,6 +25,7 @@ Verify it works:
 ```bash
 fleet --version
 fleet status
+fleet sitrep --help
 ```
 
 Or install from source:
@@ -195,6 +198,7 @@ Top-level keys:
 | `fleet check --port N --repo PATH --gpu MB` | Honest availability probe (exit 0/1) |
 | `fleet discover` | Scan and register running AI processes |
 | `fleet report` | Write STATE_REPORT.md + state.json |
+| `fleet sitrep --json` | Read-only GitHub fleet sitrep via `gh` (no clone, no tokens, no invented SHA) |
 
 ### Observability
 
@@ -233,6 +237,43 @@ operator, and the recurring launchd job is staged
 (`contrib/launchd/io.fleet-watch.census.plist`), never installed.
 
 Receipt contract: [`docs/fleet-census-receipt-contract-v1.md`](docs/fleet-census-receipt-contract-v1.md).
+
+### `fleet sitrep`
+
+A read-only GitHub fleet sitrep. One GraphQL query through the local `gh`
+binary lists repositories owned by the authenticated viewer (or `--owner`)
+and copies the default-branch object id GitHub returned.
+
+```bash
+# Viewer-owned repos, most recently pushed first
+fleet sitrep --json
+
+# A specific user or org GitHub still lets this `gh` login see
+fleet sitrep --owner cjchanh --limit 30 --json
+```
+
+Rules the command is tested against:
+
+- **No clone.** `sitrep` may only invoke `gh api graphql`. There is no
+  `git clone` / `gh repo clone` path.
+- **No tokens in this repo.** The code does not read `GITHUB_TOKEN` /
+  `GH_TOKEN`, does not run `gh auth token`, and refuses `-t` / `--token`.
+  Auth stays in the operator's `gh` credential store. If `gh` is missing or
+  the query fails, sitrep prints `REFUSAL` and exits 1 — it does not invent a
+  fleet from local checkouts.
+- **No invented SHA.** `sha` is a 40- or 64-char hex object id from GitHub's
+  `defaultBranchRef.target.oid`. Empty repos, missing oids, and abbreviated
+  values become `sha: null` plus `sha_absent_reason`. Short SHAs are never
+  kept or padded.
+
+Receipts (when not `--no-receipt`) land at
+`~/.governance/receipts/fleet-github-sitrep/` as a dated JSON file plus
+`latest.json`. Schema: `fleet-github-sitrep/v1`. At most `--limit` repos
+(default 30, max 100); `truncated: true` means GitHub said another page
+exists.
+
+`fleet sitrep` is the only Fleet Watch subcommand that talks to GitHub.
+`fleet guard`, `discover`, `census`, and `health` stay local.
 
 ### Session Lifecycle
 
@@ -424,6 +465,7 @@ Auto-discovery uses `ps` for process matching. On Linux, listener-to-PID mapping
 - Auto-discovery is heuristic and uses `ps` plus platform listener probes such as `ss`, `netstat`, or `lsof`. Use `fleet register` when explicit claims are more reliable than discovery.
 - Fleet Watch is advisory for human use. For AI agent sessions, a PreToolUse hook can make it fail-closed.
 - Single-machine by design. No distributed coordination.
+- `fleet sitrep` requires an authenticated `gh` on PATH. It reports at most `--limit` owned repositories GitHub returned for that login. It is not a clone, not an unauthenticated public scrape, and not a list of local working trees.
 
 ## License
 
