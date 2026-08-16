@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,52 @@ from fleet_watch.guards import memory_pressure
 # discover()/watch() themselves are deliberately left untouched to avoid
 # overlapping the in-flight --auto-kill fail-closed fix on fleet_watch/cli.py
 # (uncommitted on main at time of writing).
+
+
+# `fleet status` calls two probes `fleet guard` never touches:
+# ollama_runners.discover_ollama_runners() (pgrep/ps fan-out, one subprocess
+# call per discovered ollama runner, each individually bounded but with no
+# cap on the total across N runners) and orphan_detector.detect_orphans()
+# (an HTTP GET against a local ollama /api/ps port plus a `ps aux` call).
+# Every underlying call already carries its own timeout, but nothing bounded
+# the SUM across all of them, so a slow/loaded box or several stacked runners
+# could push `status` well past its 2s advisory budget (observed: an 8s
+# timeout in CURRENT_MACHINE_STATE while `guard`, which skips both probes,
+# stayed fast). STATUS_DISCOVERY_TIMEOUT_SECONDS caps each probe's WALL-CLOCK
+# contribution to `status`; on timeout the probe degrades to its safe empty
+# default rather than hanging the command.
+STATUS_DISCOVERY_TIMEOUT_SECONDS = 3.0
+
+
+def _run_bounded(fn, *, timeout_seconds: float, default: Any):
+    """Run ``fn()`` in a daemon thread bounded by ``timeout_seconds``.
+
+    Returns ``(result, timed_out)``. On timeout, returns ``default`` and
+    ``timed_out=True`` without waiting for the underlying call to finish.
+    The worker thread is daemonized specifically so a still-blocked
+    subprocess/socket call inside ``fn`` can never hold the CLI process open
+    past its own exit -- a non-daemon thread (e.g. via
+    concurrent.futures.ThreadPoolExecutor, whose atexit hook joins pending
+    workers) would still make the process hang even after this function
+    returns a degraded result.
+    """
+    result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_queue.put(("ok", fn()))
+        except Exception as exc:  # noqa: BLE001 -- degrade, never propagate
+            result_queue.put(("error", exc))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    try:
+        kind, payload = result_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return default, True
+    if kind == "error":
+        return default, False
+    return payload, False
 
 
 def _get_conn():
@@ -683,13 +731,26 @@ def status(as_json: bool):
         events.log_event(conn, "CLEAN", pid=c["pid"], workstream=c["workstream"],
                          detail={"reason": "dead_pid", "name": c["name"]})
 
-    # H1: discover ollama runners
-    runner_reports = ollama_runners.discover_ollama_runners()
+    # H1: discover ollama runners. Bounded (see _run_bounded docstring) --
+    # a slow/loaded box or several stacked runners must degrade to an empty
+    # scan, never hang the command past STATUS_DISCOVERY_TIMEOUT_SECONDS.
+    runner_reports, ollama_scan_timed_out = _run_bounded(
+        ollama_runners.discover_ollama_runners,
+        timeout_seconds=STATUS_DISCOVERY_TIMEOUT_SECONDS,
+        default=[],
+    )
     runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
     actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
 
-    # H3: detect orphan runners
-    orphan_result = orphan_detector.detect_orphans()
+    # H3: detect orphan runners. Same bound -- the HTTP probe against a
+    # local ollama port already carries its own socket timeout, but a
+    # hung/black-holed port could still stall this call past the CLI's
+    # advisory response budget without an outer bound.
+    orphan_result, orphan_probe_timed_out = _run_bounded(
+        orphan_detector.detect_orphans,
+        timeout_seconds=STATUS_DISCOVERY_TIMEOUT_SECONDS,
+        default=orphan_detector.OrphanDetectionResult(error="probe_timed_out"),
+    )
     if orphan_result.orphans_detected:
         events.log_event(
             conn,
@@ -705,11 +766,18 @@ def status(as_json: bool):
     counters.save_counters(gate_counters)
 
     if as_json:
-        state = reporter.build_state(conn)
-        state["ollama_runners"] = [r.to_dict() for r in runner_reports]
-        state["ollama_runner_entries"] = runner_entries
-        state["actual_ollama_gpu_mb"] = actual_gpu
-        state["orphan_detection"] = orphan_result.to_dict()
+        # Pass the already-bounded results through so build_state() does not
+        # trigger a second, unbounded discovery scan (see build_state()
+        # docstring) -- this was the actual 8s `fleet status` hang: the
+        # bounded call above returned on time, then build_state() re-ran the
+        # same unbounded probe and blocked on it.
+        state = reporter.build_state(
+            conn, runner_reports=runner_reports, orphan_result=orphan_result
+        )
+        state["discovery_degraded"] = {
+            "ollama_runner_scan_timed_out": ollama_scan_timed_out,
+            "orphan_probe_timed_out": orphan_probe_timed_out,
+        }
         click.echo(json.dumps(state, indent=2, default=str))
     else:
         procs = registry.get_all_processes(conn)
@@ -766,6 +834,17 @@ def status(as_json: bool):
             click.echo(f"  Orphan PIDs: {' '.join(str(p) for p in orphan_result.orphan_pids)}")
             click.echo(f"  Estimated recovered: {orphan_result.estimated_recovered_mb:,} MB")
             click.echo(f"  Suggested: {orphan_result.suggested_kill_command}")
+
+        if ollama_scan_timed_out or orphan_probe_timed_out:
+            degraded = []
+            if ollama_scan_timed_out:
+                degraded.append("ollama runner scan")
+            if orphan_probe_timed_out:
+                degraded.append("orphan probe")
+            click.echo(
+                f"\nDEGRADED: {', '.join(degraded)} exceeded "
+                f"{STATUS_DISCOVERY_TIMEOUT_SECONDS}s and was skipped this run."
+            )
 
     conn.close()
 

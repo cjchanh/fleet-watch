@@ -51,8 +51,23 @@ def build_guard_state(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Build the full observability state. Includes system health (subprocess calls)."""
+def build_state(
+    conn: sqlite3.Connection,
+    *,
+    runner_reports: list[ollama_runners.OllamaRunnerReport] | None = None,
+    orphan_result: orphan_detector.OrphanDetectionResult | None = None,
+) -> dict[str, Any]:
+    """Build the full observability state. Includes system health (subprocess calls).
+
+    ``runner_reports``/``orphan_result`` let a caller that already ran (and
+    bounded) these two discovery probes pass the result through instead of
+    triggering a second, unbounded scan here -- `fleet status --json` does
+    this (see cli.py `status()`) because both probes fan out to per-process
+    subprocess/socket calls with no aggregate cap, which measured an 8s
+    `fleet status` timeout in CURRENT_MACHINE_STATE. Callers that don't pass
+    either (every other `write_report()` call site) keep the prior
+    unbounded-but-individually-timed-out behavior unchanged.
+    """
     state = build_guard_state(conn)
 
     classifications = registry.get_process_classifications(conn)
@@ -75,16 +90,18 @@ def build_state(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     gpu_monitor = discover.load_gpu_monitor_state()
 
-    # H1: ollama runner discovery
-    runner_reports = ollama_runners.discover_ollama_runners()
+    # H1: ollama runner discovery (skipped when the caller already ran it)
+    if runner_reports is None:
+        runner_reports = ollama_runners.discover_ollama_runners()
     runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
     actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
 
     # H2: swap pressure state
     swap_verdict = memory_pressure.check_swap_pressure()
 
-    # H3: orphan detection
-    orphan_result = orphan_detector.detect_orphans()
+    # H3: orphan detection (skipped when the caller already ran it)
+    if orphan_result is None:
+        orphan_result = orphan_detector.detect_orphans()
 
     # Gate counters
     gate_counters = counters.load_counters()

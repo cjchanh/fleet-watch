@@ -4,6 +4,8 @@ import json
 import os
 import socket
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -1228,3 +1230,110 @@ def test_register_can_claim_a_port_the_registering_process_holds(tmp_path, monke
         assert result.exit_code == 0, f"self-registration refused: {result.stderr}"
     finally:
         sock.close()
+
+
+# ===== `status` discovery probes are bounded, never hang the command =====
+# Surface: `status` (unlike `guard`) calls ollama_runners.discover_ollama_runners()
+# and orphan_detector.detect_orphans(), each an unbounded fan-out of
+# individually-bounded subprocess/socket calls. CURRENT_MACHINE_STATE recorded
+# an 8s `fleet status` timeout while `guard`, which skips both probes, stayed
+# fast. _run_bounded() caps each probe's wall-clock contribution and degrades
+# to a safe empty default instead of hanging.
+def test_run_bounded_returns_result_when_fast():
+    result, timed_out = cli_module._run_bounded(
+        lambda: 42, timeout_seconds=1.0, default=None
+    )
+    assert result == 42
+    assert timed_out is False
+
+
+def test_run_bounded_times_out_without_waiting_for_the_call():
+    started = threading.Event()
+
+    def _hang():
+        started.set()
+        time.sleep(5)
+        return "should never surface"
+
+    start = time.monotonic()
+    result, timed_out = cli_module._run_bounded(
+        _hang, timeout_seconds=0.2, default="degraded"
+    )
+    elapsed = time.monotonic() - start
+
+    assert started.is_set()
+    assert result == "degraded"
+    assert timed_out is True
+    # Must return promptly at the timeout, not wait out the 5s hang.
+    assert elapsed < 1.0
+
+
+def test_run_bounded_degrades_on_exception_without_propagating():
+    def _boom():
+        raise RuntimeError("probe blew up")
+
+    result, timed_out = cli_module._run_bounded(
+        _boom, timeout_seconds=1.0, default="fallback"
+    )
+    assert result == "fallback"
+    assert timed_out is False
+
+
+def test_status_json_degrades_when_ollama_scan_hangs(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+
+    def _hang():
+        time.sleep(5)
+        return []
+
+    monkeypatch.setattr(
+        cli_module.ollama_runners, "discover_ollama_runners", _hang
+    )
+
+    runner = CliRunner()
+    start = time.monotonic()
+    result = runner.invoke(cli_module.cli, ["status", "--json"])
+    elapsed = time.monotonic() - start
+
+    assert result.exit_code == 0, result.output
+    assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+    payload = json.loads(result.output)
+    assert payload["discovery_degraded"]["ollama_runner_scan_timed_out"] is True
+    assert payload["ollama_runners"] == []
+
+
+def test_status_json_degrades_when_orphan_probe_hangs(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module, "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+
+    def _hang():
+        time.sleep(5)
+        return cli_module.orphan_detector.OrphanDetectionResult()
+
+    monkeypatch.setattr(cli_module.orphan_detector, "detect_orphans", _hang)
+
+    runner = CliRunner()
+    start = time.monotonic()
+    result = runner.invoke(cli_module.cli, ["status", "--json"])
+    elapsed = time.monotonic() - start
+
+    assert result.exit_code == 0, result.output
+    assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+    payload = json.loads(result.output)
+    assert payload["discovery_degraded"]["orphan_probe_timed_out"] is True
+    assert payload["orphan_detection"]["orphans_detected"] is False
+
+
+def test_status_json_not_degraded_when_probes_are_fast(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_module.cli, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["discovery_degraded"] == {
+        "ollama_runner_scan_timed_out": False,
+        "orphan_probe_timed_out": False,
+    }
