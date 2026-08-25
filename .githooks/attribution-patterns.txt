@@ -1,0 +1,40 @@
+# CDS AI-attribution scan patterns.
+#
+# Loaded at runtime by the sibling `pre-commit` and `commit-msg` hooks.
+# Spec 2623611.
+#
+# FORMAT
+#   One POSIX extended-regex (ERE) pattern per line.
+#   Blank lines and lines whose first non-space character is `#` are ignored.
+#   Surviving lines are joined with `|` and matched case-insensitively.
+#
+# WHY THIS FILE EXISTS
+#   The rule used to live inside the scanner's own source, so the scanner
+#   matched itself: every commit that touched a hook -- or any file that quoted
+#   the rule -- was blocked forever, with no legitimate way to land a fix.
+#   Moving the rule into data, and excluding exactly this file and the hook
+#   directory from the staged-CONTENT scan, is what makes the rule editable.
+#
+# WHAT IS *NOT* EXCLUDED
+#   Commit-MESSAGE scanning has no exclusions at all. A commit message carrying
+#   an attribution line is blocked everywhere, always, including from here.
+#   Every staged file outside the hook directory is still scanned.
+#
+# FAIL-CLOSED
+#   If this file is missing, unreadable, or contains no patterns, both hooks
+#   BLOCK the commit. Deleting the rule does not disable the rule.
+Co-Authored-By:.*Claude
+Co-Authored-By:.*Anthropic
+Co-Authored-By:.*Copilot
+Co-Authored-By:.*GPT
+Co-Authored-By:.*OpenAI
+noreply@anthropic\.com
+Generated[[:space:]]+with[[:space:]].*Claude
+Generated[[:space:]]+by[[:space:]].*Claude
+Generated[[:space:]]+with[[:space:]]+AI
+Generated[[:space:]]+by[[:space:]]+AI
+Made[[:space:]]+with[[:space:]].*Claude
+Authored.by.*Claude
+Written.by.*Claude
+🤖
+# rollout: installed by spec 2623611 on 2026-08-25

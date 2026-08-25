@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# CDS commit-msg hook -- block AI attribution in the commit MESSAGE.
+#
+# Spec 2623611. The scan patterns are NOT in this file; they live in the
+# sibling data file resolved below, so that the rule can be edited and
+# committed without the scanner matching its own definition.
+#
+# THIS HOOK HAS NO EXCLUSIONS. The pattern-file / hook-directory skip belongs
+# to the staged-CONTENT scan in pre-commit and does not exist here. A commit
+# message carrying an attribution line is blocked in every repo, every time,
+# no matter what is staged.
+#
+# FAIL-CLOSED. A missing, unreadable, or pattern-free data file BLOCKS the
+# commit, as does a missing message file. Deleting the rule does not disable
+# the rule.
+
+set -uo pipefail
+
+# --- resolve the pattern data file relative to THIS hook -------------------
+HOOK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+PATTERN_FILE="$HOOK_DIR/attribution-patterns.txt"
+
+if [ ! -f "$PATTERN_FILE" ] || [ ! -r "$PATTERN_FILE" ]; then
+    echo "BLOCKED: AI-attribution pattern file missing or unreadable:" >&2
+    echo "  $PATTERN_FILE" >&2
+    echo "The scan cannot run, so the commit does not proceed (fail-closed)." >&2
+    exit 1
+fi
+
+REGEX="$(awk '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { if (n++) printf "|"; printf "%s", $0 }
+' "$PATTERN_FILE")"
+
+if [ -z "$REGEX" ]; then
+    echo "BLOCKED: AI-attribution pattern file contains no patterns:" >&2
+    echo "  $PATTERN_FILE" >&2
+    echo "An empty rule is not an absent rule (fail-closed)." >&2
+    exit 1
+fi
+
+# --- scan the whole message, with no exclusions ----------------------------
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -r "$MSG_FILE" ]; then
+    echo "BLOCKED: commit-msg hook received no readable message file." >&2
+    echo "Refusing to pass a message that was never scanned (fail-closed)." >&2
+    exit 1
+fi
+
+MATCHES="$(grep -iE "$REGEX" "$MSG_FILE")"
+
+if [ -n "$MATCHES" ]; then
+    echo "BLOCKED: AI attribution detected in the commit message." >&2
+    echo "" >&2
+    echo "Matched lines:" >&2
+    echo "$MATCHES" >&2
+    echo "" >&2
+    echo "Remove the attribution from the commit message." >&2
+    echo "Rule source: $PATTERN_FILE" >&2
+    exit 1
+fi
+
+# --- spec-id guard (chained 2026-08-20, preserved) -------------------------
+# Spec 3713026. queue_triage proves a spec shipped by finding its id in a
+# commit message; implementing commits that omit the id are invisible to every
+# queue-vs-history tool. No-op unless CDS_ACTIVE_SPEC_ID is set, so manual
+# commits are never burdened. A non-zero exit from the guard is propagated
+# verbatim: a mis-wired guard is loud rather than silently permissive.
+if [ -x "$HOME/.claude/hooks/commit_msg_spec_id_guard.py" ]; then
+    python3 "$HOME/.claude/hooks/commit_msg_spec_id_guard.py" "$1" || exit $?
+fi
+
+exit 0

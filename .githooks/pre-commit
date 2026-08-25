@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# CDS pre-commit hook -- block AI attribution in staged CONTENT.
+#
+# Spec 2623611. The scan patterns are NOT in this file. They live in the
+# sibling data file resolved below. Before that split the scanner's own source
+# carried the rule, so the scanner matched itself: any commit touching a hook,
+# or touching any file that quoted the rule, was blocked forever with no
+# legitimate way to land a fix. That is the self-reference paradox this hook
+# exists to not have.
+#
+# FAIL-CLOSED. A missing, unreadable, or pattern-free data file BLOCKS the
+# commit. So does an unresolvable repository root. Deleting the rule does not
+# disable the rule.
+#
+# SCAN-SKIP IS BOUNDED TO EXACTLY TWO PATHS AND NOTHING ELSE:
+#   1. this hook's own directory (the repo's .githooks/)
+#   2. the pattern data file
+# Any other staged file carrying an attribution string is still blocked --
+# there is no sentinel, no comment marker, and no per-line opt-out. The
+# companion commit-msg hook applies NO exclusions at all: a commit MESSAGE
+# containing attribution is blocked everywhere, regardless of what is staged.
+
+set -uo pipefail
+
+# --- resolve the pattern data file relative to THIS hook -------------------
+# Hook-dir-relative resolution is what lets one byte-identical hook work both
+# as a tracked repo hook (core.hooksPath=.githooks) and as a template-installed
+# hook (.git/hooks/), without either one hardcoding the other's layout.
+HOOK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+PATTERN_FILE="$HOOK_DIR/attribution-patterns.txt"
+
+if [ ! -f "$PATTERN_FILE" ] || [ ! -r "$PATTERN_FILE" ]; then
+    echo "BLOCKED: AI-attribution pattern file missing or unreadable:" >&2
+    echo "  $PATTERN_FILE" >&2
+    echo "The scan cannot run, so the commit does not proceed (fail-closed)." >&2
+    exit 1
+fi
+
+REGEX="$(awk '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { if (n++) printf "|"; printf "%s", $0 }
+' "$PATTERN_FILE")"
+
+if [ -z "$REGEX" ]; then
+    echo "BLOCKED: AI-attribution pattern file contains no patterns:" >&2
+    echo "  $PATTERN_FILE" >&2
+    echo "An empty rule is not an absent rule (fail-closed)." >&2
+    exit 1
+fi
+
+# --- resolve the repository root ------------------------------------------
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    echo "BLOCKED: cannot resolve the repository root." >&2
+    echo "Refusing to run a scan whose skip-list cannot be bounded (fail-closed)." >&2
+    exit 1
+fi
+REPO_ROOT="$(cd -- "$REPO_ROOT" && pwd -P)" || exit 1
+cd -- "$REPO_ROOT" || exit 1
+
+# --- build the bounded skip-list ------------------------------------------
+# Only paths that are physically inside the work tree can be excluded. A
+# template-installed hook lives under .git/ and yields an empty relative path,
+# which adds no exclusion at all.
+rel_to_repo() {
+    case "$1" in
+        "$REPO_ROOT"/*) printf '%s' "${1#"$REPO_ROOT"/}" ;;
+        *)              printf '' ;;
+    esac
+}
+
+HOOK_DIR_REL="$(rel_to_repo "$HOOK_DIR")"
+PATTERN_REL="$(rel_to_repo "$PATTERN_FILE")"
+
+SCAN_PATHSPEC=(".")
+if [ -n "$HOOK_DIR_REL" ]; then
+    SCAN_PATHSPEC+=(":(exclude,literal)$HOOK_DIR_REL")
+fi
+if [ -n "$PATTERN_REL" ]; then
+    SCAN_PATHSPEC+=(":(exclude,literal)$PATTERN_REL")
+fi
+
+# --- scan added lines of every other staged file ---------------------------
+# Only added lines are scanned: REMOVING attribution must always be possible.
+#
+# Added lines are identified STRUCTURALLY (inside a hunk), not by pattern.
+# The obvious filter `grep '^\+[^+]'` -- used by this hook's predecessor -- is
+# fail-open: an added line whose own first character is '+' renders as '++...'
+# in the diff and is silently discarded along with the '+++ b/path' header.
+# Verified as a live smuggle path before this was replaced. Tracking hunk
+# state instead means the header is excluded because of WHERE it is, and every
+# added line is scanned regardless of what it starts with.
+MATCHES="$(git diff --cached --diff-filter=ACMR -U0 -- "${SCAN_PATHSPEC[@]}" \
+    | awk '
+        /^diff --git / { inhunk = 0; next }
+        /^@@/          { inhunk = 1; next }
+        inhunk && substr($0, 1, 1) == "+" { print substr($0, 2) }
+      ' \
+    | grep -iE "$REGEX")"
+
+if [ -n "$MATCHES" ]; then
+    echo "BLOCKED: AI attribution detected in staged content." >&2
+    echo "" >&2
+    echo "Matched added lines:" >&2
+    echo "$MATCHES" >&2
+    echo "" >&2
+    echo "Remove the attribution before committing." >&2
+    echo "Rule source: $PATTERN_FILE" >&2
+    exit 1
+fi
+
+# --- hook exit-code lint (pre-existing gate, preserved) --------------------
+# A PreToolUse hook blocks ONLY with exit 2; a block path that exits 1 is
+# fail-open. tools/lint_hook_exit_codes.py catches that class.
+#
+# Scoped to STAGED hooks/*.py on purpose. Linting all of hooks/ would make any
+# pre-existing residual block every unrelated commit -- a repo-wide lockout.
+# This is a ratchet: you cannot leave a fail-open in a hook you are actively
+# editing, but untouched residuals never hold the repo hostage. Inert in repos
+# that have no such linter.
+LINTER="$REPO_ROOT/tools/lint_hook_exit_codes.py"
+STAGED_HOOKS="$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '^hooks/.*\.py$')"
+
+if [ -n "$STAGED_HOOKS" ] && [ -f "$LINTER" ]; then
+    if ! printf '%s\n' "$STAGED_HOOKS" | xargs python3 -B "$LINTER"; then
+        echo "" >&2
+        echo "BLOCKED: staged hook has a block path that exits 1 (fail-open)." >&2
+        echo "A PreToolUse hook blocks ONLY with exit code 2." >&2
+        exit 1
+    fi
+fi
+
+exit 0
