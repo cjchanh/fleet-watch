@@ -58,6 +58,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "reason",
         "holder",
         "suggested_ports",
+        "evidence",
     }
     assert set(payload["checks"]["repo"].keys()) == {
         "allowed",
@@ -67,6 +68,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "overlap_paths",
         "stale_holders",
         "safe_mode",
+        "evidence",
     }
     assert set(payload["checks"]["gpu"].keys()) == {
         "allowed",
@@ -80,6 +82,7 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         # the payload must say what produced it. Additive only — the
         # fleet_guard_hook consumer reads keys via .get(), never a key set.
         "provenance",
+        "evidence",
     }
     assert set(payload["checks"]["gpu"]["provenance"].keys()) == {
         "ledger_allocated_mb",
@@ -95,7 +98,10 @@ def test_guard_json_contract_shape(tmp_path, monkeypatch):
         "blockers",
         "memory",
         "swap",
+        "evidence",
     }
+    for check in payload["checks"].values():
+        assert set(check["evidence"]) >= {"source", "status", "detail"}
     assert set(payload["state"].keys()) == {
         "process_count",
         "occupied_ports",

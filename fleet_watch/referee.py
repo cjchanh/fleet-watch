@@ -31,6 +31,7 @@ class Decision:
     overlap_paths: list[str] = field(default_factory=list)
     stale_holders: list[dict[str, Any]] = field(default_factory=list)
     safe_mode: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 def _session_holder_from_lease(lease: dict[str, Any]) -> dict[str, Any]:
@@ -464,10 +465,14 @@ def check_port(
 #     match. On this machine that is a near-permanent false DENY.
 #   * An uncommitted, recently-modified tree — REJECTED. Proves PAST activity,
 #     and never clears: every active dev repo is dirty by construction.
-#   * A git lockfile whose fd is held open by a LIVE process — ACCEPTED. Git
-#     creates these O_CREAT|O_EXCL and holds the descriptor until the write
-#     commits or rolls back, so an attributable holder is a writer by
-#     construction, in exactly the window where a second writer does damage.
+#   * A git lockfile whose fd is held open WRITABLE by a LIVE process —
+#     ACCEPTED. Git creates these O_CREAT|O_EXCL and holds a writable
+#     descriptor until the write commits or rolls back, so a writable holder
+#     is a writer by construction, in exactly the window where a second
+#     writer does damage. A READ-ONLY descriptor on the same file is NOT a
+#     claim: an unrelated process (a watcher, a VM) can hold stale debris
+#     open for reading without being the writer (2026-08-26 class-1 false
+#     positive; only a writable descriptor counts).
 #
 # WHY ATTRIBUTION IS MANDATORY AND PRESENCE IS NOT ENOUGH. Measured on this
 # machine 2026-08-04: ``~/Workspace/active/flight-atlas/.git/index.lock`` —
@@ -564,8 +569,8 @@ def _git_dir(repo_dir: str) -> Path | None:
     return None
 
 
-def _open_file_holders(path: Path) -> set[int] | None:
-    """PIDs holding ``path`` open, or ``None`` if the query could not run.
+def _open_file_holders(path: Path) -> dict[int, str] | None:
+    """Map PIDs holding ``path`` open to their lsof access mode.
 
     ``None`` (tool absent/timed out) is distinct from an empty set (the tool ran
     and attributed the file to nobody). The caller must never read an empty set
@@ -574,18 +579,27 @@ def _open_file_holders(path: Path) -> set[int] | None:
     """
     try:
         completed = subprocess.run(
-            ["lsof", "-t", "--", str(path)],
+            ["lsof", "-F", "pfa", "--", str(path)],
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
         return None
-    pids: set[int] = set()
-    for line in completed.stdout.split():
-        if line.isdigit():
-            pids.add(int(line))
-    return pids
+    holders: dict[int, str] = {}
+    current_pid: int | None = None
+    for field in completed.stdout.splitlines():
+        if field.startswith("p") and field[1:].isdigit():
+            current_pid = int(field[1:])
+        elif field.startswith("a") and current_pid is not None:
+            access = field[1:] or "unknown"
+            previous = holders.get(current_pid)
+            # One process can hold the same inode through several descriptors.
+            # Preserve any writable sighting instead of letting a later
+            # read-only descriptor erase the live-write evidence.
+            if previous not in {"w", "u"} or access in {"w", "u"}:
+                holders[current_pid] = access
+    return holders
 
 
 def _lsof_can_attribute_open_files() -> bool:
@@ -604,7 +618,10 @@ def _lsof_can_attribute_open_files() -> bool:
         handle.write("fleet-watch lsof positive control")
         handle.flush()
         holders = _open_file_holders(Path(control_path))
-        return holders is not None and os.getpid() in holders
+        return (
+            holders is not None
+            and holders.get(os.getpid()) in {"w", "u"}
+        )
     except OSError:
         return False
     finally:
@@ -650,6 +667,7 @@ def probe_repo_writers(repo_dir: str) -> RepoWriterProbe:
         )
 
     unattributed: list[Path] = []
+    read_only_holders: set[int] = set()
     for lock in present:
         holders = _open_file_holders(lock)
         if holders is None:
@@ -661,14 +679,45 @@ def probe_repo_writers(repo_dir: str) -> RepoWriterProbe:
                 ),
                 lock_path=str(lock),
             )
-        if holders:
+        holder_items = (
+            holders.items()
+            if isinstance(holders, dict)
+            else ((pid, "unknown") for pid in holders)
+        )
+        holder_modes = dict(holder_items)
+        writable_holders = {
+            pid
+            for pid, access in holder_modes.items()
+            if access in {"w", "u"} and registry._pid_exists(pid)
+        }
+        unknown_access_holders = {
+            pid
+            for pid, access in holder_modes.items()
+            if access not in {"r", "w", "u"} and registry._pid_exists(pid)
+        }
+        read_only_holders.update(
+            pid
+            for pid, access in holder_modes.items()
+            if access == "r" and registry._pid_exists(pid)
+        )
+        if writable_holders:
             return RepoWriterProbe(
                 REPO_WRITER_HELD,
                 (
-                    f"PID(s) {sorted(holders)} hold {lock} open — a git write is "
-                    f"in progress in this repo"
+                    f"live PID(s) {sorted(writable_holders)} hold {lock} with a "
+                    f"writable file descriptor — a git write is in progress"
                 ),
-                pids=tuple(sorted(holders)),
+                pids=tuple(sorted(writable_holders)),
+                lock_path=str(lock),
+            )
+        if unknown_access_holders:
+            return RepoWriterProbe(
+                REPO_WRITER_UNDETERMINED,
+                (
+                    f"live PID(s) {sorted(unknown_access_holders)} hold {lock}, "
+                    "but lsof did not report a usable access mode"
+                ),
+                pids=tuple(sorted(unknown_access_holders)),
                 lock_path=str(lock),
             )
         try:
@@ -686,12 +735,19 @@ def probe_repo_writers(repo_dir: str) -> RepoWriterProbe:
         )
 
     if _lsof_can_attribute_open_files():
+        read_only_detail = (
+            f"; live PID(s) {sorted(read_only_holders)} hold only read-only "
+            "descriptors, which are not write claims"
+            if read_only_holders
+            else ""
+        )
         return RepoWriterProbe(
             REPO_WRITER_STALE,
             (
                 f"git write lock(s) {[str(p) for p in unattributed]} exist but no "
-                f"process holds them open (verified: the same lookup does find "
-                f"this process's own open file) — stale lock, not a live writer"
+                f"live process holds a writable descriptor{read_only_detail} "
+                f"(verified: the same lookup finds this process's writable "
+                f"control file) — stale lock, not a live writer"
             ),
             lock_path=str(unattributed[0]),
         )
@@ -750,6 +806,18 @@ def check_repo_with_session(
     # here, "wait" is correct no matter who started it, and the refusal names
     # the PID and clears itself the moment the write finishes.
     writer_probe = probe_repo_writers(resolved_repo_dir)
+    writer_evidence = {
+        "source": "git_lock_lsof",
+        "status": writer_probe.status,
+        "lock_path": writer_probe.lock_path,
+        "pids": list(writer_probe.pids),
+        "detail": writer_probe.detail,
+    }
+
+    def repo_decision(**kwargs: Any) -> Decision:
+        kwargs.setdefault("evidence", writer_evidence)
+        return Decision(**kwargs)
+
     if writer_probe.blocks:
         if writer_probe.status == REPO_WRITER_HELD:
             reason = (
@@ -762,7 +830,10 @@ def check_repo_with_session(
                 f"repo {resolved_repo_dir} availability is undetermined — "
                 f"{writer_probe.detail}; refusing rather than guessing"
             )
-        return Decision(allowed=False, reason=reason)
+        return repo_decision(
+            allowed=False,
+            reason=reason,
+        )
 
     holder = registry.get_process_by_repo(conn, resolved_repo_dir)
     if holder is None:
@@ -819,7 +890,7 @@ def check_repo_with_session(
                         if lease_mode == "exclusive"
                         else f"exclusive repo lock blocked by active session {lease['session_id']}"
                     )
-                    return Decision(
+                    return repo_decision(
                         allowed=False,
                         reason=reason,
                         holder=lease_holder,
@@ -828,7 +899,7 @@ def check_repo_with_session(
                         stale_holders=stale_holders,
                     )
                 if requested_scopes and held_scopes and overlaps:
-                    return Decision(
+                    return repo_decision(
                         allowed=False,
                         reason=f"repo {resolved_repo_dir} write scope overlaps active session {lease['session_id']}",
                         holder=lease_holder,
@@ -838,7 +909,7 @@ def check_repo_with_session(
                     )
                 advisory_holders.append(lease_holder)
             if owned_by_current_session:
-                return Decision(
+                return repo_decision(
                     allowed=True,
                     reason="repo available (owned by current session)",
                     stale_holders=stale_holders,
@@ -851,7 +922,7 @@ def check_repo_with_session(
                 else:
                     reason = "repo available; cooperative sessions present"
                     safe_mode = "declare --write-scope before editing"
-                return Decision(
+                return repo_decision(
                     allowed=True,
                     reason=reason,
                     holders=advisory_holders,
@@ -861,11 +932,11 @@ def check_repo_with_session(
             reason = "repo available"
             if stale_holders:
                 reason = "repo available (stale session lease cleared)"
-            return Decision(allowed=True, reason=reason, stale_holders=stale_holders)
+            return repo_decision(allowed=True, reason=reason, stale_holders=stale_holders)
         for external in external_holders:
             if current_session_id and external["session_id"] == current_session_id:
                 continue
-            return Decision(
+            return repo_decision(
                 allowed=False,
                 reason=(
                     f"repo {resolved_repo_dir} locked by external "
@@ -873,7 +944,7 @@ def check_repo_with_session(
                 ),
                 holder=external,
             )
-        return Decision(allowed=True, reason="repo available (owned by current session)")
+        return repo_decision(allowed=True, reason="repo available (owned by current session)")
     # Is the holder row's PID still the process that registered it?
     #
     # This was ``os.kill(holder["pid"], 0)``, which asks only "does this integer
@@ -899,13 +970,13 @@ def check_repo_with_session(
                              "reason": "recycled_pid" if recycled else "dead_pid",
                              "repo_dir": repo_dir,
                          })
-        return Decision(allowed=True, reason="repo available (stale lock cleared)")
+        return repo_decision(allowed=True, reason="repo available (stale lock cleared)")
 
     # Same-session bypass for local processes
     if current_session_id and holder.get("session_id") == current_session_id:
-        return Decision(allowed=True, reason="repo available (owned by current session)")
+        return repo_decision(allowed=True, reason="repo available (owned by current session)")
 
-    return Decision(
+    return repo_decision(
         allowed=False,
         reason=f"repo {resolved_repo_dir} locked by PID {holder['pid']} ({holder['name']})",
         holder=holder,
