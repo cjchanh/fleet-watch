@@ -416,6 +416,11 @@ def _build_guard_payload(
                 for holder in [*stale_holders, *decision.stale_holders]
             ],
             "safe_mode": decision.safe_mode,
+            "evidence": decision.evidence or {
+                "source": "fleet_registry_and_git_lock_probe",
+                "status": "allow" if decision.allowed else "deny",
+                "detail": decision.reason,
+            },
         }
         unblock_command = _repo_unblock_command(decision.holder)
         if not decision.allowed and unblock_command:
@@ -509,6 +514,23 @@ def _build_guard_payload(
 
         payload["checks"]["gpu"] = gpu_check
         payload["allowed"] = payload["allowed"] and gpu_check["allowed"]
+
+    evidence_sources = {
+        "swap_pressure": "kernel_memory_pressure",
+        "port": "fleet_registry_and_socket_table",
+        "repo": "fleet_registry_and_git_lock_probe",
+        "memory_pressure": "system_memory_and_swap",
+        "gpu": "fleet_ledger_and_device_telemetry",
+    }
+    for check_name, check in payload["checks"].items():
+        check.setdefault(
+            "evidence",
+            {
+                "source": evidence_sources.get(check_name, "fleet_guard"),
+                "status": "allow" if check.get("allowed") else "deny",
+                "detail": check.get("reason", "no reason reported"),
+            },
+        )
 
     return payload
 
