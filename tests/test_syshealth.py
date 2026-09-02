@@ -1,23 +1,25 @@
 """Tests for system health monitoring."""
 
 import json
-import sys
+import subprocess
+
+import pytest
 
 from fleet_watch import registry, syshealth
 
 
 def test_memory_state_returns_valid_data():
-    """get_memory_state is populated when telemetry is supported."""
+    """Live telemetry is numeric or explicitly unavailable with provenance."""
     mem = syshealth.get_memory_state()
-    if sys.platform in {"darwin", "linux"}:
+    if mem.is_available:
         assert mem.total_mb > 0
         assert 0 <= mem.pressure_pct <= 100
         assert mem.available_mb >= 0
     else:
         assert mem.total_mb == 0
-        assert not mem.is_available
         assert mem.pressure_pct == -1
         assert mem.available_mb == 0
+        assert mem.failure_reason is not None
 
 
 def test_memory_state_dict():
@@ -27,6 +29,7 @@ def test_memory_state_dict():
     assert "pressure_pct" in d
     assert "available_mb" in d
     assert d["available_mb"] == mem.free_mb + mem.inactive_mb
+    assert "failure_reason" in d
 
 
 def test_memory_pressure_pct_is_clamped_to_valid_percent():
@@ -306,7 +309,11 @@ def test_get_memory_state_fails_closed_when_vm_stat_fails(monkeypatch):
     # sysctl gives total RAM but vm_stat fails: the state must be unavailable
     # (fail-closed) rather than fabricating all-RAM-free, so memory-gated guards
     # treat partial telemetry as pressured.
-    monkeypatch.setattr(syshealth, "_get_total_memory_mb", lambda: 131072)
+    monkeypatch.setattr(
+        syshealth,
+        "_get_total_memory_probe",
+        lambda: syshealth.ProbeResult(131072 * 1024 * 1024),
+    )
 
     class _R:
         returncode = 1
@@ -315,6 +322,124 @@ def test_get_memory_state_fails_closed_when_vm_stat_fails(monkeypatch):
     monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **k: _R())
     state = syshealth.get_memory_state()
     assert state.is_available is False
+    assert state.failure_reason == "vm_stat_nonzero_exit"
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (subprocess.TimeoutExpired("sysctl", 3), "timeout"),
+        (PermissionError(), "permission_denied"),
+    ],
+)
+def test_pressure_probe_retains_exception_provenance(monkeypatch, failure, reason):
+    monkeypatch.setattr(
+        syshealth.subprocess,
+        "run",
+        lambda *a, **kw: (_ for _ in ()).throw(failure),
+    )
+
+    probe = syshealth.get_vm_pressure_probe()
+
+    assert probe.to_dict() == {
+        "available": False,
+        "value": None,
+        "failure_reason": reason,
+    }
+    assert syshealth.get_vm_pressure_level() is None
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "reason"),
+    [
+        (1, "", "nonzero_exit"),
+        (0, "not-an-integer", "malformed_output"),
+    ],
+)
+def test_pressure_probe_retains_output_failure_provenance(
+    monkeypatch, returncode, stdout, reason,
+):
+    result = type("Result", (), {"returncode": returncode, "stdout": stdout})()
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
+
+    probe = syshealth.get_vm_pressure_probe()
+
+    assert probe.is_available is False
+    assert probe.failure_reason == reason
+
+
+def test_pressure_probe_success_preserves_numeric_behavior(monkeypatch):
+    result = type("Result", (), {"returncode": 0, "stdout": "4\n"})()
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
+
+    assert syshealth.get_vm_pressure_probe().to_dict() == {
+        "available": True,
+        "value": 4,
+        "failure_reason": None,
+    }
+    assert syshealth.get_vm_pressure_level() == 4
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (subprocess.TimeoutExpired("vm_stat", 3), "vm_stat_timeout"),
+        (PermissionError(), "vm_stat_permission_denied"),
+    ],
+)
+def test_memory_probe_retains_exception_provenance(monkeypatch, failure, reason):
+    monkeypatch.setattr(
+        syshealth, "_get_total_memory_probe", lambda: syshealth.ProbeResult(1024**3),
+    )
+    monkeypatch.setattr(
+        syshealth.subprocess,
+        "run",
+        lambda *a, **kw: (_ for _ in ()).throw(failure),
+    )
+
+    state = syshealth.get_memory_state()
+
+    assert state.is_available is False
+    assert state.to_dict()["failure_reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "reason"),
+    [
+        (1, "", "vm_stat_nonzero_exit"),
+        (0, "unexpected output", "vm_stat_malformed_output"),
+    ],
+)
+def test_memory_probe_retains_output_failure_provenance(
+    monkeypatch, returncode, stdout, reason,
+):
+    monkeypatch.setattr(
+        syshealth, "_get_total_memory_probe", lambda: syshealth.ProbeResult(1024**3),
+    )
+    result = type("Result", (), {"returncode": returncode, "stdout": stdout})()
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
+
+    state = syshealth.get_memory_state()
+
+    assert state.is_available is False
+    assert state.failure_reason == reason
+
+
+def test_memory_probe_success_preserves_numeric_behavior(monkeypatch):
+    monkeypatch.setattr(
+        syshealth, "_get_total_memory_probe", lambda: syshealth.ProbeResult(1024**3),
+    )
+    output = """Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 256.\nPages active: 512.\nPages inactive: 128.\nPages wired down: 64.\nPages stored in compressor: 32.\nPageouts: 7.\nSwapins: 3.\n"""
+    result = type("Result", (), {"returncode": 0, "stdout": output})()
+    monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
+
+    state = syshealth.get_memory_state()
+
+    assert state.total_mb == 1024
+    assert state.active_mb == 2
+    assert state.free_mb == 1
+    assert state.pageouts == 7
+    assert state.failure_reason is None
 
 
 def test_pressure_label():

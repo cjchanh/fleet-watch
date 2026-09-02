@@ -83,6 +83,7 @@ class MemoryState:
     wired_mb: int
     pageouts: int = 0
     swapins: int = 0
+    failure_reason: str | None = None
 
     @property
     def available_mb(self) -> int:
@@ -104,6 +105,7 @@ class MemoryState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "available": self.is_available,
+            "failure_reason": self.failure_reason,
             "total_mb": self.total_mb,
             "active_mb": self.active_mb,
             "inactive_mb": self.inactive_mb,
@@ -252,21 +254,68 @@ def launch_pressure_blockers(
     return blockers
 
 
+@dataclass(frozen=True)
+class ProbeResult:
+    """Machine-readable result for a numeric system telemetry probe."""
+
+    value: int | None
+    failure_reason: str | None = None
+
+    @property
+    def is_available(self) -> bool:
+        return self.value is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.is_available,
+            "value": self.value,
+            "failure_reason": self.failure_reason,
+        }
+
+
+def _run_numeric_probe(command: list[str]) -> ProbeResult:
+    """Run a numeric subprocess probe and retain deterministic provenance."""
+    try:
+        out = subprocess.run(
+            command, capture_output=True, text=True, timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        return ProbeResult(None, "timeout")
+    except PermissionError:
+        return ProbeResult(None, "permission_denied")
+    except FileNotFoundError:
+        return ProbeResult(None, "not_found")
+    except OSError:
+        return ProbeResult(None, "os_error")
+    if out.returncode != 0:
+        return ProbeResult(None, "nonzero_exit")
+    try:
+        return ProbeResult(int(out.stdout.strip()))
+    except ValueError:
+        return ProbeResult(None, "malformed_output")
+
+
 def get_memory_state() -> MemoryState:
     """Read system memory state via vm_stat + sysctl (macOS).
 
-    Returns zeroed MemoryState on non-macOS or on failure.
+    Returns a zeroed MemoryState on non-macOS or on failure, and on every
+    failure path carries a machine-readable ``failure_reason`` (one of
+    vm_stat_timeout / vm_stat_permission_denied / vm_stat_not_found /
+    vm_stat_os_error / vm_stat_nonzero_exit / vm_stat_malformed_output, or
+    ``sysctl_<reason>`` when the total-memory probe failed). The success path
+    preserves the pre-provenance numeric behavior exactly.
     """
-    try:
-        total_mb = _get_total_memory_mb()
-    except (FileNotFoundError, PermissionError):
-        return MemoryState(0, 0, 0, 0, 0, 0)
+    total_probe = _get_total_memory_probe()
+    total_mb = (total_probe.value or 0) // (1024 * 1024)
 
     if total_mb == 0:
         linux_state = _get_linux_memory_state()
         if linux_state is not None:
             return linux_state
-        return MemoryState(0, 0, 0, 0, 0, 0)
+        return MemoryState(
+            0, 0, 0, 0, 0, 0,
+            failure_reason=f"sysctl_{total_probe.failure_reason or 'unavailable'}",
+        )
 
     pages: dict[str, int] = {}
     page_size = 16384  # default, overridden by vm_stat header
@@ -278,7 +327,9 @@ def get_memory_state() -> MemoryState:
             # vm_stat failed: page stats unknown. Fail-closed — return an
             # unavailable state instead of claiming all RAM free, so guards that
             # gate on memory pressure treat this as pressured, not headroom.
-            return MemoryState(0, 0, 0, 0, 0, 0)
+            return MemoryState(
+                0, 0, 0, 0, 0, 0, failure_reason="vm_stat_nonzero_exit",
+            )
         for line in out.stdout.splitlines():
             match = re.match(r"(.+?):\s+(\d+)", line)
             if match:
@@ -286,9 +337,27 @@ def get_memory_state() -> MemoryState:
         ps_match = re.search(r"page size of (\d+) bytes", out.stdout)
         if ps_match:
             page_size = int(ps_match.group(1))
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        required_pages = {
+            "Pages active",
+            "Pages inactive",
+            "Pages free",
+            "Pages wired down",
+        }
+        if not required_pages.issubset(pages):
+            return MemoryState(
+                0, 0, 0, 0, 0, 0, failure_reason="vm_stat_malformed_output",
+            )
+    except subprocess.TimeoutExpired:
+        return MemoryState(0, 0, 0, 0, 0, 0, failure_reason="vm_stat_timeout")
+    except PermissionError:
+        return MemoryState(
+            0, 0, 0, 0, 0, 0, failure_reason="vm_stat_permission_denied",
+        )
+    except FileNotFoundError:
+        return MemoryState(0, 0, 0, 0, 0, 0, failure_reason="vm_stat_not_found")
+    except OSError:
         # vm_stat unavailable: fail-closed (see above) — do not fabricate free RAM.
-        return MemoryState(0, 0, 0, 0, 0, 0)
+        return MemoryState(0, 0, 0, 0, 0, 0, failure_reason="vm_stat_os_error")
 
     def mb(key: str) -> int:
         return pages.get(key, 0) * page_size // (1024 * 1024)
@@ -305,6 +374,11 @@ def get_memory_state() -> MemoryState:
     )
 
 
+def _get_total_memory_probe() -> ProbeResult:
+    """Return the raw hw.memsize probe result in bytes."""
+    return _run_numeric_probe(["sysctl", "-n", "hw.memsize"])
+
+
 def _get_total_memory_mb() -> int:
     """Get total physical memory in MB. Returns 0 on any failure (never raises).
 
@@ -312,19 +386,8 @@ def _get_total_memory_mb() -> int:
     MemoryState, which guards treat as fail-closed (memory pressured). This must
     never propagate an exception: fleet guard must always return a decision.
     """
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
-        return 0
-    if out.returncode != 0:
-        return 0
-    try:
-        return int(out.stdout.strip()) // (1024 * 1024)
-    except ValueError:
-        return 0
+    probe = _get_total_memory_probe()
+    return (probe.value or 0) // (1024 * 1024)
 
 
 def get_total_memory_mb() -> int:
@@ -350,19 +413,14 @@ def get_vm_pressure_level() -> int | None:
     contract: callers treat ``None`` as pressured/refuse so an unreadable signal
     never silently admits a workload onto a possibly-starved host.
     """
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
-        return None
-    if out.returncode != 0:
-        return None
-    try:
-        return int(out.stdout.strip())
-    except ValueError:
-        return None
+    return get_vm_pressure_probe().value
+
+
+def get_vm_pressure_probe() -> ProbeResult:
+    """Return pressure level plus deterministic failure provenance."""
+    return _run_numeric_probe(
+        ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+    )
 
 
 def _get_linux_memory_state() -> MemoryState | None:
