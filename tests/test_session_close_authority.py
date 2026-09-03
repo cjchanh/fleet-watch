@@ -499,3 +499,87 @@ def test_cli_close_missing_session_still_exits_two(tmp_path, monkeypatch):
 
     assert result.exit_code == 2
     assert "not found" in result.output
+
+
+# ── The advice half: what `fleet guard` may truthfully advertise ─────────────
+#
+# `fleet guard --json` renders `unblock_command` for an operator who has been
+# denied a repo. Advice that names a command this module refuses is worse than
+# silence: it routes the blocked agent into a second refusal. These pin that
+# `describe_session_close_authority` reports the SAME world the gate enforces.
+
+
+def test_describe_reports_lineage_only_for_a_live_proven_owner(monkeypatch):
+    _install_fake_process_table(monkeypatch)
+    conn = _fresh_conn()
+    _open_lease(conn)
+
+    described = registry.describe_session_close_authority(conn, "sess-a")
+
+    assert described == {
+        "session_id": "sess-a",
+        "status": "lineage_only",
+        "owner_pid": 200,
+    }
+    # And the gate agrees: an unrelated live process is refused.
+    assert registry.authorize_session_close(conn, "sess-a", 600)[0] is False
+    assert _status(conn) == "ACTIVE"
+
+
+def test_describe_reports_reapable_for_a_provably_dead_owner(monkeypatch):
+    _install_fake_process_table(monkeypatch)
+    conn = _fresh_conn()
+    _open_lease(conn)
+    # The owner exits: its pid leaves the table entirely.
+    _install_fake_process_table(monkeypatch, tree={k: v for k, v in TREE.items() if k != 200})
+
+    described = registry.describe_session_close_authority(conn, "sess-a")
+
+    assert described["status"] == "reapable"
+    assert described["owner_pid"] == 200
+    # And the gate agrees: an unrelated process MAY reap it.
+    assert registry.authorize_session_close(conn, "sess-a", 600)[0] is True
+
+
+def test_describe_reports_ttl_only_for_a_null_owner_lease(monkeypatch):
+    _install_fake_process_table(monkeypatch)
+    conn = _fresh_conn()
+    registry.upsert_session_lease(
+        conn, "sess-null", owner_pid=None, repo_dir="/tmp/lease-repo"
+    )
+
+    described = registry.describe_session_close_authority(conn, "sess-null")
+
+    assert described["status"] == "ttl_only"
+    assert described["owner_pid"] is None
+    # And the gate agrees: NOBODY may close it, including the process that
+    # would otherwise be its own lineage.
+    assert registry.authorize_session_close(conn, "sess-null", 200)[0] is False
+    assert registry.authorize_session_close(conn, "sess-null", 600)[0] is False
+
+
+def test_describe_reports_uninspectable_when_owner_identity_is_unprovable(monkeypatch):
+    _install_fake_process_table(monkeypatch)
+    conn = _fresh_conn()
+    _open_lease(conn)
+    # The pid still exists, but its create-time can no longer be read — the
+    # exact input `_owner_identity_proven` resolves to None (fail closed).
+    monkeypatch.setattr(registry, "_pid_create_time", lambda pid: None)
+
+    described = registry.describe_session_close_authority(conn, "sess-a")
+
+    assert described["status"] == "uninspectable"
+    assert registry.authorize_session_close(conn, "sess-a", 200)[0] is False
+
+
+def test_describe_reports_absent_for_a_lease_that_is_not_registered(monkeypatch):
+    _install_fake_process_table(monkeypatch)
+    conn = _fresh_conn()
+
+    described = registry.describe_session_close_authority(conn, "sess-ghost")
+
+    assert described == {
+        "session_id": "sess-ghost",
+        "status": "absent",
+        "owner_pid": None,
+    }

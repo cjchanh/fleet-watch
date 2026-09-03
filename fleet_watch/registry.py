@@ -590,6 +590,54 @@ def authorize_session_close(
     return False, "requester is not the session owner, a descendant, or an ancestor"
 
 
+def describe_session_close_authority(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict[str, Any]:
+    """Predict what ``fleet session close`` will decide for this lease.
+
+    Advice that names a command the gate will refuse is worse than no advice:
+    it sends an operator to a DENY and teaches them the guard is noise. So the
+    remedy text is derived from :func:`authorize_session_close`'s OWN
+    predicates rather than restated beside them — the two cannot drift because
+    there is only one implementation of "is the owner provably dead" and one of
+    "does this lease even have an owner".
+
+    Requester-independent by construction: a requester PID is not known when a
+    ``fleet guard`` denial is rendered, so this answers the question that can
+    be answered without one — WHO may close it — and leaves the lineage walk
+    to the close path itself.
+
+    ``status`` is one of:
+      ``absent``        — no such lease; nothing to close.
+      ``ttl_only``      — NULL ``owner_pid``: close fails closed for EVERY
+                          requester; only heartbeat-TTL expiry clears it.
+      ``reapable``      — the owner is provably dead; anyone may close it.
+      ``lineage_only``  — the owner is live and proven; only the owner, a
+                          descendant, or an ancestor may close it.
+      ``uninspectable`` — owner identity is unprovable; close fails closed for
+                          every requester until it can be inspected.
+    """
+    lease = get_session_lease(conn, session_id)
+    if lease is None:
+        return {"session_id": session_id, "status": "absent", "owner_pid": None}
+
+    owner_pid = lease.get("owner_pid")
+    if not isinstance(owner_pid, int) or owner_pid <= 0:
+        return {"session_id": session_id, "status": "ttl_only", "owner_pid": None}
+
+    identity = _owner_identity_proven(owner_pid, lease.get("owner_create_time"))
+    if identity is False:
+        return {"session_id": session_id, "status": "reapable", "owner_pid": owner_pid}
+    if identity is None:
+        return {
+            "session_id": session_id,
+            "status": "uninspectable",
+            "owner_pid": owner_pid,
+        }
+    return {"session_id": session_id, "status": "lineage_only", "owner_pid": owner_pid}
+
+
 def _is_parent_chain_detached(pid: int) -> bool | None:
     info = _inspect_process(pid)
     if info is None:

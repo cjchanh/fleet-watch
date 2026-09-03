@@ -220,6 +220,13 @@ def test_guard_repo_allows_cooperative_session_lease_and_reports_holder(tmp_path
 
 
 def test_guard_repo_denied_by_exclusive_session_lease_includes_unblock_command(tmp_path, monkeypatch):
+    """An ownerless exclusive lease: the close command DENIES for everyone.
+
+    Regression for the advice defect. This payload used to hand back `fleet
+    session close --session-id sess-editor`, which `authorize_session_close`
+    refuses on a NULL owner_pid for every requester alive — the guard was
+    routing the blocked agent into a second refusal.
+    """
     _patch_paths(monkeypatch, tmp_path)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -242,7 +249,147 @@ def test_guard_repo_denied_by_exclusive_session_lease_includes_unblock_command(t
     assert repo_check["allowed"] is False
     assert repo_check["holder"]["session_id"] == "sess-editor"
     assert repo_check["holder"]["repo_lock_mode"] == "exclusive"
-    assert repo_check["unblock_command"] == "fleet session close --session-id sess-editor"
+    unblock = repo_check["unblock_command"]
+    assert unblock != "fleet session close --session-id sess-editor", (
+        "the bare close command denies for a NULL-owner lease; advertising it "
+        "sends the blocked agent to a refusal"
+    )
+    assert "has no owner pid" in unblock
+    assert "fails closed for every requester" in unblock
+    assert str(registry.DEFAULT_STALE_SECONDS) in unblock
+    # An exclusive lease is not arbitrated by scope, so the cooperative
+    # alternative must NOT be offered here either.
+    assert "no --write-scope declaration bypasses an exclusive lease" in unblock
+
+
+def test_guard_repo_unblock_names_who_may_close_a_live_exclusive_holder(tmp_path, monkeypatch):
+    """A LIVE foreign holder: name the lineage that may close it, not a command."""
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-live",
+        owner_pid=os.getpid(),
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        ["guard", "--repo", str(repo), "--session-id", "sess-other", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    unblock = payload["checks"]["repo"]["unblock_command"]
+    assert f"owner pid {os.getpid()}" in unblock
+    assert "a descendant of it, or the terminal that spawned it" in unblock
+    assert "fleet session close --session-id sess-live" in unblock
+    assert "no --write-scope declaration bypasses an exclusive lease" in unblock
+
+
+def test_guard_repo_unblock_offers_write_scope_when_a_cooperative_scope_overlaps(
+    tmp_path, monkeypatch
+):
+    """Cooperative deny: the truthful remedy is narrowing scope, not closing."""
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-peer",
+        owner_pid=os.getpid(),
+        repo_dir=str(repo),
+        repo_lock_mode="cooperative",
+        write_scopes=[str(repo / "src")],
+    )
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "guard",
+            "--repo",
+            str(repo),
+            "--session-id",
+            "sess-other",
+            "--write-scope",
+            str(repo / "src"),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    repo_check = payload["checks"]["repo"]
+    assert repo_check["allowed"] is False
+    unblock = repo_check["unblock_command"]
+    assert f"owner pid {os.getpid()}" in unblock
+    assert "narrow --write-scope <paths>" in unblock
+
+
+def test_repo_unblock_keeps_the_close_command_for_a_provably_dead_owner(tmp_path, monkeypatch):
+    """Reaping a dead owner is not a privilege — the command stays a command.
+
+    Exercised on the helper directly: `fleet guard` clears a dead session lease
+    before it renders a payload (referee.check_repo_with_session), so this
+    branch is unreachable through the CLI and would otherwise go untested.
+    """
+    _patch_paths(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dead_pid = 2147483646
+    conn = registry.connect()
+    registry.upsert_session_lease(
+        conn,
+        "sess-dead",
+        owner_pid=dead_pid,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    monkeypatch.setattr(registry, "_pid_exists", lambda pid: pid != dead_pid)
+
+    holder = {
+        "pid": dead_pid,
+        "name": "session sess-dead",
+        "workstream": "session",
+        "session_id": "sess-dead",
+        "repo_lock_mode": "exclusive",
+    }
+    assert (
+        cli_module._repo_unblock_command(conn, holder)
+        == "fleet session close --session-id sess-dead"
+    )
+    conn.close()
+
+
+def test_repo_unblock_falls_back_to_the_close_command_without_a_connection(tmp_path, monkeypatch):
+    """No registry handle -> no authority claim. Emit the command, unadorned."""
+    _patch_paths(monkeypatch, tmp_path)
+    holder = {
+        "pid": 4242,
+        "name": "session sess-x",
+        "workstream": "session",
+        "session_id": "sess-x",
+        "repo_lock_mode": "cooperative",
+    }
+    assert (
+        cli_module._repo_unblock_command(None, holder)
+        == "fleet session close --session-id sess-x"
+    )
+
+
+def test_repo_unblock_for_a_process_holder_is_unchanged(tmp_path, monkeypatch):
+    """The `fleet release --pid` arm is not a lease revocation and did not move."""
+    _patch_paths(monkeypatch, tmp_path)
+    holder = {"pid": 9191, "name": "mlx", "workstream": "serve"}
+    assert cli_module._repo_unblock_command(None, holder) == "fleet release --pid 9191"
 
 
 def test_guard_repo_cleans_stale_dead_exclusive_session_before_payload(tmp_path, monkeypatch):

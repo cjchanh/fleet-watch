@@ -126,11 +126,74 @@ def _is_documents_path(path: Path) -> bool:
     return True
 
 
-def _repo_unblock_command(holder: dict[str, Any] | None) -> str | None:
+def _cooperative_alternative(holder: dict[str, Any], requested_exclusive: bool) -> str:
+    """The path forward that does NOT require the holder's lease to end.
+
+    Which one is truthful depends on WHICH rule refused. An exclusive lease is
+    not arbitrated by scope at all (referee.check_repo_with_session denies on
+    the mode before it looks at overlap), so offering `--write-scope` there
+    would be the same species of false advice this function exists to remove.
+    """
+    if holder.get("repo_lock_mode") == "exclusive":
+        return "no --write-scope declaration bypasses an exclusive lease"
+    if requested_exclusive:
+        return (
+            "or drop --exclusive-repo-lock and declare --write-scope <paths>, "
+            "which proceeds when scopes do not overlap"
+        )
+    return (
+        "or narrow --write-scope <paths> so it does not overlap the holder's "
+        "scopes, and proceed"
+    )
+
+
+def _repo_unblock_command(
+    conn: sqlite3.Connection | None,
+    holder: dict[str, Any] | None,
+    requested_exclusive: bool = False,
+) -> str | None:
+    """Remedy text for a repo denial — a COMMAND only when one actually works.
+
+    Before 2026-09-03 this always emitted `fleet session close --session-id
+    <holder>`. Since `authorize_session_close` landed, that command DENIES for
+    a live foreign holder unless the requester is its owner, a descendant, or
+    an ancestor — so the guard was routing every blocked agent to a refusal
+    and calling it the unblock. The key name is unchanged (the JSON schema is
+    a cross-repo contract, see CLAUDE.md Cross-Folder Dependencies); what
+    changed is that its value is now true.
+    """
     if holder is None:
         return None
-    if holder.get("workstream") == "session" and holder.get("session_id"):
-        return f"fleet session close --session-id {holder['session_id']}"
+    session_id = holder.get("session_id")
+    if holder.get("workstream") == "session" and session_id:
+        close_cmd = f"fleet session close --session-id {session_id}"
+        if conn is None:
+            return close_cmd
+        authority = registry.describe_session_close_authority(conn, session_id)
+        status = authority["status"]
+        if status in {"reapable", "absent"}:
+            # Reaping a dead owner is not a privilege — anyone may run it, and
+            # invariant 3 says a dead owner must not hold a repo to the TTL.
+            return close_cmd
+        alternative = _cooperative_alternative(holder, requested_exclusive)
+        if status == "ttl_only":
+            return (
+                f"session {session_id} has no owner pid: `{close_cmd}` fails "
+                f"closed for every requester and the lease clears only on "
+                f"heartbeat TTL expiry ({registry.DEFAULT_STALE_SECONDS}s) — "
+                f"{alternative}"
+            )
+        if status == "uninspectable":
+            return (
+                f"session {session_id} owner pid {authority['owner_pid']} "
+                f"cannot be inspected: `{close_cmd}` fails closed for every "
+                f"requester until it can be — {alternative}"
+            )
+        return (
+            f"session {session_id} is live (owner pid {authority['owner_pid']}): "
+            f"only that pid, a descendant of it, or the terminal that spawned "
+            f"it may run `{close_cmd}` — {alternative}"
+        )
     if holder.get("pid") is not None:
         return f"fleet release --pid {holder['pid']}"
     return None
@@ -423,7 +486,9 @@ def _build_guard_payload(
                 "detail": decision.reason,
             },
         }
-        unblock_command = _repo_unblock_command(decision.holder)
+        unblock_command = _repo_unblock_command(
+            conn, decision.holder, requested_exclusive=exclusive_repo_lock
+        )
         if not decision.allowed and unblock_command:
             repo_check["unblock_command"] = unblock_command
         payload["checks"]["repo"] = repo_check
