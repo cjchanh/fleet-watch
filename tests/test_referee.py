@@ -865,10 +865,54 @@ def test_suggest_ports_skips_taken_and_requested():
 # and the os.kill(pid, 0) probe was reachable only AFTER that returned a row.
 
 
-def test_repo_denied_for_live_unregistered_git_writer(tmp_path):
-    """THE FAILING CASE. A git write in flight, nothing registered, must DENY."""
+def _stub_open_file_holders(monkeypatch, mapping: dict[str, dict[int, str]]):
+    """Make the lsof LOOKUP deterministic without changing what the probe MEANS.
+
+    Both verdicts below are decided by `probe_repo_writers`, but both were
+    reached through a real `lsof` subprocess with a 10s timeout. Under a loaded
+    full-suite run that call can exceed the timeout; `_open_file_holders` then
+    returns None and the probe degrades HELD->UNDETERMINED and STALE->
+    UNDETERMINED. The tests failed on the machine's load, not on the code —
+    a flake that would eventually be silenced rather than read.
+
+    The stub replaces only the external tool call, which is the one part of
+    this path that carries no logic. Everything the tests are actually about
+    still executes for real: descriptor-mode attribution, liveness filtering,
+    the positive control (which builds a real temp file and queries it through
+    this same seam, so it is exercised rather than faked), and the verdict
+    selection. `referee._lsof_can_attribute_open_files` itself is unpatched.
+
+    Real-lsof coverage is not removed by this: it lives, deliberately alone, in
+    `test_repo_writer_probe_has_a_working_positive_control`, whose entire
+    subject is that the real tool can attribute a real descriptor. This same
+    seam is the one `test_referee_stale_lock_attribution.py` already uses.
+    """
+
+    def fake(path):
+        key = str(path)
+        if key in mapping:
+            return dict(mapping[key])
+        if Path(key).name.startswith("fleet_watch_lsof_control_"):
+            # The probe's own positive-control file: the real lookup would find
+            # this process holding it writable, so say exactly that.
+            return {os.getpid(): "w"}
+        return {}
+
+    monkeypatch.setattr(referee, "_open_file_holders", fake)
+
+
+def test_repo_denied_for_live_unregistered_git_writer(tmp_path, monkeypatch):
+    """THE FAILING CASE. A git write in flight, nothing registered, must DENY.
+
+    The lock holder is a REAL live process — the liveness filter in
+    `probe_repo_writers` calls `registry._pid_exists` on it, so a fabricated
+    pid would take the dead branch and the test would prove nothing. Only the
+    lsof lookup is stubbed (see `_stub_open_file_holders`).
+    """
     conn = _fresh_conn()
     with _git_repo_with_held_lock(tmp_path) as (repo, holder_pid):
+        lock = repo / ".git" / "index.lock"
+        _stub_open_file_holders(monkeypatch, {str(lock): {holder_pid: "w"}})
         d = referee.check_repo(conn, str(repo))
         assert d.allowed is False, (
             f"a live git writer must block, got allowed={d.allowed} "
@@ -881,18 +925,23 @@ def test_repo_denied_for_live_unregistered_git_writer(tmp_path):
         assert "index.lock" in d.reason
 
 
-def test_repo_available_when_git_lock_is_stale_debris(tmp_path):
+def test_repo_available_when_git_lock_is_stale_debris(tmp_path, monkeypatch):
     """POSITIVE CONTROL for the refusal — it must not fire on lock PRESENCE.
 
     Measured on this machine: ~/Workspace/active/flight-atlas/.git/index.lock,
     0 bytes, 171.6 hours old, zero open descriptors. A "lock exists => DENY"
     rule refuses a repo like that forever, which teaches the operator to ignore
     the guard. Only an ATTRIBUTED lock may deny.
+
+    The empty-holder answer is what a real lsof returns for unheld debris; the
+    stub supplies it directly so the verdict does not depend on how busy the
+    machine is when the suite reaches this line.
     """
     conn = _fresh_conn()
     repo = tmp_path / "stale"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git" / "index.lock").write_text("")  # nobody holds it open
+    _stub_open_file_holders(monkeypatch, {str(repo / ".git" / "index.lock"): {}})
 
     probe = referee.probe_repo_writers(str(repo))
     assert probe.status == referee.REPO_WRITER_STALE, (
@@ -900,6 +949,38 @@ def test_repo_available_when_git_lock_is_stale_debris(tmp_path):
     )
     d = referee.check_repo(conn, str(repo))
     assert d.allowed is True, f"stale lock must not refuse, got {d.reason!r}"
+
+
+def test_stale_verdict_degrades_to_undetermined_when_the_control_cannot_run(
+    tmp_path, monkeypatch
+):
+    """The flake's MECHANISM, pinned as behaviour rather than left to load.
+
+    A slow `lsof` makes `_open_file_holders` return None inside the positive
+    control, the control returns False, and an unheld lock reads UNDETERMINED
+    instead of STALE. Direction is fail-closed (a DENY, never a widened
+    allow), but it means the availability of a repo with debris on it is
+    load-dependent. Recorded here so the degradation is a known contract and
+    not a mystery failure in a future suite run.
+    """
+    conn = _fresh_conn()
+    repo = tmp_path / "slow-lsof"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "index.lock").write_text("")
+
+    def fake(path):
+        key = str(path)
+        if Path(key).name.startswith("fleet_watch_lsof_control_"):
+            return None  # what a TimeoutExpired produces
+        return {}
+
+    monkeypatch.setattr(referee, "_open_file_holders", fake)
+
+    probe = referee.probe_repo_writers(str(repo))
+    assert probe.status == referee.REPO_WRITER_UNDETERMINED
+    assert "not evidence of a stale lock" in probe.detail
+    d = referee.check_repo(conn, str(repo))
+    assert d.allowed is False, "an unverified empty answer must not allow"
 
 
 def test_repo_writer_probe_has_a_working_positive_control():
