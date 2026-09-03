@@ -139,7 +139,14 @@ Top-level keys:
 - `overlap_paths` — paths that caused a write-scope denial
 - `stale_holders` — dead/stale session leases cleaned during the check
 - `safe_mode` — suggested operating mode such as `cooperative-write`
-- `unblock_command` when denied by a process or session holder Fleet can name directly
+- `unblock_command` when denied by a process or session holder Fleet can name
+  directly. A runnable command only when one truthfully exists — `fleet release
+  --pid <pid>` for a process holder, `fleet session close --session-id <id>`
+  for a session whose owner is provably dead. For a LIVE session holder it is
+  remedy TEXT instead, naming who may close the lease (its owner pid, a
+  descendant, or the terminal that spawned it) and the cooperative alternative,
+  because `fleet session close` is authorized to the lease's own lineage and
+  would refuse anyone else
 
 `checks.gpu` contains:
 
