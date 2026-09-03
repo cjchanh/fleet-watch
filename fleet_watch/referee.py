@@ -796,6 +796,13 @@ def check_repo_with_session(
     :func:`check_repo` — an unregistered NON-GIT writer on this path still
     cannot be seen, so ``allowed: true`` means "no registered holder and no
     live git writer", not "nobody is writing".
+
+    A COOPERATIVE session lease whose heartbeat is older than
+    ``registry.DEFAULT_STALE_SECONDS`` lapses for arbitration (it stops
+    blocking, is reported under ``stale_holders`` with
+    ``reason="cooperative_lease_idle_lapsed"``, and is not closed — the owner's
+    next heartbeat revives it). EXCLUSIVE leases do not lapse: an alive owner
+    blocks at any heartbeat age.
     """
     resolved_repo_dir = str(Path(repo_dir).resolve())
     requested_scopes = normalize_write_scopes(resolved_repo_dir, write_scopes)
@@ -864,6 +871,7 @@ def check_repo_with_session(
                 )
                 # Conservative arm: a null-PID lease only releases on TTL expiry
                 # (missing PID + fresh heartbeat keeps blocking — fail-closed).
+                lease_mode = lease.get("repo_lock_mode", "cooperative")
                 if owner_dead or (owner_missing and ttl_expired):
                     registry.close_session_lease(conn, lease["session_id"])
                     events.log_event(
@@ -880,8 +888,36 @@ def check_repo_with_session(
                     stale_holders.append(_session_holder_from_lease(lease))
                     continue
 
+                # COOPERATIVE IDLE LAPSE. The release arms above both require
+                # the owner to be gone, so a lease whose PID is ALIVE but whose
+                # heartbeat stopped blocked its scope forever — observed
+                # 2026-09-03 with a cooperative lease on ~/.claude idle 40+
+                # minutes, still refusing every whole-tree operation there.
+                # For COOPERATIVE leases only, a heartbeat older than the TTL
+                # this module already trusts (the ownerless arm above releases
+                # on exactly this signal) makes the lease LAPSED for
+                # ARBITRATION: it neither blocks an overlapping scope nor
+                # counts as a cooperative peer against an exclusive request.
+                #
+                # It is NOT closed. The row stays ACTIVE and the owner's next
+                # heartbeat revives it with no operator action and no new
+                # grant, so an idle session loses nothing durable — which is
+                # why lapsing is safe here and closing would not be. It is
+                # reported under stale_holders so an operator sees WHY a repo
+                # that has a live lease on it was handed to someone else.
+                #
+                # EXCLUSIVE leases keep the old behaviour exactly: an alive PID
+                # blocks regardless of heartbeat age. The ~/.claude SessionStart
+                # guard relies on that for fail-closed whole-tree protection,
+                # and an unparseable heartbeat yields age None, which is not
+                # expired — the unreadable case still blocks.
+                if lease_mode != "exclusive" and ttl_expired:
+                    lapsed_holder = _session_holder_from_lease(lease)
+                    lapsed_holder["reason"] = "cooperative_lease_idle_lapsed"
+                    stale_holders.append(lapsed_holder)
+                    continue
+
                 lease_holder = _session_holder_from_lease(lease)
-                lease_mode = lease.get("repo_lock_mode", "cooperative")
                 held_scopes = lease.get("write_scopes", [])
                 overlaps = _overlap_paths(requested_scopes, held_scopes)
                 if exclusive or lease_mode == "exclusive":
@@ -1198,7 +1234,10 @@ def summarize_holder(holder: dict[str, Any] | None) -> dict[str, Any] | None:
         "repo_dir": holder["repo_dir"],
         "gpu_mb": holder["gpu_mb"],
     }
-    for key in ("session_id", "provider", "external_id", "resource_type", "repo_lock_mode", "write_scopes"):
+    # ``reason`` rides along so a stale_holders entry can say WHY it is listed
+    # (e.g. "cooperative_lease_idle_lapsed", which is a lapse for arbitration,
+    # not a closed lease) instead of being indistinguishable from a reaped one.
+    for key in ("session_id", "provider", "external_id", "resource_type", "repo_lock_mode", "write_scopes", "reason"):
         if key in holder:
             summary[key] = holder.get(key)
     return summary

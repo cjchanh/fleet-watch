@@ -94,6 +94,187 @@ def _get_conn():
     return registry.connect()
 
 
+# ── Post-commit report refresh on the lease CLAIM paths ──────────────────────
+#
+# WHY THIS EXISTS. `session start` used to run `reporter.write_report(conn)`
+# INLINE, after the lease row was already committed, and only then echo the
+# acknowledgement. Measured on a temp registry with 30 leases (quiet machine):
+# preflight 0.9ms + upsert-and-commit 11.9ms + event 0.2ms = 13.8ms of decision,
+# then 897.9ms of report — 98.5% of the command runs after the claim is durable
+# and cannot change it. `reporter.build_state` fans out to `ps`/socket probes
+# (`get_session_processes` 445ms, `detect_orphans` 98ms, `get_idle_processes`
+# 93ms, `discover_ollama_runners` 64ms) with per-item timeouts but no aggregate
+# cap; its own docstring records an 8s `fleet status` from the same probes.
+#
+# The caller is a GATE. `~/.claude/hooks/single_writer_guard.py` runs this
+# command with a 5s subprocess timeout and resolves any failure to HALT, so a
+# slow report made the command report FAILURE for a claim that had SUCCEEDED —
+# observed live 2026-09-03 03:1xZ (`single_writer_claim_failed: timed out after
+# 5 seconds` while `fleet status --json` showed the lease ACTIVE, one scope,
+# started 03:10:56). An observability rewrite that cannot affect the grant must
+# not be able to falsify the grant's acknowledgement.
+#
+# So on the claim paths the order is: decide -> commit -> log -> ACK -> report,
+# and the report runs on its own connection under a wall-clock budget. If the
+# budget is exceeded the lease is already durable and already acknowledged; the
+# published report keeps its PRIOR generation (every report file is written via
+# tempfile + os.replace, so an abandoned refresh is never a torn file) and the
+# caller is told on stderr. The DB work here is ~14ms and `registry.connect`
+# already sets busy_timeout=5000 — lock contention was never the cause, so it
+# is not what is being fixed.
+REPORT_BUDGET_ENV = "FLEET_REPORT_BUDGET_S"
+DEFAULT_REPORT_BUDGET_S = 2.0
+# Coalescing window. Several sessions heartbeat every turn, so without this each
+# one pays for a full rebuild of a report the previous one just published — N
+# sessions produce N identical scans per turn. `fleet discover` republishes the
+# same report every 60s under launchd regardless, so the freshness this trades
+# away is bounded by the window, not unbounded.
+REPORT_MIN_INTERVAL_ENV = "FLEET_REPORT_MIN_INTERVAL_S"
+DEFAULT_REPORT_MIN_INTERVAL_S = 10.0
+# Coalescing keys on the newest of {completed generation, attempted refresh}.
+# ATTEMPTS have to count: on a host where the rebuild reliably exceeds the
+# budget, a success-only key never fires, so every claim would pay the full
+# budget forever and buy nothing. `fleet discover` (launchd, 60s) runs the same
+# report UNBOUNDED and is the guaranteed publisher; the claim path is
+# best-effort by design and must never be the thing standing between a gate and
+# its answer.
+REPORT_ATTEMPT_MARKER = ".report_refresh_attempt"
+
+
+def _float_env(name: str, default: float, *, allow_zero: bool = False) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
+
+
+def _report_budget_seconds() -> float:
+    """Wall-clock budget for the post-ack report refresh (env-overridable)."""
+    return _float_env(REPORT_BUDGET_ENV, DEFAULT_REPORT_BUDGET_S)
+
+
+def _report_min_interval_seconds() -> float:
+    """Skip the refresh when the published report is younger than this.
+
+    ``0`` disables coalescing (every claim refreshes).
+    """
+    return _float_env(
+        REPORT_MIN_INTERVAL_ENV, DEFAULT_REPORT_MIN_INTERVAL_S, allow_zero=True
+    )
+
+
+def _report_is_fresh() -> bool:
+    """True when the report was published OR attempted inside the window.
+
+    ``state.json`` is flipped LAST by ``reporter.write_report`` via
+    ``os.replace``, so a fresh mtime there proves a completed generation, never
+    a partial one. The attempt marker covers the case that success alone cannot:
+    a host slow enough that the rebuild never finishes inside the budget.
+    """
+    window = _report_min_interval_seconds()
+    if window <= 0:
+        return False
+    newest: float | None = None
+    for name in ("state.json", REPORT_ATTEMPT_MARKER):
+        try:
+            mtime = (registry.FLEET_DIR / name).stat().st_mtime
+        except OSError:
+            continue
+        newest = mtime if newest is None else max(newest, mtime)
+    if newest is None:
+        return False
+    return 0 <= time.time() - newest < window
+
+
+def _mark_report_attempt() -> None:
+    """Record that a refresh was started, so peers coalesce even if it fails."""
+    try:
+        registry.FLEET_DIR.mkdir(parents=True, exist_ok=True)
+        (registry.FLEET_DIR / REPORT_ATTEMPT_MARKER).touch()
+    except OSError:
+        pass
+
+
+def _publish_report_after_ack(context: str) -> bool:
+    """Refresh the published report after the caller's write is already durable.
+
+    Returns True when the refresh completed within its budget, or was skipped
+    because a completed generation is already younger than the coalescing
+    window. A False return is NOT a failure of the operation that called it: by
+    contract this runs only after the registry write committed and the
+    acknowledgement was emitted.
+
+    The refresh opens its OWN read-only-in-practice connection, so the caller
+    may close its handle first, and runs on a daemon thread so an overrun is
+    abandoned at process exit rather than blocking it.
+    """
+    if _report_is_fresh():
+        return True
+    _mark_report_attempt()
+
+    budget = _report_budget_seconds()
+    outcome: dict[str, Any] = {}
+
+    def _refresh() -> None:
+        conn = None
+        try:
+            conn = registry.connect()
+            reporter.write_report(conn)
+            outcome["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - never fatal to a committed claim
+            outcome["error"] = exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    worker = threading.Thread(
+        target=_refresh, name=f"fleet-report-{context}", daemon=True
+    )
+    worker.start()
+    worker.join(budget)
+
+    if worker.is_alive():
+        click.echo(
+            f"WARN: fleet report refresh exceeded {budget:g}s after {context}; "
+            "the lease is committed and this command's result stands. "
+            "~/.fleet-watch/state.json keeps its previous generation.",
+            err=True,
+        )
+        return False
+    error = outcome.get("error")
+    if error is not None:
+        click.echo(
+            f"WARN: fleet report refresh failed after {context}: {error}; "
+            "the lease is committed and this command's result stands.",
+            err=True,
+        )
+        return False
+    return True
+
+
+def _ack(message: str) -> None:
+    """Emit a claim acknowledgement and flush it before any slower work runs.
+
+    stdout is block-buffered when the caller is a pipe (every hook invocation),
+    so the flush is what makes "ack before report" true for a streaming reader
+    and not merely true in source order.
+    """
+    click.echo(message)
+    try:
+        sys.stdout.flush()
+    except (ValueError, OSError):
+        pass
+
+
 def _holder_text(holder: dict[str, Any] | None) -> str:
     if holder is None:
         return "none"
@@ -1349,10 +1530,10 @@ def share_repo(repo_dir: str):
         conn.close()
         sys.exit(1)
 
-    reporter.write_report(conn)
     conn.close()
     for lease in released:
-        click.echo(f"Released session lease {lease['session_id']} for {resolved_repo}")
+        _ack(f"Released session lease {lease['session_id']} for {resolved_repo}")
+    _publish_report_after_ack("share-repo release")
 
 
 @cli.command()
@@ -1389,7 +1570,42 @@ def session_start(
     write_scopes: tuple[str, ...],
     exclusive_repo_lock: bool,
 ):
-    """Open or refresh a session lease."""
+    """Open or refresh a session lease.
+
+    ACK CONTRACT (read this before treating a failure as a denial). The lease is
+    durable the moment ``upsert_session_lease`` commits; the acknowledgement on
+    stdout is emitted immediately after, BEFORE the observability report is
+    refreshed (see ``_publish_report_after_ack``). A caller that nonetheless
+    times out waiting for this process MUST NOT conclude the claim failed — a
+    timeout is evidence about the courier, not about the registry. Read the
+    registry back instead::
+
+        fleet session list --json
+
+    and treat the claim as SUCCEEDED iff ``session_leases`` contains an entry
+    with this ``--session-id`` where ``status == "ACTIVE"``, ``shutdown_at`` is
+    null, ``repo_dir`` equals the resolved ``--repo``, ``repo_lock_mode``
+    matches the mode requested, ``write_scopes`` matches the requested scopes
+    resolved to absolute paths, ``owner_alive`` is not False, and
+    ``last_heartbeat_at`` is a few seconds old (proving THIS invocation landed
+    rather than a lease from an earlier turn). Anything short of a full match
+    stays a failure. ``fleet status --json`` carries the same rows but also runs
+    the unbounded discovery fan-out that causes these timeouts, so
+    ``session list --json`` is the read-back this contract names. A non-zero
+    exit that printed ``DENY:`` is a real refusal and is never read back.
+
+    IDEMPOTENCY on re-invocation with the same ``--session-id``: the row is
+    keyed by session id and written ``ON CONFLICT DO UPDATE``, so a retry
+    refreshes exactly one lease — no duplicate, no ownership transfer,
+    ``started_at`` preserved, ``shutdown_at`` cleared, heartbeat refreshed,
+    scopes/mode replaced with the ones passed (identical on a retry), and
+    preflight re-run so a retry still cannot take a scope a peer claimed in the
+    interim. The one value a retry DOES change is ``fencing_epoch``, which
+    ``registry.upsert_session_lease`` advances on every grant. Its only reader
+    is ``registry.fencing_token_valid`` — advisory, with no production call
+    site — so a retry is safe today; a future epoch consumer must re-read the
+    epoch after a retry instead of caching one from before it.
+    """
     if write_scopes and repo_dir is None:
         raise click.UsageError("--write-scope requires --repo")
     conn = _get_conn()
@@ -1426,9 +1642,12 @@ def session_start(
             "write_scopes": list(write_scopes),
         },
     )
-    reporter.write_report(conn)
-    click.echo(f"Session {session_id} active (owner PID {resolved_owner_pid})")
+    # The claim is durable here. Acknowledge it, release the handle, and only
+    # then refresh the report — under a budget, because that refresh is
+    # observability and this command's answer is authorization.
+    _ack(f"Session {session_id} active (owner PID {resolved_owner_pid})")
     conn.close()
+    _publish_report_after_ack("session start")
 
 
 @session.command("heartbeat")
@@ -1472,9 +1691,12 @@ def session_heartbeat(
             "write_scopes": list(write_scopes),
         },
     )
-    reporter.write_report(conn)
-    click.echo(f"Session heartbeat updated for {session_id}")
+    # Same ordering rule as `session start`: heartbeats run every turn from
+    # several sessions at once, so this is the call site that GENERATES the
+    # `ps`-fan-out contention that made the claim path slow.
+    _ack(f"Session heartbeat updated for {session_id}")
     conn.close()
+    _publish_report_after_ack("session heartbeat")
 
 
 @session.command("ensure")
@@ -1541,9 +1763,14 @@ def session_ensure(
                     "write_scopes": list(write_scopes),
                 },
             )
-            reporter.write_report(conn)
+            # Ack before the report, same rule as `session start`. It also
+            # removes a real retry hazard: the report used to run inside this
+            # try, so an OSError from writing STATE_REPORT.md re-entered the
+            # retry loop and re-granted a lease that had already committed.
+            # `_publish_report_after_ack` never raises, so it cannot.
+            _ack(f"Session {session_id} active (owner PID {resolved_owner_pid})")
             conn.close()
-            click.echo(f"Session {session_id} active (owner PID {resolved_owner_pid})")
+            _publish_report_after_ack("session ensure")
             return
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as exc:
             last_err = exc
@@ -1622,11 +1849,14 @@ def session_close(session_id: str):
             "twin_lease": twin,
         },
     )
-    reporter.write_report(conn)
-    click.echo(f"Session {session_id} closed")
+    # Release is durable here; same ordering rule as the claim paths. A close
+    # that appears to fail is as damaging as a claim that appears to fail —
+    # the caller retries a revocation it already completed.
+    _ack(f"Session {session_id} closed")
     if twin["cleared"]:
         click.echo(f"Cleared Claude twin lease {twin['path']}")
     conn.close()
+    _publish_report_after_ack("session close")
 
 
 @session.command("list")

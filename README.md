@@ -292,6 +292,22 @@ exists.
 | `fleet session close` | Close a session lease (owner, its descendants, or its ancestor shell only; anyone may reap a provably-dead owner). Also clears the Claude single-writer twin state file. No `--force`. |
 | `fleet share-repo PATH` | Close active session leases for a `~/Documents/*` editorial handoff |
 
+These five commands answer as soon as the registry write is committed. The
+observability report is refreshed AFTER the acknowledgement, under a wall-clock
+budget (`FLEET_REPORT_BUDGET_S`, default 2s) and coalesced across concurrent
+sessions (`FLEET_REPORT_MIN_INTERVAL_S`, default 10s; `0` disables). A caller
+that nonetheless times out must READ THE REGISTRY BACK — `fleet session list
+--json` — before concluding the claim failed: a timeout is evidence about the
+courier, not about the lease. See `session start`'s docstring for the exact
+match conditions and for what a retry does to `fencing_epoch`.
+`fleet discover` remains the unbounded publisher of `STATE_REPORT.md` /
+`state.json`, so a skipped refresh here delays the report, never loses it.
+
+A COOPERATIVE lease whose owner is alive but whose heartbeat is older than 180s
+lapses for arbitration: it stops blocking and is reported under `stale_holders`
+with `reason: "cooperative_lease_idle_lapsed"`. It is not closed — the owner's
+next heartbeat revives it. EXCLUSIVE leases do not lapse.
+
 ### Process Management
 
 | Command | What It Does |
