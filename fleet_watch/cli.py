@@ -372,8 +372,9 @@ def _repo_unblock_command(
             )
         return (
             f"session {session_id} is live (owner pid {authority['owner_pid']}): "
-            f"only that pid, a descendant of it, or the terminal that spawned "
-            f"it may run `{close_cmd}` — {alternative}"
+            f"you from any of your own terminals, or that pid, a descendant of "
+            f"it, or the terminal that spawned it, may run `{close_cmd}` "
+            f"(another agent may not) — {alternative}"
         )
     if holder.get("pid") is not None:
         return f"fleet release --pid {holder['pid']}"

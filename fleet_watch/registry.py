@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -479,6 +480,124 @@ def _process_uid(pid: int | None) -> int | None:
         return None
 
 
+def _process_command(pid: int | None) -> str | None:
+    """Full argv of a live PID, or ``None`` when unresolvable.
+
+    ``None`` is a DENY signal for every caller, never "nothing interesting" — an
+    unreadable command is exactly what an agent hiding from the roster produces.
+    """
+    if pid is None or pid <= 0 or not _pid_exists(pid):
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return None
+    line = result.stdout.strip()
+    if result.returncode != 0 or not line:
+        return None
+    return line
+
+
+def _agent_runtime_roster() -> list[dict[str, str]]:
+    """The one roster, read lazily.
+
+    ``syshealth`` imports this module, so the dependency can only run this
+    direction at call time. An import failure returns ``None`` upward and every
+    caller denies — a roster that cannot be loaded must never read as "no agent".
+    """
+    from fleet_watch import syshealth  # local: syshealth imports registry
+
+    return syshealth.DEFAULT_SESSION_PATTERNS
+
+
+def _command_is_agent_runtime(command: str, roster: list[dict[str, str]]) -> bool:
+    """True when ``command`` looks like ANY roster runtime.
+
+    Deliberately over-matches relative to the census: an argv token whose
+    basename equals a roster ``binary`` counts, and so does the census regex.
+    Over-matching costs an operator one denied close; under-matching would hand
+    an agent the operator's own revocation authority.
+    """
+    for entry in roster:
+        pattern = entry.get("process_match")
+        if pattern:
+            try:
+                if re.search(pattern, command):
+                    return True
+            except re.error:
+                pass
+        binary = entry.get("binary")
+        if not binary:
+            continue
+        for token in command.split():
+            if os.path.basename(token) == binary:
+                return True
+            # A runtime's own directory in the path counts: `/opt/codex/bin/x`
+            # and `~/.claude/hooks/x.py` are both agent-side scripts. This is
+            # the fail-closed direction — it costs an operator running such a
+            # script one denied close (lineage still decides), where the reverse
+            # error would hand an agent the operator's revocation authority.
+            if (
+                f"/{binary}/" in token
+                or f"/.{binary}/" in token
+                or token.startswith((f"{binary}/", f".{binary}/"))
+            ):
+                return True
+    return False
+
+
+def _agent_runtime_in_ancestry(
+    pid: int | None,
+    max_hops: int = LINEAGE_MAX_HOPS,
+) -> bool | None:
+    """Is ``pid`` — or any ancestor of it — an agent runtime?
+
+    ``True`` = an agent was found. ``False`` = the ancestry was walked to init
+    with no match. ``None`` = the walk could not be completed (unreadable
+    command, uninspectable process, PPID cycle, hop budget exhausted) and every
+    caller MUST fail closed.
+    """
+    if pid is None or pid <= 0:
+        return None
+    try:
+        roster = _agent_runtime_roster()
+    except Exception:  # noqa: BLE001 - an unloadable roster must not read as "no agent"
+        return None
+    if not roster:
+        return None
+
+    current_pid = pid
+    seen: set[int] = set()
+    for _ in range(max_hops):
+        if current_pid in seen:
+            return None
+        seen.add(current_pid)
+
+        command = _process_command(current_pid)
+        if command is None:
+            return None
+        if _command_is_agent_runtime(command, roster):
+            return True
+
+        info = _inspect_process(current_pid)
+        if info is None or not info.get("inspectable"):
+            return None
+        parent_pid = info.get("ppid")
+        if not isinstance(parent_pid, int):
+            return None
+        if parent_pid in (0, 1):
+            return False
+        current_pid = parent_pid
+    return None
+
+
 def _lineage_proven(
     start_pid: int | None,
     target_pid: int | None,
@@ -544,6 +663,12 @@ def authorize_session_close(
       * an ANCESTOR of the owner (the Terminal shell that spawned the session)
         — an owner cannot outrank the shell that created it, and denying this
         forces unaudited hand-deletion of governance state;
+      * the OPERATOR SEAT — a requester of the same uid with NO agent runtime
+        anywhere in its ancestry, i.e. a human at any of their own terminals.
+        Lineage alone denied a second Terminal tab, which is a sibling of the
+        owner's parent, not an ancestor. Agents are excluded by construction
+        (a Claude/Codex/OpenCode/Grok process anywhere up the chain fails the
+        test), so this never lets one agent revoke another's lease;
       * anyone at all when the owner is PROVABLY dead — reaping a dead lease is
         not a privilege, and fleet-watch invariant 3 forbids a dead owner from
         holding a repo for up to the TTL.
@@ -585,9 +710,27 @@ def authorize_session_close(
     ancestor = _lineage_proven(owner_pid, requester_pid)
     if ancestor is True:
         return True, "requester is an ancestor of the session owner"
+
+    # Operator seat (2026-09-03). Lineage alone denied the operator's OWN hand:
+    # a second Terminal tab is a SIBLING of the owner's parent, so a human at
+    # their own machine could not close their own lease and was pushed to
+    # deleting governance state by hand. A same-uid requester with NO agent
+    # runtime anywhere in its ancestry is that hand. An agent — or any child of
+    # one — never reaches this arm, so one agent still cannot revoke another's
+    # lease. Ordered last: it only ever converts a would-be DENY into an ALLOW,
+    # and only after every identity and uid check above has already passed.
+    agent_in_ancestry = _agent_runtime_in_ancestry(requester_pid)
+    if agent_in_ancestry is False:
+        return True, "requester is the operator seat (same uid, no agent runtime in its ancestry)"
+    if agent_in_ancestry is None:
+        return False, "requester ancestry is uninspectable for agent runtimes (fail-closed)"
+
     if descendant is None or ancestor is None:
         return False, "requester lineage is uninspectable (fail-closed)"
-    return False, "requester is not the session owner, a descendant, or an ancestor"
+    return False, (
+        "requester is an agent runtime and is not the session owner, a descendant, "
+        "or an ancestor"
+    )
 
 
 def describe_session_close_authority(

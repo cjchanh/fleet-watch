@@ -64,8 +64,12 @@ def test_memory_state_unavailable_on_failure(monkeypatch):
 def test_session_processes_returns_list():
     sessions = syshealth.get_session_processes()
     assert isinstance(sessions, list)
+    # Derived from the roster, not restated: the roster gained OpenCode and
+    # Grok on 2026-09-03 and a hardcoded pair would have called a correct
+    # census a failure. It is also the table the close-authority arm reads.
+    known_kinds = {p["kind"] for p in syshealth.DEFAULT_SESSION_PATTERNS}
     for s in sessions:
-        assert s.kind in ("claude-code", "codex")
+        assert s.kind in known_kinds
         assert s.rss_mb >= 0
         assert s.pid > 0
 

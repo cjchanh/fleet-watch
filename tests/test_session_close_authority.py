@@ -55,10 +55,20 @@ TREE = {
 }
 
 
-def _install_fake_process_table(monkeypatch, tree=None, uids=None, uninspectable=()):
-    """Replace every kernel probe registry uses with a deterministic table."""
+def _install_fake_process_table(
+    monkeypatch, tree=None, uids=None, uninspectable=(), commands=None
+):
+    """Replace every kernel probe registry uses with a deterministic table.
+
+    ``commands`` feeds the operator-seat arm (2026-09-03), which asks whether an
+    agent runtime sits anywhere in the requester's ancestry. Default: every
+    process in this tree is an agent runtime, which keeps every pre-existing
+    case in this module answering the LINEAGE question it was written to test.
+    A test that wants the operator seat says so by passing a plain command.
+    """
     tree = TREE if tree is None else tree
     uids = {} if uids is None else uids
+    commands = {} if commands is None else commands
 
     def pid_exists(pid):
         return pid in tree
@@ -93,10 +103,16 @@ def _install_fake_process_table(monkeypatch, tree=None, uids=None, uninspectable
             return None
         return uids.get(pid, TEST_UID)
 
+    def process_command(pid):
+        if pid not in tree:
+            return None
+        return commands.get(pid, "/Users/cj/.local/bin/claude --effort max")
+
     monkeypatch.setattr(registry, "_pid_exists", pid_exists)
     monkeypatch.setattr(registry, "_pid_create_time", create_time)
     monkeypatch.setattr(registry, "_inspect_process", inspect)
     monkeypatch.setattr(registry, "_process_uid", process_uid)
+    monkeypatch.setattr(registry, "_process_command", process_command)
 
 
 def _fresh_conn() -> sqlite3.Connection:
@@ -200,8 +216,14 @@ def test_recycled_owner_pid_counts_as_dead(monkeypatch):
 
 # ── DENY: everything that is not positive proof ──────────────────────────────
 
-def test_unrelated_live_process_is_denied(monkeypatch):
-    """THE core threat: cross-session revocation producing two writers."""
+def test_unrelated_live_agent_process_is_denied(monkeypatch):
+    """THE core threat: cross-session revocation producing two writers.
+
+    The requester here is an AGENT (the fixture's default command), which is
+    what makes this the threat model — an agent reaching across to revoke a
+    peer's lease. The operator's own hand is a different principal and is
+    covered by the operator-seat arm below.
+    """
     _install_fake_process_table(monkeypatch)
     conn = _fresh_conn()
     _open_lease(conn)
@@ -209,7 +231,28 @@ def test_unrelated_live_process_is_denied(monkeypatch):
     allowed, reason = registry.authorize_session_close(conn, "sess-a", 600)
 
     assert allowed is False
-    assert reason == "requester is not the session owner, a descendant, or an ancestor"
+    assert reason == (
+        "requester is an agent runtime and is not the session owner, a descendant, "
+        "or an ancestor"
+    )
+
+
+def test_unrelated_live_operator_process_is_allowed(monkeypatch):
+    """The 2026-09-03 incident: the operator's OTHER terminal tab.
+
+    Same uid, no agent runtime in its ancestry — a human at their own machine.
+    Denying this forced hand-deletion of governance state twice in one night.
+    """
+    _install_fake_process_table(
+        monkeypatch, commands={600: "-zsh", 1: "/sbin/launchd"}
+    )
+    conn = _fresh_conn()
+    _open_lease(conn)
+
+    allowed, reason = registry.authorize_session_close(conn, "sess-a", 600)
+
+    assert allowed is True, reason
+    assert "operator seat" in reason
     assert _status(conn) == "ACTIVE"
 
 
@@ -455,7 +498,7 @@ def test_cli_close_denies_unrelated_requester_and_exits_nonzero(tmp_path, monkey
     )
 
     assert result.exit_code == 3
-    assert "DENY: requester is not the session owner" in result.output
+    assert "DENY: requester is an agent runtime and is not the session owner" in result.output
     conn = registry.connect()
     assert _status(conn) == "ACTIVE"
     conn.close()

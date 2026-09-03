@@ -18,16 +18,46 @@ from fleet_watch import registry
 
 # --- Default patterns (overridable via config.json) ---
 
+# The agent-runtime roster. ONE table, two readers with different jobs:
+#
+#   process_match — the CENSUS regex. Narrow on purpose: it answers "is this
+#                   process a live agent session worth counting", so it may
+#                   miss an idle or oddly-invoked runtime without harm.
+#   binary        — the AUTHORIZATION name (registry._agent_runtime_in_ancestry).
+#                   Matched against every argv token's basename, so it catches a
+#                   runtime the census regex would skip. Authorization asks the
+#                   opposite question — "could this possibly be an agent" — and
+#                   must over-match, because a missed runtime there would hand an
+#                   agent the operator's own authority (see the operator-seat arm
+#                   in registry.authorize_session_close).
+#
+# Keeping both fields in one table is the point: a runtime added for the census
+# is simultaneously known to the authorization path, and a runtime that is
+# invisible to authorization is visibly missing from the census too.
 DEFAULT_SESSION_PATTERNS: list[dict[str, str]] = [
     {
         "name": "Claude Code",
         "kind": "claude-code",
         "process_match": r"/claude\b.*--",
+        "binary": "claude",
     },
     {
         "name": "Codex",
         "kind": "codex",
         "process_match": r"/codex\b",
+        "binary": "codex",
+    },
+    {
+        "name": "OpenCode",
+        "kind": "opencode",
+        "process_match": r"/opencode\b",
+        "binary": "opencode",
+    },
+    {
+        "name": "Grok CLI",
+        "kind": "grok",
+        "process_match": r"/grok\b",
+        "binary": "grok",
     },
 ]
 
