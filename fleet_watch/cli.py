@@ -20,6 +20,7 @@ import click
 
 from fleet_watch import autonomous as autonomous_mod
 from fleet_watch import boot_map as boot_map_mod
+from fleet_watch import claude_lease_twin
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
@@ -1503,20 +1504,63 @@ def session_ensure(
 @session.command("close")
 @click.option("--session-id", required=True, help="Session identifier")
 def session_close(session_id: str):
-    """Close a session lease without touching attached processes."""
+    """Close a session lease without touching attached processes.
+
+    Authorized to the lease's own lineage only — the owner PID, a descendant of
+    it, or an ancestor of it (the shell that spawned the session) — plus anyone
+    at all once the owner is provably dead. A session id is a public locator, so
+    holding it is not authority. There is no --force: an override on a
+    revocation path is a fail-open path.
+
+    Two requester identities are tried because ``fleet`` is itself a child of
+    the shell that invoked it: ``os.getppid()`` is the true requester and is the
+    only one that can prove the ANCESTOR relation, while ``os.getpid()`` covers
+    the descendant walk from this process.
+    """
     conn = _get_conn()
+    lease = registry.get_session_lease(conn, session_id)
+    if lease is None:
+        click.echo(f"Session {session_id} not found", err=True)
+        conn.close()
+        sys.exit(2)
+
+    allowed, reason = registry.authorize_session_close(conn, session_id, os.getppid())
+    if not allowed:
+        allowed, self_reason = registry.authorize_session_close(
+            conn, session_id, os.getpid()
+        )
+        if allowed:
+            reason = self_reason
+    if not allowed:
+        click.echo(f"DENY: {reason}", err=True)
+        conn.close()
+        sys.exit(3)
+
     ok = registry.close_session_lease(conn, session_id)
     if not ok:
         click.echo(f"Session {session_id} not found", err=True)
         conn.close()
         sys.exit(2)
+
+    twin = claude_lease_twin.clear_twin_lease(
+        session_id,
+        lease.get("repo_dir"),
+        lease.get("owner_pid"),
+    )
     events.log_event(
         conn,
         "SESSION_CLOSE",
-        detail={"session_id": session_id},
+        detail={
+            "session_id": session_id,
+            "requester_pid": os.getppid(),
+            "authorization": reason,
+            "twin_lease": twin,
+        },
     )
     reporter.write_report(conn)
     click.echo(f"Session {session_id} closed")
+    if twin["cleared"]:
+        click.echo(f"Cleared Claude twin lease {twin['path']}")
     conn.close()
 
 

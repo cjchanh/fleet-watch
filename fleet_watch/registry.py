@@ -16,6 +16,11 @@ DEFAULT_GPU_TOTAL_MB = 131072
 DEFAULT_GPU_RESERVE_MB = 16384
 DEFAULT_STALE_SECONDS = 180
 DEFAULT_SESSION_LEASE_CLEANUP_LIMIT = 50
+# Bound on any PPID walk used for an authorization decision. Real process trees
+# on this host are single digits deep; the budget exists so an inspection error
+# or a PPID cycle terminates as "uninspectable" (fail-closed) instead of
+# spinning up unbounded `ps` calls inside a gate.
+LINEAGE_MAX_HOPS = 32
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS processes (
@@ -283,6 +288,33 @@ def _owner_still_alive(pid: int | None, recorded_create_time: str | None) -> boo
     return live == recorded_create_time
 
 
+def _owner_identity_proven(
+    pid: int | None,
+    recorded_create_time: str | None,
+) -> bool | None:
+    """Return positive process identity proof for authorization decisions.
+
+    Tri-state, unlike :func:`_owner_still_alive`, which resolves uncertainty
+    toward "alive" because its job is to keep a lease BLOCKING. Authorization
+    cannot reuse that bias: "probably the owner" must not open a privilege.
+
+    ``True``  — the PID exists and its kernel create-time matches the one
+                recorded at lease open (identity positively proven).
+    ``False`` — the PID is gone, or the create-time no longer matches, which
+                positively proves the original owner is dead (PID reuse).
+    ``None``  — identity is unprovable (no recorded create-time, or ``ps`` is
+                unavailable/unreadable). Callers MUST fail closed.
+    """
+    if pid is None or pid <= 0 or not _pid_exists(pid):
+        return False
+    if not recorded_create_time:
+        return None
+    live_create_time = _pid_create_time(pid)
+    if live_create_time is None:
+        return None
+    return live_create_time == recorded_create_time
+
+
 def _lease_owner_alive(lease: dict[str, Any] | None) -> bool:
     """Positively confirm a lease's owner process is the SAME process that opened
     it — PID exists AND, when a create-time was recorded, the live PID's
@@ -417,6 +449,145 @@ def _inspect_process(pid: int | None) -> dict[str, Any] | None:
             "tty": tty,
             "error": f"unexpected ps output: {line}",
         }
+
+
+def _process_uid(pid: int | None) -> int | None:
+    """Return the numeric owning uid of a live PID, or ``None`` when unresolvable.
+
+    ``None`` is an authorization DENY signal, never "same uid" — an unreadable
+    uid is exactly the case an attacker would engineer.
+    """
+    if pid is None or pid <= 0 or not _pid_exists(pid):
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "uid=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return None
+    line = result.stdout.strip()
+    if result.returncode != 0 or not line:
+        return None
+    try:
+        return int(line.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _lineage_proven(
+    start_pid: int | None,
+    target_pid: int | None,
+    max_hops: int = LINEAGE_MAX_HOPS,
+) -> bool | None:
+    """Prove ``target_pid`` is ``start_pid`` itself or an ANCESTOR of it, by PPID.
+
+    ``True`` is positive proof. ``False`` is a fully inspected non-match (the
+    walk reached init without meeting the target). ``None`` means the lineage
+    could not be inspected — ``ps`` unavailable, output unparseable, a PPID
+    cycle, or the hop budget exhausted — and callers MUST fail closed.
+
+    Direction is the caller's choice, which is what makes both an ancestor and a
+    descendant check expressible with one bounded walk:
+      * descendant arm — ``_lineage_proven(requester, owner)``
+      * ancestor arm  — ``_lineage_proven(owner, requester)``
+
+    PGID and TTY are recorded audit evidence only; neither grants authority.
+    """
+    if start_pid is None or start_pid <= 0:
+        return None
+    if target_pid is None or target_pid <= 0:
+        return False
+    if start_pid == target_pid:
+        return True
+
+    current_pid = start_pid
+    seen: set[int] = set()
+    for _ in range(max_hops):
+        if current_pid in seen:
+            return None
+        seen.add(current_pid)
+
+        info = _inspect_process(current_pid)
+        if info is None or not info.get("inspectable"):
+            return None
+        parent_pid = info.get("ppid")
+        if not isinstance(parent_pid, int):
+            return None
+        if parent_pid == target_pid:
+            return True
+        if parent_pid in (0, 1):
+            return False
+        current_pid = parent_pid
+    return None
+
+
+def authorize_session_close(
+    conn: sqlite3.Connection,
+    session_id: str,
+    requester_pid: int | None,
+) -> tuple[bool, str]:
+    """Decide whether ``requester_pid`` may close ``session_id``'s lease.
+
+    Closing a lease is a PRIVILEGE REVOCATION: an ACTIVE lease is what makes
+    ``fleet guard --json`` answer DENY for every other agent, so a close turns
+    that DENY into ALLOW. A session id is a public locator (``fleet session
+    list`` prints it), never a bearer token — possession grants nothing.
+
+    Authorized, and only these:
+      * the owner PID itself;
+      * a DESCENDANT of the owner (the session's own ``bash``/``fleet`` child);
+      * an ANCESTOR of the owner (the Terminal shell that spawned the session)
+        — an owner cannot outrank the shell that created it, and denying this
+        forces unaudited hand-deletion of governance state;
+      * anyone at all when the owner is PROVABLY dead — reaping a dead lease is
+        not a privilege, and fleet-watch invariant 3 forbids a dead owner from
+        holding a repo for up to the TTL.
+
+    Every other outcome denies, including every uncertainty: unresolvable uid,
+    uninspectable lineage, unprovable owner identity, a PPID cycle, or a lease
+    with a NULL ``owner_pid`` (whose liveness belongs to the referee's TTL arm,
+    not to this path). There is deliberately no ``--force`` and no environment
+    override — an override is a fail-open path by construction.
+
+    Returns ``(allowed, reason)``; the reason is always safe to print.
+    """
+    lease = get_session_lease(conn, session_id)
+    if lease is None:
+        return False, "session lease not found"
+    if requester_pid is None or requester_pid <= 0:
+        return False, "requester pid is unknown (fail-closed)"
+
+    owner_pid = lease.get("owner_pid")
+    if not isinstance(owner_pid, int) or owner_pid <= 0:
+        return False, "session lease has no owner pid; close is TTL-governed (fail-closed)"
+
+    owner_identity = _owner_identity_proven(owner_pid, lease.get("owner_create_time"))
+    if owner_identity is False:
+        return True, f"session owner pid {owner_pid} is provably dead; reaping"
+    if owner_identity is None:
+        return False, "session owner identity is uninspectable (fail-closed)"
+
+    owner_uid = _process_uid(owner_pid)
+    requester_uid = _process_uid(requester_pid)
+    if owner_uid is None or requester_uid is None:
+        return False, "requester or owner uid is unresolvable (fail-closed)"
+    if owner_uid != requester_uid:
+        return False, "requester uid does not match the session owner uid"
+
+    descendant = _lineage_proven(requester_pid, owner_pid)
+    if descendant is True:
+        return True, "requester is the session owner or a descendant of it"
+    ancestor = _lineage_proven(owner_pid, requester_pid)
+    if ancestor is True:
+        return True, "requester is an ancestor of the session owner"
+    if descendant is None or ancestor is None:
+        return False, "requester lineage is uninspectable (fail-closed)"
+    return False, "requester is not the session owner, a descendant, or an ancestor"
 
 
 def _is_parent_chain_detached(pid: int) -> bool | None:

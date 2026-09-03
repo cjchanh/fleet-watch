@@ -282,7 +282,7 @@ exists.
 | `fleet session start` | Open or refresh a session lease |
 | `fleet session heartbeat` | Refresh session lease heartbeat |
 | `fleet session ensure` | Idempotent session management with retry |
-| `fleet session close` | Close a session lease |
+| `fleet session close` | Close a session lease (owner, its descendants, or its ancestor shell only; anyone may reap a provably-dead owner). Also clears the Claude single-writer twin state file. No `--force`. |
 | `fleet share-repo PATH` | Close active session leases for a `~/Documents/*` editorial handoff |
 
 ### Process Management
