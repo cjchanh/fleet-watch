@@ -23,6 +23,11 @@ telemetry is treated as pressured/critical, so a blind guard refuses rather than
 admit a workload onto a possibly-starved host (the dangerous direction here is
 under-refusal letting a real OOM through).
 
+Spec 2624307 — the syshealth failure provenance (``MemoryState.failure_reason``,
+``ProbeResult.failure_reason``) is carried through the verdict, and a blind
+refusal's reason names the unavailable telemetry instead of asserting a physical
+"avail 0MB" that was never measured. A genuine zero is still reported as 0MB.
+
 All gates run in audit-only mode for the first 10 cycles post-deployment.
 Threshold crossings emit structured events to state_changelog.jsonl.
 """
@@ -110,6 +115,11 @@ class SwapPressureVerdict:
     mem_pressure_pct: int = -1
     mem_pressured: bool = True
     pressure_level: int | None = None
+    # Spec 2624307 — deterministic failure provenance from syshealth, set only
+    # when the corresponding probe was unavailable (None/unavailable state).
+    # Distinguishes a blind refusal from a genuine physical 0 MB reading.
+    pressure_failure_reason: str | None = None
+    mem_failure_reason: str | None = None
     scaled_avail_floor_mb: int = 0
     warning: bool = False
     gpu_blocked: bool = False
@@ -132,6 +142,8 @@ class SwapPressureVerdict:
             "mem_pressure_pct": self.mem_pressure_pct,
             "mem_pressured": self.mem_pressured,
             "pressure_level": self.pressure_level,
+            "pressure_failure_reason": self.pressure_failure_reason,
+            "mem_failure_reason": self.mem_failure_reason,
             "scaled_avail_floor_mb": self.scaled_avail_floor_mb,
             "warning": self.warning,
             "gpu_blocked": self.gpu_blocked,
@@ -217,7 +229,10 @@ def check_swap_pressure(
 
     FAIL-CLOSED: an unreadable pressure level (``None``) OR unavailable memory
     telemetry is treated as pressured/critical — both GPU and ALL refuse — so a
-    blind guard never admits a workload onto a possibly-starved host.
+    blind guard never admits a workload onto a possibly-starved host. Blind
+    probes also record syshealth's failure provenance on the verdict
+    (``pressure_failure_reason`` / ``mem_failure_reason``, spec 2624307) so a
+    blind refusal is distinguishable from a genuine physical 0 MB reading.
 
     ``swap_state`` / ``mem_state`` / ``pressure_level`` / ``total_mem_mb`` may be
     injected for testing; by default they are read live from syshealth.
@@ -226,11 +241,20 @@ def check_swap_pressure(
     t = {**DEFAULT_THRESHOLDS, **load_thresholds(), **(thresholds or {})}
     swap = swap_state if swap_state is not None else syshealth.get_swap_state()
     mem = mem_state if mem_state is not None else syshealth.get_memory_state()
-    level = (
-        syshealth.get_vm_pressure_level()
-        if pressure_level is _UNSET
-        else pressure_level
-    )
+    # Spec 2624307 — carry syshealth's deterministic failure provenance. The
+    # governing level read stays ``get_vm_pressure_level``; provenance is only
+    # resolved when that read is blind, so a readable level costs nothing and
+    # patched-over readers keep their exact prior behavior.
+    pressure_failure: str | None = None
+    if pressure_level is _UNSET:
+        level = syshealth.get_vm_pressure_level()
+        if level is None:
+            probe = syshealth.get_vm_pressure_probe()
+            pressure_failure = probe.failure_reason or "unavailable"
+    else:
+        level = pressure_level
+        if level is None:
+            pressure_failure = "unavailable"
     live_probe = (
         swap_state is None
         and mem_state is None
@@ -261,6 +285,14 @@ def check_swap_pressure(
 
     mem_available = mem.available_mb if mem.is_available else 0
     mem_pressure = mem.pressure_pct if mem.is_available else -1
+    # Provenance for a blind memory probe: syshealth's recorded failure reason
+    # (e.g. ``vm_stat_timeout``) or a neutral marker when the caller injected a
+    # state without one. Never set when telemetry was readable.
+    mem_failure = (
+        (getattr(mem, "failure_reason", None) or "unavailable")
+        if not mem.is_available
+        else None
+    )
 
     # Available-RAM floor scaled to the host (a fixed floor is wrong across a
     # 16GB laptop and a 128GB Mac); the absolute min keeps a sane lower bound.
@@ -295,6 +327,8 @@ def check_swap_pressure(
         mem_pressure_pct=mem_pressure,
         mem_pressured=gpu_pressured,
         pressure_level=level,
+        pressure_failure_reason=pressure_failure,
+        mem_failure_reason=mem_failure,
         scaled_avail_floor_mb=scaled_floor,
         thresholds_used=t,
     )
@@ -320,6 +354,24 @@ def check_swap_pressure(
     return verdict
 
 
+def _blind_provenance_parts(verdict: SwapPressureVerdict) -> list[str]:
+    """Human-readable provenance for unavailable telemetry (spec 2624307).
+
+    Empty when every probe was readable, so callers keep the physical reading
+    (which may honestly be 0 MB). Non-empty only for a blind probe — the
+    refusal must then name the unavailable telemetry, never assert a physical
+    "avail 0MB" that was never measured.
+    """
+    parts: list[str] = []
+    if verdict.pressure_failure_reason:
+        parts.append(
+            f"vm_pressure_level unreadable ({verdict.pressure_failure_reason})"
+        )
+    if verdict.mem_failure_reason:
+        parts.append(f"memory probe unavailable ({verdict.mem_failure_reason})")
+    return parts
+
+
 def guard_decision(
     verdict: SwapPressureVerdict,
     gpu_requested: bool = False,
@@ -330,8 +382,13 @@ def guard_decision(
 
     In audit mode (< audit_floor cycles), gates never block —
     they emit advisory events only.
+
+    When telemetry was blind (spec 2624307 provenance carried on the verdict),
+    the refusal/audit note names the unavailable probes instead of asserting a
+    physical "avail 0MB" reading that never happened.
     """
     in_audit = audit_cycles < audit_floor
+    blind_parts = _blind_provenance_parts(verdict)
 
     result: dict[str, Any] = {
         "allowed": True,
@@ -340,6 +397,20 @@ def guard_decision(
     }
 
     if verdict.all_blocked:
+        if blind_parts:
+            provenance = "; ".join(blind_parts)
+            if in_audit:
+                result["audit_note"] = (
+                    f"would BLOCK all workloads (memory telemetry unavailable: "
+                    f"{provenance})"
+                )
+            else:
+                result["allowed"] = False
+                result["reason"] = (
+                    f"memory telemetry unavailable ({provenance}), "
+                    "fail-closed: all new workloads refused"
+                )
+            return result
         if in_audit:
             result["audit_note"] = (
                 f"would BLOCK all workloads (vm_pressure_level="

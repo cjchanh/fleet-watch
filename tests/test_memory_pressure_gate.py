@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import fleet_watch.guards.memory_pressure as memory_pressure
+from fleet_watch import syshealth
 from fleet_watch.guards.memory_pressure import (
     SwapPressureVerdict,
     check_swap_pressure,
@@ -164,6 +165,8 @@ def _blind_live_probes(monkeypatch, tmp_path):
                         lambda: _mem(0, -1, avail=False))
     monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_level",
                         lambda: None)
+    monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_probe",
+                        lambda: syshealth.ProbeResult(None, "timeout"))
     monkeypatch.setattr(memory_pressure.syshealth, "get_total_memory_mb",
                         lambda: _MB_128GB)
 
@@ -406,6 +409,148 @@ class TestLoadThresholdsMemoryKeys:
         assert t["pressure_gpu_level"] == 2
         assert t["avail_floor_pct"] == DEFAULT_THRESHOLDS["avail_floor_pct"]
         assert "swap_refusal_min_avail_mb" in t
+
+
+class TestTelemetryProvenance:
+    """Spec 2624307: syshealth failure provenance carried through the gate.
+
+    Blind telemetry stays fail-closed (all_blocked=true, allowed=false) but the
+    refusal reason must identify the UNAVAILABLE telemetry instead of asserting
+    a physical "avail 0MB" that was never measured. A genuine zero, read by
+    healthy telemetry, keeps the existing numeric refusal."""
+
+    def test_blind_injected_probes_fail_closed_with_provenance(self):
+        # AC#2: injected unavailable pressure + memory probes refuse, and the
+        # refusal reason names telemetry unavailability — never "avail 0MB".
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(30.0),
+                                mem_state=_mem(0, -1, avail=False),
+                                pressure_level=None, total_mem_mb=_MB_128GB)
+        assert v.all_blocked
+        assert v.pressure_failure_reason == "unavailable"
+        assert v.mem_failure_reason == "unavailable"
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is False
+        assert "memory telemetry unavailable" in d["reason"]
+        assert "vm_pressure_level unreadable (unavailable)" in d["reason"]
+        assert "memory probe unavailable (unavailable)" in d["reason"]
+        assert "0MB" not in d["reason"]
+
+    def test_blind_live_probes_carry_syshealth_provenance(self, tmp_path, monkeypatch):
+        # Live probes blind: syshealth's deterministic provenance (ProbeResult /
+        # MemoryState failure_reason) flows onto the verdict and into the
+        # decision dict. Hermetic — every probe is patched.
+        monkeypatch.setattr(memory_pressure, "FLEET_DIR", tmp_path)
+        monkeypatch.setattr(memory_pressure, "load_thresholds",
+                            lambda: dict(DEFAULT_THRESHOLDS))
+        monkeypatch.setattr(memory_pressure.syshealth, "get_swap_state",
+                            lambda: _swap(0.0, avail=False))
+        monkeypatch.setattr(
+            memory_pressure.syshealth, "get_memory_state",
+            lambda: syshealth.MemoryState(0, 0, 0, 0, 0, 0,
+                                          failure_reason="vm_stat_timeout"),
+        )
+        monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_level",
+                            lambda: None)
+        monkeypatch.setattr(memory_pressure.syshealth, "get_vm_pressure_probe",
+                            lambda: syshealth.ProbeResult(None, "timeout"))
+        monkeypatch.setattr(memory_pressure.syshealth, "get_total_memory_mb",
+                            lambda: _MB_128GB)
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+        assert v.all_blocked
+        assert v.telemetry_source == "live"
+        assert v.pressure_failure_reason == "timeout"
+        assert v.mem_failure_reason == "vm_stat_timeout"
+
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is False
+        assert "vm_pressure_level unreadable (timeout)" in d["reason"]
+        assert "memory probe unavailable (vm_stat_timeout)" in d["reason"]
+        assert "0MB" not in d["reason"]
+        assert d["verdict"]["pressure_failure_reason"] == "timeout"
+        assert d["verdict"]["mem_failure_reason"] == "vm_stat_timeout"
+
+    def test_blind_probes_fail_closed_only_memory_blind(self):
+        # Readable NORMAL level but blind memory probe: still all-blocked, and
+        # the reason names only the memory probe as unavailable.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(30.0),
+                                mem_state=_mem(0, -1, avail=False),
+                                pressure_level=_NORMAL, total_mem_mb=_MB_128GB)
+        assert v.all_blocked
+        assert v.pressure_failure_reason is None
+        assert v.mem_failure_reason == "unavailable"
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is False
+        assert "memory probe unavailable (unavailable)" in d["reason"]
+        assert "vm_pressure_level unreadable" not in d["reason"]
+        assert "0MB" not in d["reason"]
+
+    def test_blind_audit_note_identifies_unavailability(self):
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(30.0),
+                                mem_state=_mem(0, -1, avail=False),
+                                pressure_level=None, total_mem_mb=_MB_128GB)
+        d = guard_decision(v, audit_cycles=3, audit_floor=10)
+        assert d["allowed"] is True      # audit mode never blocks
+        assert d["audit_mode"] is True
+        assert "memory telemetry unavailable" in d["audit_note"]
+        assert "0MB" not in d["audit_note"]
+
+    def test_genuine_zero_avail_keeps_physical_zero_reason(self):
+        # VALID telemetry reporting a true 0 MB available: refusal stays the
+        # existing numeric form — that is what makes it distinguishable from
+        # the blind refusal above.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(30.0), mem_state=_mem(0, 96),
+                                pressure_level=_NORMAL, total_mem_mb=_MB_128GB)
+        assert v.all_blocked
+        assert v.mem_failure_reason is None
+        assert v.pressure_failure_reason is None
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is False
+        assert d["reason"].startswith("memory pressure critical")
+        assert "avail 0MB" in d["reason"]
+
+    def test_low_memory_refusal_retains_existing_reason(self):
+        # AC#3: a valid low-memory fixture keeps the existing critical refusal.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(30.0), mem_state=_mem(3000, 50),
+                                pressure_level=_NORMAL, total_mem_mb=_MB_128GB)
+        assert v.all_blocked
+        assert v.mem_failure_reason is None
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is False
+        assert d["reason"].startswith("memory pressure critical")
+        assert "avail 3000MB" in d["reason"]
+
+    def test_healthy_telemetry_retains_admission(self):
+        # AC#3: valid healthy telemetry keeps admission, no provenance recorded.
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS),
+                                swap_state=_swap(20.0),
+                                mem_state=_mem(64000, 20),
+                                pressure_level=_NORMAL, total_mem_mb=_MB_128GB)
+        assert not v.all_blocked
+        assert not v.gpu_blocked
+        assert v.pressure_failure_reason is None
+        assert v.mem_failure_reason is None
+        assert guard_decision(v, audit_cycles=20)["allowed"] is True
+
+    def test_state_fallback_verdict_has_no_provenance(self, tmp_path, monkeypatch):
+        # The state snapshot is real telemetry written by the daemon: fallback
+        # verdicts must not carry failure provenance.
+        _blind_live_probes(monkeypatch, tmp_path)
+        _write_state(tmp_path, _fresh_state())
+
+        v = check_swap_pressure(thresholds=dict(DEFAULT_THRESHOLDS))
+        assert v.telemetry_source == "state_fallback"
+        assert v.pressure_failure_reason is None
+        assert v.mem_failure_reason is None
+        d = guard_decision(v, audit_cycles=20)
+        assert d["allowed"] is True
+        assert d["verdict"]["pressure_failure_reason"] is None
+        assert d["verdict"]["mem_failure_reason"] is None
 
 
 class TestVmPressureLevelReader:
