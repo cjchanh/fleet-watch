@@ -436,12 +436,17 @@ class TestTelemetryProvenance:
         assert "memory probe unavailable (unavailable)" in d["reason"]
         assert "0MB" not in d["reason"]
 
-    def test_linux_missing_psi_refuses_with_path(self, tmp_path, monkeypatch):
+    def test_linux_missing_psi_and_meminfo_refuses_with_meminfo_path(
+        self, tmp_path, monkeypatch,
+    ):
         probe_reader = syshealth.get_vm_pressure_probe
-        path = tmp_path / "missing-memory-psi"
+        psi_path = tmp_path / "missing-memory-psi"
+        meminfo_path = tmp_path / "missing-meminfo"
         monkeypatch.setattr(
             syshealth, "get_vm_pressure_probe",
-            lambda: probe_reader(system="Linux", psi_path=path),
+            lambda: probe_reader(
+                system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+            ),
         )
         v = check_swap_pressure(
             thresholds=dict(DEFAULT_THRESHOLDS), swap_state=_swap(20.0),
@@ -450,7 +455,30 @@ class TestTelemetryProvenance:
         assert v.all_blocked is True
         decision = guard_decision(v, audit_cycles=20)
         assert decision["allowed"] is False
-        assert str(path) in decision["reason"]
+        assert str(meminfo_path) in decision["reason"]
+        assert str(psi_path) not in decision["reason"]
+
+    def test_linux_missing_psi_healthy_meminfo_allows(self, tmp_path, monkeypatch):
+        probe_reader = syshealth.get_vm_pressure_probe
+        psi_path = tmp_path / "missing-memory-psi"
+        meminfo_path = tmp_path / "meminfo"
+        meminfo_path.write_text(
+            "MemTotal:       10000 kB\nMemAvailable:    6000 kB\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            syshealth, "get_vm_pressure_probe",
+            lambda: probe_reader(
+                system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+            ),
+        )
+        v = check_swap_pressure(
+            thresholds=dict(DEFAULT_THRESHOLDS), swap_state=_swap(20.0),
+            mem_state=_mem(64000, 20), total_mem_mb=_MB_128GB,
+        )
+        assert v.all_blocked is False
+        decision = guard_decision(v, audit_cycles=20)
+        assert decision["allowed"] is True
 
     def test_blind_live_probes_carry_syshealth_provenance(self, tmp_path, monkeypatch):
         # Live probes blind: syshealth's deterministic provenance (ProbeResult /

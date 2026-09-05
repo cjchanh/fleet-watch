@@ -106,6 +106,12 @@ VM_PRESSURE_CRITICAL = 4
 LINUX_PSI_WARN_AVG10 = 10.0
 LINUX_PSI_CRITICAL_AVG10 = 40.0
 LINUX_PSI_MEMORY_PATH = Path("/proc/pressure/memory")
+# When PSI is absent (CONFIG_PSI off / no /proc/pressure/memory), map
+# MemAvailable/MemTotal from /proc/meminfo onto the same 1/2/4 scale:
+# >=15% available is normal; >=5% is warning; else critical.
+LINUX_MEMINFO_PATH = Path("/proc/meminfo")
+LINUX_MEMINFO_WARN_AVAILABLE_FRACTION = 0.15
+LINUX_MEMINFO_CRITICAL_AVAILABLE_FRACTION = 0.05
 
 
 # --- Memory ---
@@ -449,28 +455,38 @@ def get_vm_pressure_level() -> int | None:
     an integer: 1 normal / 2 warning / 4 critical. This is ground truth; swap-%
     and the computed pressure-% are PROXIES that over-read on big-RAM hosts.
 
-    Linux maps PSI ``some avg10`` using the LINUX_PSI_* thresholds.
-    Returns the integer level, or ``None`` when the signal is unreadable
-    (unsupported OS, missing/failed probe, or malformed output). FAIL-CLOSED by
-    contract: callers treat ``None`` as pressured/refuse so an unreadable signal
-    never silently admits a workload onto a possibly-starved host.
+    Linux maps PSI ``some avg10`` using the LINUX_PSI_* thresholds. When PSI is
+    absent, Linux falls back to ``/proc/meminfo`` MemAvailable (see
+    ``LINUX_MEMINFO_*``). Returns the integer level, or ``None`` when the
+    signal is unreadable (unsupported OS, missing/failed probe, or malformed
+    output). FAIL-CLOSED by contract: callers treat ``None`` as pressured/refuse
+    so an unreadable signal never silently admits a workload onto a
+    possibly-starved host.
     """
     return get_vm_pressure_probe().value
 
 
 def get_vm_pressure_probe(
-    *, system: str | None = None, psi_path: Path = LINUX_PSI_MEMORY_PATH,
+    *,
+    system: str | None = None,
+    psi_path: Path = LINUX_PSI_MEMORY_PATH,
+    meminfo_path: Path = LINUX_MEMINFO_PATH,
 ) -> ProbeResult:
     """Return platform pressure level plus deterministic failure provenance.
 
     Linux parses ``some avg10=N avg60=N avg300=N total=N`` from PSI, using
-    only avg10 (0..100 percent); missing or invalid telemetry stays unavailable.
-    Platform and PSI path are injectable without changing host-global state.
+    only avg10 (0..100 percent). FileNotFoundError on the PSI path falls back
+    to ``_linux_meminfo_pressure``; other OSError (e.g. PermissionError) stays
+    unavailable and does not read meminfo. Missing or invalid telemetry stays
+    unavailable. Platform, PSI path, and meminfo path are injectable without
+    changing host-global state.
     """
     system = platform.system() if system is None else system
     if system == "Linux":
         try:
             content = psi_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return _linux_meminfo_pressure(meminfo_path)
         except OSError as exc:
             return ProbeResult(None, f"{psi_path}: {type(exc).__name__}")
         except UnicodeError:
@@ -492,6 +508,44 @@ def get_vm_pressure_probe(
     return _run_numeric_probe(
         ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
     )
+
+
+def _linux_meminfo_pressure(meminfo_path: Path) -> ProbeResult:
+    """Map MemAvailable/MemTotal onto the shared 1/2/4 pressure scale.
+
+    Fail-closed: missing file, missing/non-integer fields, or MemTotal == 0
+    stay unavailable. Does not synthesize MemAvailable from other keys.
+    """
+    try:
+        text = meminfo_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ProbeResult(None, f"{meminfo_path}: FileNotFoundError")
+    except OSError as exc:
+        return ProbeResult(None, f"{meminfo_path}: {type(exc).__name__}")
+    except UnicodeError:
+        return ProbeResult(None, f"{meminfo_path}: malformed_output")
+
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        if key not in {"MemTotal", "MemAvailable"}:
+            continue
+        match = re.fullmatch(r"\s*(\d+)\s+kB\s*", rest)
+        if match is None:
+            return ProbeResult(None, f"{meminfo_path}: malformed_output")
+        values[key] = int(match.group(1))
+
+    total_kb = values.get("MemTotal")
+    available_kb = values.get("MemAvailable")
+    if total_kb is None or available_kb is None or total_kb == 0:
+        return ProbeResult(None, f"{meminfo_path}: malformed_output")
+
+    fraction = available_kb / total_kb
+    if fraction >= LINUX_MEMINFO_WARN_AVAILABLE_FRACTION:
+        return ProbeResult(VM_PRESSURE_NORMAL)
+    if fraction >= LINUX_MEMINFO_CRITICAL_AVAILABLE_FRACTION:
+        return ProbeResult(VM_PRESSURE_WARN)
+    return ProbeResult(VM_PRESSURE_CRITICAL)
 
 
 def _get_linux_memory_state() -> MemoryState | None:

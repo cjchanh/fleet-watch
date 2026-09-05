@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -617,3 +618,132 @@ def test_get_gpu_workload_footprints_filters_non_gpu():
     ]
     fps = syshealth.get_gpu_workload_footprints(procs)
     assert fps == []
+
+
+# --- Linux VM pressure (PSI, with /proc/meminfo fallback) ---
+# Darwin sysctl cases above pin platform.system to Darwin. These pin
+# system="Linux" and inject tmp_path files; they must not share that fixture.
+
+
+def _linux_psi_text(avg10: str) -> str:
+    return (
+        f"some avg10={avg10} avg60=1.00 avg300=0.50 total=12345\n"
+        "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    )
+
+
+def _linux_meminfo_text(total_kb: int, available_kb: int) -> str:
+    return f"MemTotal:       {total_kb} kB\nMemAvailable:    {available_kb} kB\n"
+
+
+@pytest.mark.parametrize(
+    ("avg10", "expected"),
+    [
+        ("3.00", syshealth.VM_PRESSURE_NORMAL),
+        ("10.00", syshealth.VM_PRESSURE_WARN),
+        ("40.00", syshealth.VM_PRESSURE_CRITICAL),
+    ],
+)
+def test_linux_psi_present_maps_avg10_to_shared_scale(tmp_path, avg10, expected):
+    psi_path = tmp_path / "memory"
+    psi_path.write_text(_linux_psi_text(avg10), encoding="utf-8")
+    probe = syshealth.get_vm_pressure_probe(system="Linux", psi_path=psi_path)
+    assert probe.value == expected
+    assert probe.failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("available_kb", "expected"),
+    [
+        (6000, syshealth.VM_PRESSURE_NORMAL),
+        (1000, syshealth.VM_PRESSURE_WARN),
+        (200, syshealth.VM_PRESSURE_CRITICAL),
+    ],
+)
+def test_linux_psi_absent_falls_back_to_meminfo_fraction(
+    tmp_path, available_kb, expected,
+):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(_linux_meminfo_text(10000, available_kb), encoding="utf-8")
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value == expected
+    assert probe.failure_reason is None
+
+
+def test_linux_psi_absent_meminfo_absent_is_unavailable(tmp_path):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "missing-meminfo"
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value is None
+    assert probe.failure_reason is not None
+    assert probe.failure_reason.endswith("FileNotFoundError")
+    assert str(meminfo_path) in probe.failure_reason
+
+
+def test_linux_psi_absent_meminfo_missing_memavailable_is_malformed(tmp_path):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text("MemTotal:       10000 kB\n", encoding="utf-8")
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value is None
+    assert probe.failure_reason is not None
+    assert probe.failure_reason.endswith("malformed_output")
+
+
+def test_linux_psi_absent_meminfo_zero_memtotal_is_malformed(tmp_path):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(_linux_meminfo_text(0, 0), encoding="utf-8")
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value is None
+    assert probe.failure_reason is not None
+    assert probe.failure_reason.endswith("malformed_output")
+
+
+def test_linux_psi_absent_meminfo_non_integer_is_malformed(tmp_path):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(
+        "MemTotal:       10000 kB\nMemAvailable:    not-a-number kB\n",
+        encoding="utf-8",
+    )
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value is None
+    assert probe.failure_reason is not None
+    assert probe.failure_reason.endswith("malformed_output")
+
+
+def test_linux_psi_permission_error_does_not_read_meminfo(tmp_path, monkeypatch):
+    psi_path = tmp_path / "psi"
+    psi_path.write_text(_linux_psi_text("0.00"), encoding="utf-8")
+    meminfo_path = tmp_path / "no-such-meminfo"
+    real_read_text = Path.read_text
+    reads: list[str] = []
+
+    def tracked_read_text(self, *args, **kwargs):
+        reads.append(str(self))
+        if Path(self) == psi_path:
+            raise PermissionError
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value is None
+    assert probe.failure_reason is not None
+    assert probe.failure_reason.endswith("PermissionError")
+    assert str(psi_path) in probe.failure_reason
+    assert "FileNotFoundError" not in probe.failure_reason
+    assert str(meminfo_path) not in reads
