@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import os
-import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -254,32 +253,44 @@ def _run_concurrent_exclusive_starts(home: Path, repo: Path, n: int) -> int:
         repo_root if not existing else repo_root + os.pathsep + existing
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Each starter names a DISTINCT owner that stays alive for the whole trial.
+    # If the owner died as soon as the CLI returned (a `sh -c exec` wrapper), a
+    # later starter would legitimately reap the dead holder and be granted the
+    # lease in sequence -- that is the documented liveness rule, not a race --
+    # and the exit-0 count would measure liveness, not atomicity.
+    owners: list[subprocess.Popen[bytes]] = [
+        subprocess.Popen(["sleep", "120"]) for _ in range(n)
+    ]
     procs: list[subprocess.Popen[str]] = []
-    for i in range(n):
-        script = (
-            f"exec {shlex.quote(sys.executable)} -m fleet_watch.cli "
-            f"session start --session-id t{i} --repo {shlex.quote(str(repo))} "
-            f"--owner-pid $$ --exclusive-repo-lock"
-        )
-        procs.append(
-            subprocess.Popen(
-                ["sh", "-c", script],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        )
     exit0 = 0
     errors: list[str] = []
-    for proc in procs:
-        proc.wait(timeout=60)
-        if proc.returncode == 0:
-            exit0 += 1
-        else:
-            err = (proc.stderr.read() if proc.stderr else "") or ""
-            out = (proc.stdout.read() if proc.stdout else "") or ""
-            errors.append(f"rc={proc.returncode} stderr={err!r} stdout={out!r}")
+    try:
+        for i, owner in enumerate(owners):
+            procs.append(
+                subprocess.Popen(
+                    [
+                        sys.executable, "-m", "fleet_watch.cli", "session", "start",
+                        "--session-id", f"t{i}", "--repo", str(repo),
+                        "--owner-pid", str(owner.pid), "--exclusive-repo-lock",
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        for proc in procs:
+            proc.wait(timeout=60)
+            if proc.returncode == 0:
+                exit0 += 1
+            else:
+                err = (proc.stderr.read() if proc.stderr else "") or ""
+                out = (proc.stdout.read() if proc.stdout else "") or ""
+                errors.append(f"rc={proc.returncode} stderr={err!r} stdout={out!r}")
+    finally:
+        for owner in owners:
+            owner.kill()
+            owner.wait(timeout=10)
     if exit0 == 0:
         raise AssertionError("no exclusive grant succeeded:\n" + "\n".join(errors[:4]))
     return exit0
