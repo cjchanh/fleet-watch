@@ -673,6 +673,32 @@ def test_linux_psi_absent_falls_back_to_meminfo_fraction(
     assert probe.failure_reason is None
 
 
+@pytest.mark.parametrize(
+    ("available_kb", "expected"),
+    [
+        (1500, syshealth.VM_PRESSURE_NORMAL),
+        (1499, syshealth.VM_PRESSURE_WARN),
+        (500, syshealth.VM_PRESSURE_WARN),
+        (499, syshealth.VM_PRESSURE_CRITICAL),
+    ],
+)
+def test_linux_meminfo_fallback_cutover_thresholds(tmp_path, available_kb, expected):
+    psi_path = tmp_path / "missing-psi"
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(_linux_meminfo_text(10000, available_kb), encoding="utf-8")
+    probe = syshealth.get_vm_pressure_probe(
+        system="Linux", psi_path=psi_path, meminfo_path=meminfo_path,
+    )
+    assert probe.value == expected
+    assert probe.failure_reason is None
+
+
+def test_linux_meminfo_threshold_constants_are_strictly_ordered():
+    warn = syshealth.LINUX_MEMINFO_WARN_AVAILABLE_FRACTION
+    critical = syshealth.LINUX_MEMINFO_CRITICAL_AVAILABLE_FRACTION
+    assert 0 < critical < warn < 1
+
+
 def test_linux_psi_absent_meminfo_absent_is_unavailable(tmp_path):
     psi_path = tmp_path / "missing-psi"
     meminfo_path = tmp_path / "missing-meminfo"
