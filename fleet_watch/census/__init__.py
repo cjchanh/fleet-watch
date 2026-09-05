@@ -74,6 +74,10 @@ __all__ = [
 LAUNCHD_LABEL = "io.fleet-watch.census"
 STAGED_PLIST_PATH = "~/Library/LaunchAgents/io.fleet-watch.census.plist"
 DEFAULT_FLEET_BIN = "/usr/local/bin/fleet"
+# Template default for the staged plist. `fleet census --emit-launchd-plist`
+# substitutes the machine's own temp dir (cli.census), so the shared-/tmp
+# path only ever appears in the in-repo template, never in an installed agent.
+DEFAULT_CENSUS_LOG_PATH = "/tmp/fleet-census.log"  # nosec B108 - template default, replaced at emit time
 
 #: The operator installs the recurring job. `fleet census` never bootstraps it —
 #: process control is an operator gate, not an agent action.
@@ -182,6 +186,7 @@ def render_launchd_plist(
     executable: str = DEFAULT_FLEET_BIN,
     hour: int = 9,
     minute: int = 0,
+    log_path: str | None = None,
 ) -> str:
     """Render the staged launchd plist. Writes nothing, loads nothing.
 
@@ -189,7 +194,7 @@ def render_launchd_plist(
     text with the default executable path; run ``fleet census
     --emit-launchd-plist`` to get it with the path resolved for this machine.
     """
-    log_path = "/tmp/fleet-census.log"
+    log_path = log_path or DEFAULT_CENSUS_LOG_PATH
     # The path is interpolated into XML, and '&' or '<' are legal in filenames.
     # An unescaped one emits a plist that launchd cannot parse.
     executable = xml_escape(executable)

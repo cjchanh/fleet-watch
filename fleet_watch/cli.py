@@ -11,6 +11,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -20,18 +21,20 @@ import click
 
 from fleet_watch import autonomous as autonomous_mod
 from fleet_watch import boot_map as boot_map_mod
+from fleet_watch import census as census_mod
 from fleet_watch import claude_lease_twin
 from fleet_watch import counters, discover as discover_mod
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
 
-# fleet_watch.census, fleet_watch.boot_coverage, fleet_watch.pkill, and
-# fleet_watch.github_sitrep are imported lazily inside the functions that use
-# them (below) — each has a single subcommand-scoped call site and none is
-# referenced at decorator (import-time) evaluation, so every other subcommand
-# (e.g. `session list`, `guard`) skips their import cost (census alone pulls in
-# urllib.request + xml.sax.saxutils, ~40ms+).
+# fleet_watch.boot_coverage, fleet_watch.pkill, and fleet_watch.github_sitrep
+# are imported lazily inside the functions that use them (below) — each has a
+# single subcommand-scoped call site and none is referenced at decorator
+# (import-time) evaluation, so every other subcommand (e.g. `session list`,
+# `guard`) skips their import cost. fleet_watch.census is imported eagerly
+# (as census_mod) instead: _render_census's signature references it at
+# definition time, so it cannot stay function-local.
 #
 # ollama_runners/orphan_detector/memory_pressure and mcp_orphan_detector
 # stay module-level: fleet_watch.discover (kept eager here since discover_mod
@@ -3002,8 +3005,6 @@ def _executable_supports_census(executable: str) -> bool:
 def _render_census(
     payload: dict[str, Any], result: census_mod.CensusResult
 ) -> list[str]:
-    from fleet_watch import census as census_mod
-
     totals = payload["totals"]
     machine = payload.get("machine", {})
     lines = [
@@ -3123,11 +3124,10 @@ def census(
     emit_launchd_plist: bool,
 ):
     """Census what boots and runs on this machine, and what is stale."""
-    from fleet_watch import census as census_mod
-
     if emit_launchd_plist:
         executable = shutil.which("fleet") or census_mod.DEFAULT_FLEET_BIN
-        click.echo(census_mod.render_launchd_plist(executable), nl=False)
+        log_path = os.path.join(tempfile.gettempdir(), "fleet-census.log")
+        click.echo(census_mod.render_launchd_plist(executable, log_path=log_path), nl=False)
         # stderr so the plist can be redirected to a file while the operator
         # still sees what to run. Fleet Watch does not install it.
         click.echo(

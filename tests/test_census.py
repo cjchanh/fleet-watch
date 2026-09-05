@@ -934,6 +934,14 @@ def test_staged_plist_file_matches_the_renderer():
     assert staged.read_text() == census.render_launchd_plist()
 
 
+def test_render_launchd_plist_accepts_a_machine_log_path():
+    """The CLI emitter passes the machine temp dir; the template keeps its default."""
+    rendered = census.render_launchd_plist(log_path="/var/folders/x/T/fleet-census.log")
+    assert "/var/folders/x/T/fleet-census.log" in rendered
+    assert census.DEFAULT_CENSUS_LOG_PATH not in rendered
+    assert census.DEFAULT_CENSUS_LOG_PATH in census.render_launchd_plist()
+
+
 def test_domain_ids_are_stable_and_match_the_builders():
     assert domains.DOMAIN_IDS == (
         "user-launch-agents",
