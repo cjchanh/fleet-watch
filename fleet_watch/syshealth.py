@@ -6,6 +6,7 @@ via ~/.fleet-watch/config.json.
 
 from __future__ import annotations
 
+import platform
 import re
 import subprocess
 import tempfile
@@ -98,6 +99,13 @@ DEFAULT_LAUNCH_GUARD_THRESHOLDS = {
 VM_PRESSURE_NORMAL = 1
 VM_PRESSURE_WARN = 2
 VM_PRESSURE_CRITICAL = 4
+
+# Linux PSI: percent of time at least one task stalled on memory over 10s.
+# Policy mapping to the shared 1/2/4 scale, not macOS kernel classifications:
+# <10% normal; 10% to <40% warning; >=40% critical.
+LINUX_PSI_WARN_AVG10 = 10.0
+LINUX_PSI_CRITICAL_AVG10 = 40.0
+LINUX_PSI_MEMORY_PATH = Path("/proc/pressure/memory")
 
 
 # --- Memory ---
@@ -431,23 +439,53 @@ def get_total_memory_mb() -> int:
 
 
 def get_vm_pressure_level() -> int | None:
-    """Read macOS's authoritative memory-pressure level (spec 2615908).
+    """Read memory pressure on the shared 1 normal / 2 warning / 4 critical scale.
 
     ``sysctl -n kern.memorystatus_vm_pressure_level`` returns the kernel's own
     pressure classification — the signal it uses to decide app jetsam-kills — as
     an integer: 1 normal / 2 warning / 4 critical. This is ground truth; swap-%
     and the computed pressure-% are PROXIES that over-read on big-RAM hosts.
 
+    Linux maps PSI ``some avg10`` using the LINUX_PSI_* thresholds.
     Returns the integer level, or ``None`` when the signal is unreadable
-    (non-macOS, sysctl missing/failed, or non-integer output). FAIL-CLOSED by
+    (unsupported OS, missing/failed probe, or malformed output). FAIL-CLOSED by
     contract: callers treat ``None`` as pressured/refuse so an unreadable signal
     never silently admits a workload onto a possibly-starved host.
     """
     return get_vm_pressure_probe().value
 
 
-def get_vm_pressure_probe() -> ProbeResult:
-    """Return pressure level plus deterministic failure provenance."""
+def get_vm_pressure_probe(
+    *, system: str | None = None, psi_path: Path = LINUX_PSI_MEMORY_PATH,
+) -> ProbeResult:
+    """Return platform pressure level plus deterministic failure provenance.
+
+    Linux parses ``some avg10=N avg60=N avg300=N total=N`` from PSI, using
+    only avg10 (0..100 percent); missing or invalid telemetry stays unavailable.
+    Platform and PSI path are injectable without changing host-global state.
+    """
+    system = platform.system() if system is None else system
+    if system == "Linux":
+        try:
+            content = psi_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return ProbeResult(None, f"{psi_path}: {type(exc).__name__}")
+        except UnicodeError:
+            return ProbeResult(None, f"{psi_path}: malformed_output")
+        match = re.search(r"^some[ \t]+avg10=(\S+)(?:[ \t]|$)", content, re.MULTILINE)
+        try:
+            avg10 = float(match.group(1)) if match else float("nan")
+        except ValueError:
+            avg10 = float("nan")
+        if not 0 <= avg10 <= 100:
+            return ProbeResult(None, f"{psi_path}: malformed_output")
+        if avg10 < LINUX_PSI_WARN_AVG10:
+            return ProbeResult(VM_PRESSURE_NORMAL)
+        if avg10 < LINUX_PSI_CRITICAL_AVG10:
+            return ProbeResult(VM_PRESSURE_WARN)
+        return ProbeResult(VM_PRESSURE_CRITICAL)
+    if system != "Darwin":
+        return ProbeResult(None, f"unsupported_platform: {system}")
     return _run_numeric_probe(
         ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
     )

@@ -436,6 +436,22 @@ class TestTelemetryProvenance:
         assert "memory probe unavailable (unavailable)" in d["reason"]
         assert "0MB" not in d["reason"]
 
+    def test_linux_missing_psi_refuses_with_path(self, tmp_path, monkeypatch):
+        probe_reader = syshealth.get_vm_pressure_probe
+        path = tmp_path / "missing-memory-psi"
+        monkeypatch.setattr(
+            syshealth, "get_vm_pressure_probe",
+            lambda: probe_reader(system="Linux", psi_path=path),
+        )
+        v = check_swap_pressure(
+            thresholds=dict(DEFAULT_THRESHOLDS), swap_state=_swap(20.0),
+            mem_state=_mem(64000, 20), total_mem_mb=_MB_128GB,
+        )
+        assert v.all_blocked is True
+        decision = guard_decision(v, audit_cycles=20)
+        assert decision["allowed"] is False
+        assert str(path) in decision["reason"]
+
     def test_blind_live_probes_carry_syshealth_provenance(self, tmp_path, monkeypatch):
         # Live probes blind: syshealth's deterministic provenance (ProbeResult /
         # MemoryState failure_reason) flows onto the verdict and into the

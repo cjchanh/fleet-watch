@@ -2,7 +2,7 @@
 
 import subprocess
 
-from fleet_watch import cli, referee, registry
+from fleet_watch import cli, referee, registry, syshealth
 
 
 def _repo_with_lock(tmp_path):
@@ -55,6 +55,18 @@ def test_live_writable_holder_remains_a_genuine_claim(tmp_path, monkeypatch):
 
 def test_guard_repo_evidence_explains_read_only_stale_lock(tmp_path, monkeypatch):
     """Machine output must expose why the read-only holder was not charged."""
+    monkeypatch.setattr(cli.counters, "FLEET_DIR", tmp_path)
+    cli.counters.save_counters(cli.counters.GateCounters(memory_pressure_gate=20))
+    monkeypatch.setattr(cli.memory_pressure, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(cli.memory_pressure, "load_thresholds",
+                        lambda: dict(cli.memory_pressure.DEFAULT_THRESHOLDS))
+    monkeypatch.setattr(syshealth, "get_vm_pressure_probe",
+                        lambda: syshealth.ProbeResult(1))
+    monkeypatch.setattr(syshealth, "get_memory_state",
+                        lambda: syshealth.MemoryState(131072, 32000, 32000,
+                                                      64000, 0, 3072))
+    monkeypatch.setattr(syshealth, "get_swap_state",
+                        lambda: syshealth.SwapState(8192, 0, 8192))
     repo = _repo_with_lock(tmp_path)
     monkeypatch.setattr(referee, "_open_file_holders", lambda _path: {62514: "r"})
     monkeypatch.setattr(referee, "_lsof_can_attribute_open_files", lambda: True)

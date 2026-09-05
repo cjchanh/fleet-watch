@@ -31,6 +31,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e . pytest
 
+      - name: Ruff hard gate
+        run: |
+          python -m pip install ruff
+          ruff check . --select E9,F63,F7,F82
+
       - name: Run test suite
         run: python -m pytest tests -q
 
@@ -43,6 +48,10 @@ jobs:
 
           fleet --help >/dev/null
           fleet guard --json > "$RUNNER_TEMP/guard.json"
+          for attempt in {1..12}; do
+            fleet guard --json > "$RUNNER_TEMP/guard-repeat.json"
+            python -c 'import json, sys; result = json.load(sys.stdin); assert result["allowed"] is True, result' < "$RUNNER_TEMP/guard-repeat.json"
+          done
           fleet report >/dev/null
           fleet install-launchd --output "$RUNNER_TEMP/io.fleet-watch.plist" --no-load >/dev/null
 

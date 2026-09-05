@@ -7,7 +7,8 @@ app jetsam-kills), NOT swap-%. swap-% and the computed pressure-% are PROXIES
 that over-fire on big-RAM hosts: a small dynamic swapfile fills to a high
 percentage without real pressure (swap 97% on a 128GB Mac while
 ``vm_pressure_level`` = 1 NORMAL and ~58GB is available). swap-% is therefore
-demoted to an advisory WARNING.
+demoted to an advisory WARNING. Linux uses PSI ``some avg10`` mapped by
+``syshealth`` to the same 1/2/4 scale; unreadable PSI remains fail-closed.
 
 Tiers (thresholds config-overridable via ~/.fleet-watch/policy.json):
   - swap > swap_warning_pct: advisory MEMORY_PRESSURE_RISING warning only.
@@ -218,10 +219,10 @@ def check_swap_pressure(
     pressure_level: "int | None | Any" = _UNSET,
     total_mem_mb: "int | Any" = _UNSET,
 ) -> SwapPressureVerdict:
-    """Evaluate memory pressure against macOS's authoritative signal (spec 2615908).
+    """Evaluate macOS kernel pressure or Linux PSI on the shared 1/2/4 scale.
 
-    The GATE is ``kern.memorystatus_vm_pressure_level`` (1 normal / 2 warn /
-    4 critical) plus an hw.memsize-scaled available-RAM floor — NOT swap-%.
+    The GATE is macOS ``kern.memorystatus_vm_pressure_level`` or mapped Linux
+    PSI (1 normal / 2 warn / 4 critical), plus a RAM-scaled available-RAM floor.
     Swap-% is demoted to an advisory WARNING. ALL-refusal fires at the critical
     level OR when true-available RAM is below the scaled floor; GPU-refusal keeps
     high swap as its TRIGGER but corroborates on the authoritative level/floor,

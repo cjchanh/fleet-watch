@@ -477,7 +477,10 @@ States: `live` > `disconnected` > `stale_candidate` > `orphan_confirmed` > `exit
 |----------|---------------|----------------|-------------------|
 | macOS (Apple Silicon) | Full | Full | Full |
 | macOS (Intel) | Full | Partial | Full |
-| Linux | Memory/health only | Full | Full |
+| Linux | Process matching + listener probes | Full | Full |
+
+Linux memory-pressure admission uses PSI (`/proc/pressure/memory`, kernel 4.20+ with PSI enabled): `some avg10` below 10% is normal, 10% to below 40% is warning, and 40% or above is critical.
+Without readable, parseable PSI, the enforcing guard fails closed (refuses with an explanation) rather than admitting blind; the initial audit window remains advisory.
 
 Auto-discovery uses `ps` for process matching. On Linux, listener-to-PID mapping uses `ss` when available, then falls back to `netstat` and `lsof`. Use `fleet register` for explicit registration on any platform.
 
