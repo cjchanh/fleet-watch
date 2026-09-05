@@ -201,6 +201,7 @@ def _get_macos_swap_state() -> SwapState | None:
     try:
         out = subprocess.run(
             ["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=3,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return None
@@ -315,7 +316,7 @@ def _run_numeric_probe(command: list[str]) -> ProbeResult:
     """Run a numeric subprocess probe and retain deterministic provenance."""
     try:
         out = subprocess.run(
-            command, capture_output=True, text=True, timeout=3,
+            command, capture_output=True, text=True, timeout=3, check=False,
         )
     except subprocess.TimeoutExpired:
         return ProbeResult(None, "timeout")
@@ -325,6 +326,8 @@ def _run_numeric_probe(command: list[str]) -> ProbeResult:
         return ProbeResult(None, "not_found")
     except OSError:
         return ProbeResult(None, "os_error")
+    except Exception as exc:  # noqa: BLE001 — fail-closed probe; type rides in failure_reason
+        return ProbeResult(None, type(exc).__name__)
     if out.returncode != 0:
         return ProbeResult(None, "nonzero_exit")
     try:
@@ -359,7 +362,7 @@ def get_memory_state() -> MemoryState:
     page_size = 16384  # default, overridden by vm_stat header
     try:
         out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=3,
+            ["vm_stat"], capture_output=True, text=True, timeout=3, check=False,
         )
         if out.returncode != 0:
             # vm_stat failed: page stats unknown. Fail-closed — return an
@@ -777,7 +780,7 @@ def _ps_aux_lines() -> list[list[str]]:
     """Run ps aux and return parsed lines (11+ fields each)."""
     try:
         out = subprocess.run(
-            ["ps", "aux"], capture_output=True, text=True, timeout=5,
+            ["ps", "aux"], capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []
@@ -883,6 +886,7 @@ def get_process_footprint(pid: int, name: str = "") -> ProcessFootprint | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
         return None

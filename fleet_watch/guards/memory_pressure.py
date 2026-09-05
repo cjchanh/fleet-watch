@@ -267,7 +267,7 @@ def check_swap_pressure(
     ):
         try:
             fallback = _fresh_state_verdict(t)
-        except Exception:
+        except Exception:  # noqa: BLE001 — fallback miss keeps the live fail-closed path
             fallback = None
         if fallback is not None:
             return fallback

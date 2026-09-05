@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import time
+import http.client
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,6 +163,7 @@ def _get_process_commands() -> dict[int, str]:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                check=False,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
             continue
@@ -223,7 +225,7 @@ def _query_ollama_vram(port: int = 11434) -> int:
                 m.get("size_vram", 0) for m in data.get("models", [])
             )
             return total_vram // (1024 * 1024)  # bytes → MB
-    except Exception:
+    except (OSError, TimeoutError, http.client.HTTPException, ValueError, TypeError, AttributeError, KeyError):
         return 0
 
 
@@ -282,7 +284,7 @@ def _sync_thunder(conn: sqlite3.Connection) -> int:
     try:
         result = subprocess.run(
             ["tnr", "status", "--json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
     except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
         return 0

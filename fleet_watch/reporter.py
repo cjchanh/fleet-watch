@@ -620,8 +620,8 @@ def _append_changelog(log_path: Path, entry: dict[str, Any]) -> None:
         if len(all_lines) > CHANGELOG_MAX_LINES:
             keep = all_lines[len(all_lines) - CHANGELOG_MAX_LINES // 2:]
             log_path.write_text("\n".join(keep) + "\n")
-    except Exception:
-        pass  # Decay failure never blocks reporting
+    except (OSError, ValueError):
+        return
 
 
 def _atomic_write_text(path: Path, content: str) -> None:

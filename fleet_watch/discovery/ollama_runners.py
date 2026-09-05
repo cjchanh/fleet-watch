@@ -63,6 +63,7 @@ def _get_ollama_serve_pids() -> list[int]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []
@@ -85,6 +86,7 @@ def _get_child_pids(parent_pid: int) -> list[int]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []
@@ -107,6 +109,7 @@ def _get_process_info(pid: int) -> dict[str, Any] | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return None

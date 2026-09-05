@@ -34,7 +34,9 @@ def list_launchd_agents() -> dict[str, dict[str, Any]]:
             try:
                 with open(plist_path, "rb") as f:
                     plist = plistlib.load(f)
-            except Exception:
+            except Exception:  # noqa: BLE001 — unreadable plist is not a launchd agent
+                plist = None
+            if plist is None:
                 continue
             label = plist.get("Label", "")
             if not label:
@@ -48,7 +50,7 @@ def list_launchd_agents() -> dict[str, dict[str, Any]]:
     try:
         result = subprocess.run(
             ["launchctl", "list"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
     except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
         return agents
@@ -98,7 +100,9 @@ def _find_launchd_for_process(
             try:
                 with open(agent["plist_path"], "rb") as f:
                     plist = plistlib.load(f)
-            except Exception:
+            except Exception:  # noqa: BLE001 — unreadable plist cannot match a process
+                plist = None
+            if plist is None:
                 continue
             env = plist.get("EnvironmentVariables", {})
             for _key, val in env.items():

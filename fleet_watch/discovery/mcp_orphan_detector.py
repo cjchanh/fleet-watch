@@ -81,7 +81,7 @@ def _get_mcp_processes() -> list[dict[str, Any]]:
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,ppid,rss,command"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return []

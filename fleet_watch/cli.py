@@ -236,8 +236,8 @@ def _publish_report_after_ack(context: str) -> bool:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except (OSError, sqlite3.Error):
+                    conn = None
 
     worker = threading.Thread(
         target=_refresh, name=f"fleet-report-{context}", daemon=True
@@ -410,9 +410,10 @@ def _notify_conflict(skipped: list[dict[str, Any]]) -> None:
             ],
             capture_output=True,
             timeout=3,
+            check=False,
         )
-    except Exception:
-        pass  # Notification failure never blocks discovery
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
@@ -430,9 +431,10 @@ def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
             ],
             capture_output=True,
             timeout=3,
+            check=False,
         )
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 _CODEX_ORPHAN_RE = re.compile(r"codex/codex\b")
@@ -467,7 +469,7 @@ def _run_runaway_tick(
     """
     try:
         newly_flagged = tracker.tick()
-    except Exception:
+    except Exception:  # noqa: BLE001 — tick failure must not crash discover; no guard reads this
         return []
     for proc in newly_flagged:
         fleet_owned = _is_fleet_owned(conn, proc)
@@ -1170,8 +1172,8 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
             priority=priority, restart_policy=restart_policy, start_cmd=start_cmd,
             expected_duration_min=expected_duration,
         )
-    except Exception as e:
-        click.echo(f"ERROR: {e}", err=True)
+    except Exception as e:  # noqa: BLE001 — register must not traceback; type rides in ERROR
+        click.echo(f"ERROR: {type(e).__name__}: {e}", err=True)
         conn.close()
         sys.exit(1)
 
@@ -1335,7 +1337,7 @@ def guard(
                 },
             )
         conn.close()
-    except Exception as exc:  # fail-closed: deny on any guard-path error
+    except Exception as exc:  # noqa: BLE001 — fail-closed: deny on any guard-path error
         reason = f"guard_error_fail_closed: {type(exc).__name__}: {exc}"
         if as_json:
             click.echo(json.dumps({"allowed": False, "reason": reason}, default=str))
@@ -1346,7 +1348,7 @@ def guard(
     # Advisory: scan for active runaway processes (never crash the guard)
     try:
         runaways = runaway.scan_runaways()
-    except Exception:
+    except Exception:  # noqa: BLE001 — runaway scan is advisory; never flips allow/deny
         runaways = []
     if runaways:
         payload["runaways"] = [r.to_dict() for r in runaways]
@@ -2463,8 +2465,8 @@ def watch(interval: int, auto_kill: bool, autonomous: bool, once: bool,
             _run_runaway_tick(conn, tracker, auto_kill=auto_kill)
 
             conn.close()
-        except Exception as e:
-            click.echo(f"Error: {e}", err=True)
+        except Exception as e:  # noqa: BLE001 — watch loop must not traceback
+            click.echo(f"Error: {type(e).__name__}: {e}", err=True)
 
         # Interruptible sleep
         for _ in range(interval):

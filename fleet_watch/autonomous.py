@@ -162,7 +162,7 @@ def merge_policy(base: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]
 
 def run(cmd: list[str], repo: Path, *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-    return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env, check=False)
 
 
 def run_env(
@@ -173,7 +173,7 @@ def run_env(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
-    return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=timeout, env=env, check=False)
 
 
 def git_dirty_paths(repo: Path) -> list[str]:

@@ -318,7 +318,7 @@ def socket_table_listeners() -> list[tuple[int, int]] | None:
     for name, argv in _LISTENER_SOURCES:
         try:
             completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=5
+                argv, capture_output=True, text=True, timeout=5, check=False
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
             continue
@@ -583,6 +583,7 @@ def _open_file_holders(path: Path) -> dict[int, str] | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
         return None
@@ -669,7 +670,17 @@ def probe_repo_writers(repo_dir: str) -> RepoWriterProbe:
     unattributed: list[Path] = []
     read_only_holders: set[int] = set()
     for lock in present:
-        holders = _open_file_holders(lock)
+        try:
+            holders = _open_file_holders(lock)
+        except Exception as exc:  # noqa: BLE001 — fail-closed; type rides in detail
+            return RepoWriterProbe(
+                REPO_WRITER_UNDETERMINED,
+                (
+                    f"a git write lock exists at {lock} but its holder could not "
+                    f"be looked up ({type(exc).__name__}: {exc})"
+                ),
+                lock_path=str(lock),
+            )
         if holders is None:
             return RepoWriterProbe(
                 REPO_WRITER_UNDETERMINED,

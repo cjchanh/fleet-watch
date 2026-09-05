@@ -92,7 +92,7 @@ def scan_runaways(
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,pcpu,etime,command"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []

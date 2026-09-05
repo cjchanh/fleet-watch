@@ -80,6 +80,7 @@ def _find_matching_pids(pattern: str) -> list[dict[str, Any]]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []
@@ -103,6 +104,7 @@ def _get_process_detail(pid: int) -> dict[str, Any] | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return None
@@ -133,6 +135,7 @@ def _get_children(ppid: int, depth: int = 2) -> list[dict[str, Any]]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []

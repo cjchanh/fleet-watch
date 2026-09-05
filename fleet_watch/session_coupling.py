@@ -64,7 +64,7 @@ def _pid_cwd(pid: int) -> Optional[str]:
     try:
         out = subprocess.run(
             ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -210,7 +210,7 @@ def load_active_leases() -> Optional[list]:
             return registry.list_active_session_leases(conn)
         finally:
             conn.close()
-    except Exception:
+    except Exception:  # noqa: BLE001 — unreachable registry is fail-closed UNKNOWN, not a grant
         return None
 
 
@@ -219,5 +219,5 @@ def default_age_of(heartbeat_at: Optional[str]) -> Optional[float]:
         from fleet_watch import registry
 
         return registry._age_seconds(heartbeat_at)
-    except Exception:
+    except Exception:  # noqa: BLE001 — unparsable heartbeat age is unknown, not fresh
         return None
