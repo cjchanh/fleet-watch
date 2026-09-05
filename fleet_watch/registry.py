@@ -133,6 +133,16 @@ PROCESS_STATES = frozenset({
     "exited",
 })
 
+# B608 guard: the ONLY columns ``heartbeat_external_resource`` may ever set.
+# Its UPDATE statement is assembled from this module's own constants — never
+# from external input — and every column name is validated against this set
+# before the statement is built.
+_EXTERNAL_RESOURCE_UPDATABLE_COLUMNS = frozenset({
+    "last_seen",
+    "status",
+    "metadata",
+})
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1679,6 +1689,24 @@ def register_external_resource(
     conn.commit()
 
 
+def _validate_external_resource_update_columns(
+    columns: list[str] | tuple[str, ...],
+) -> None:
+    """Reject any column outside ``_EXTERNAL_RESOURCE_UPDATABLE_COLUMNS``.
+
+    ``heartbeat_external_resource`` builds its UPDATE SET clause from a dynamic
+    column list, so the assembled statement is guarded here: every column name
+    must be one of this module's own whitelisted constants, or the update is
+    refused before the SQL is ever built. Values always travel as ``?``
+    placeholders; only these validated internal names are interpolated.
+    """
+    unknown = sorted(set(columns) - _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS)
+    if unknown:
+        raise ValueError(
+            f"columns not in _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS: {unknown}"
+        )
+
+
 def heartbeat_external_resource(
     conn: sqlite3.Connection,
     *,
@@ -1689,17 +1717,21 @@ def heartbeat_external_resource(
 ) -> bool:
     """Refresh last-seen state for an external resource."""
     now = _now_iso()
+    columns = ["last_seen"]
     fields = ["last_seen = ?"]
     params: list[Any] = [now]
     if status is not None:
+        columns.append("status")
         fields.append("status = ?")
         params.append(status)
     if metadata is not None:
+        columns.append("metadata")
         fields.append("metadata = ?")
         params.append(json.dumps(metadata, separators=(",", ":")))
+    _validate_external_resource_update_columns(columns)
     params.extend([provider, external_id])
     cursor = conn.execute(
-        f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",
+        f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",  # nosec B608 - column names validated against _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS
         params,
     )
     conn.commit()

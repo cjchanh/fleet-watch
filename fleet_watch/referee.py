@@ -1084,7 +1084,7 @@ def _ollama_resident_mb(port: int = 11434) -> tuple[int | None, str]:
     """
     url = f"http://127.0.0.1:{port}/api/ps"
     try:
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with urllib.request.urlopen(url, timeout=3) as resp:  # nosec B310 - loopback-only probe; tests/test_no_external_egress.py enforces the host set
             if resp.status != 200:
                 return None, f"ollama /api/ps returned HTTP {resp.status}"
             payload = json.loads(resp.read())

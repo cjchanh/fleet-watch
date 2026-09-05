@@ -54,7 +54,7 @@ def _get_known_models(port: int = 11434) -> list[str]:
             f"http://127.0.0.1:{port}/api/ps",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:  # nosec B310 - loopback-only probe; tests/test_no_external_egress.py enforces the host set
             data = json.loads(resp.read())
             return [m.get("name", "unknown") for m in data.get("models", [])]
     except Exception:
