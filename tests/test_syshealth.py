@@ -337,6 +337,7 @@ def test_get_memory_state_fails_closed_when_vm_stat_fails(monkeypatch):
     ],
 )
 def test_pressure_probe_retains_exception_provenance(monkeypatch, failure, reason):
+    monkeypatch.setattr(syshealth.platform, "system", lambda: "Darwin")  # these exercise the sysctl path
     monkeypatch.setattr(
         syshealth.subprocess,
         "run",
@@ -363,6 +364,7 @@ def test_pressure_probe_retains_exception_provenance(monkeypatch, failure, reaso
 def test_pressure_probe_retains_output_failure_provenance(
     monkeypatch, returncode, stdout, reason,
 ):
+    monkeypatch.setattr(syshealth.platform, "system", lambda: "Darwin")  # these exercise the sysctl path
     result = type("Result", (), {"returncode": returncode, "stdout": stdout})()
     monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
 
@@ -373,6 +375,7 @@ def test_pressure_probe_retains_output_failure_provenance(
 
 
 def test_pressure_probe_success_preserves_numeric_behavior(monkeypatch):
+    monkeypatch.setattr(syshealth.platform, "system", lambda: "Darwin")  # these exercise the sysctl path
     result = type("Result", (), {"returncode": 0, "stdout": "4\n"})()
     monkeypatch.setattr(syshealth.subprocess, "run", lambda *a, **kw: result)
 
