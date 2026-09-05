@@ -1718,17 +1718,17 @@ def heartbeat_external_resource(
     """Refresh last-seen state for an external resource."""
     now = _now_iso()
     columns = ["last_seen"]
-    fields = ["last_seen = ?"]
     params: list[Any] = [now]
     if status is not None:
         columns.append("status")
-        fields.append("status = ?")
         params.append(status)
     if metadata is not None:
         columns.append("metadata")
-        fields.append("metadata = ?")
         params.append(json.dumps(metadata, separators=(",", ":")))
+    # The SET clause is derived from the validated names, never from a parallel
+    # list, so an unvalidated identifier cannot reach the statement.
     _validate_external_resource_update_columns(columns)
+    fields = [f"{column} = ?" for column in columns]
     params.extend([provider, external_id])
     cursor = conn.execute(
         f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",  # nosec B608 - column names validated against _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS
