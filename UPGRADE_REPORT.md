@@ -1,6 +1,6 @@
 # Upgrade report — Fleet Watch
 
-Date: 2026-08-15. Checkout: `/Users/cj/Workspace/active/fleet-watch` on `main`. No push.
+Date: 2026-08-15. Checkout: a local clone on `main`. No push.
 
 ## What changed
 
