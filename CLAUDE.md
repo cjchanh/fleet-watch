@@ -1,5 +1,7 @@
 # CLAUDE.md — fleet-watch
 
+> This file and `AGENTS.md` are byte-identical mirrors; `tests/test_agents_mirror.py` enforces it. Edit CLAUDE.md, then copy it over AGENTS.md.
+
 ## Folder Purpose
 Process governance daemon that prevents port, GPU, and repo collisions across
 AI workloads on a single machine by maintaining a shared SQLite registry and
