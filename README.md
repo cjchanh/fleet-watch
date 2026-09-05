@@ -454,7 +454,9 @@ print(f"Chain valid: {valid}, events: {count}")
 
 Fleet Watch uses **session leases** to track who owns what. Process classification requires three independent signals before marking a process as safe to reap:
 
-Repo session leases are cooperative by default. `fleet guard --repo PATH --json` reports active sessions but does not deny solely because another session is in the same repo. Add `--write-scope RELPATH` when a command may edit files; Fleet denies only when another cooperative session has an overlapping declared scope. Use `--exclusive-repo-lock` for destructive git operations, whole-repo rewrites, or other work that truly requires sole repo ownership.
+Repo session leases are cooperative by default. `fleet guard --repo PATH --json` reports active sessions but does not deny solely because another session is in the same repo. Add `--write-scope RELPATH` when a command may edit files; Fleet denies only when another cooperative session has an overlapping declared scope. Use `--exclusive-repo-lock` for destructive git operations, whole-repo rewrites, or other work that truly requires sole repo ownership. An ACTIVE exclusive lease also denies when the requested resolved path equals, contains, or is inside the holder's stored `repo_dir`; cooperative leases stay exact-path.
+
+`--gpu` rejects negative values (exit 2).
 
 1. **Heartbeat expired** — not seen by discovery in >180 seconds
 2. **Session lease missing or closed** — no active owner

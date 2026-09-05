@@ -856,8 +856,36 @@ def check_repo_with_session(
     holder = registry.get_process_by_repo(conn, resolved_repo_dir)
     if holder is None:
         external_holders = registry.get_external_resources_by_repo(conn, repo_dir)
-        if not external_holders:
+        blocking_externals = [
+            item
+            for item in external_holders
+            if not (current_session_id and item["session_id"] == current_session_id)
+        ]
+        if blocking_externals:
+            external = blocking_externals[0]
+            return repo_decision(
+                allowed=False,
+                reason=(
+                    f"repo {resolved_repo_dir} locked by external "
+                    f"{external['provider']} resource {external['external_id']} "
+                    f"({external['name']})"
+                ),
+                holder=external,
+            )
+        if not blocking_externals:
             session_leases = registry.get_active_session_leases_by_repo(conn, repo_dir)
+            seen_ids = {lease["session_id"] for lease in session_leases}
+            for lease in registry.list_active_session_leases(conn):
+                if lease["session_id"] in seen_ids:
+                    continue
+                held = lease.get("repo_dir")
+                if (
+                    held
+                    and lease.get("repo_lock_mode") == "exclusive"
+                    and registry.repo_dirs_overlap(resolved_repo_dir, held)
+                ):
+                    session_leases.append(lease)
+                    seen_ids.add(lease["session_id"])
             owned_by_current_session = False
             advisory_holders: list[dict[str, Any]] = []
             stale_holders: list[dict[str, Any]] = []
@@ -979,19 +1007,14 @@ def check_repo_with_session(
             reason = "repo available"
             if stale_holders:
                 reason = "repo available (stale session lease cleared)"
+            if external_holders and not stale_holders:
+                return repo_decision(
+                    allowed=True,
+                    reason="repo available (owned by current session)",
+                    stale_holders=stale_holders,
+                    safe_mode="same-session",
+                )
             return repo_decision(allowed=True, reason=reason, stale_holders=stale_holders)
-        for external in external_holders:
-            if current_session_id and external["session_id"] == current_session_id:
-                continue
-            return repo_decision(
-                allowed=False,
-                reason=(
-                    f"repo {resolved_repo_dir} locked by external "
-                    f"{external['provider']} resource {external['external_id']} ({external['name']})"
-                ),
-                holder=external,
-            )
-        return repo_decision(allowed=True, reason="repo available (owned by current session)")
     # Is the holder row's PID still the process that registered it?
     #
     # This was ``os.kill(holder["pid"], 0)``, which asks only "does this integer

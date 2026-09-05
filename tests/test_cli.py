@@ -447,7 +447,8 @@ def test_guard_repo_cleans_stale_dead_exclusive_session_before_payload(tmp_path,
 def test_guard_repo_reports_stale_cleaned_lease_even_when_active_holder_denies(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
     repo = tmp_path / "repo"
-    repo.mkdir()
+    nested = repo / "nested"
+    nested.mkdir(parents=True)
     stale_pid = 2147483646
     active_pid = 2147483645
     conn = registry.connect()
@@ -462,7 +463,7 @@ def test_guard_repo_reports_stale_cleaned_lease_even_when_active_holder_denies(t
         conn,
         "sess-active",
         owner_pid=active_pid,
-        repo_dir=str(repo),
+        repo_dir=str(nested),
         repo_lock_mode="exclusive",
     )
     conn.close()

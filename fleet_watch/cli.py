@@ -97,6 +97,14 @@ def _get_conn():
     return registry.connect()
 
 
+def _reject_negative_gpu(
+    ctx: click.Context, param: click.Parameter, value: int | None
+) -> int | None:
+    if value is not None and value < 0:
+        raise click.BadParameter("must not be negative")
+    return value
+
+
 # ── Post-commit report refresh on the lease CLAIM paths ──────────────────────
 #
 # WHY THIS EXISTS. `session start` used to run `reporter.write_report(conn)`
@@ -589,6 +597,9 @@ def _build_guard_payload(
             "actual_ollama_gpu_mb": actual_gpu,
         },
     }
+    registry_warnings = registry.registry_warnings_for()
+    if registry_warnings:
+        payload["registry_warnings"] = registry_warnings
 
     # Advisory: include active runaway warnings if tracker is available
     if runaway_tracker is not None:
@@ -1189,7 +1200,7 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to check")
 @click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this command may edit")
 @click.option("--exclusive-repo-lock", is_flag=True, help="Require exclusive repo ownership")
-@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to check")
+@click.option("--gpu", "gpu_mb", type=int, default=None, callback=_reject_negative_gpu, help="GPU MB to check")
 @click.option("--session-id", default=None, help="Current session ID for owned-resource bypass")
 def check(
     port: int | None,
@@ -1259,7 +1270,7 @@ def check(
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to guard")
 @click.option("--write-scope", "write_scopes", multiple=True, help="Repo-relative or absolute path this command may edit")
 @click.option("--exclusive-repo-lock", is_flag=True, help="Require exclusive repo ownership")
-@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to guard")
+@click.option("--gpu", "gpu_mb", type=int, default=None, callback=_reject_negative_gpu, help="GPU MB to guard")
 @click.option("--framework", default=None, help="Inference framework (candle, mlx, ollama, vllm)")
 @click.option("--model", "model_hint", default=None, help="Model name/path for working set estimation")
 @click.option("--session-id", default=None, help="Current session ID for owned-resource bypass")
@@ -1366,7 +1377,7 @@ def guard(
 @cli.command(hidden=True)
 @click.option("--port", type=int, default=None, help="Port to check")
 @click.option("--repo", "repo_dir", default=None, help="Repo directory to check")
-@click.option("--gpu", "gpu_mb", type=int, default=None, help="GPU MB to check")
+@click.option("--gpu", "gpu_mb", type=int, default=None, callback=_reject_negative_gpu, help="GPU MB to check")
 @click.pass_context
 def claim(ctx, port, repo_dir, gpu_mb):
     """Alias for 'check' (deprecated)."""
@@ -1614,6 +1625,8 @@ def session_start(
     """
     if write_scopes and repo_dir is None:
         raise click.UsageError("--write-scope requires --repo")
+    resolved_owner_pid = owner_pid or _default_owner_pid()
+    owner_metadata = registry.collect_owner_metadata(resolved_owner_pid)
     conn = _get_conn()
     failures = referee.preflight_register(
         conn,
@@ -1628,15 +1641,28 @@ def session_start(
         conn.close()
         sys.exit(1)
 
-    resolved_owner_pid = owner_pid or _default_owner_pid()
-    registry.upsert_session_lease(
-        conn,
-        session_id,
-        owner_pid=resolved_owner_pid,
-        repo_dir=repo_dir,
-        repo_lock_mode="exclusive" if exclusive_repo_lock else "cooperative",
-        write_scopes=write_scopes,
-    )
+    if exclusive_repo_lock:
+        grant = registry.grant_exclusive_lease(
+            conn,
+            session_id,
+            owner_metadata=owner_metadata,
+            repo_dir=repo_dir,
+            write_scopes=write_scopes,
+        )
+        if not grant["allowed"]:
+            click.echo(f"DENY: {grant['reason']}", err=True)
+            conn.close()
+            sys.exit(1)
+    else:
+        registry.upsert_session_lease(
+            conn,
+            session_id,
+            owner_pid=resolved_owner_pid,
+            repo_dir=repo_dir,
+            repo_lock_mode="cooperative",
+            write_scopes=write_scopes,
+            owner_metadata=owner_metadata,
+        )
     events.log_event(
         conn,
         "SESSION_START",
@@ -1674,14 +1700,29 @@ def session_heartbeat(
         raise click.UsageError("--write-scope requires --repo")
     conn = _get_conn()
     resolved_owner_pid = owner_pid or _default_owner_pid()
-    ok = registry.heartbeat_session_lease(
-        conn,
-        session_id,
-        owner_pid=resolved_owner_pid,
-        repo_dir=repo_dir,
-        repo_lock_mode="exclusive" if exclusive_repo_lock else None,
-        write_scopes=write_scopes if write_scopes else None,
-    )
+    if exclusive_repo_lock:
+        owner_metadata = registry.collect_owner_metadata(resolved_owner_pid)
+        grant = registry.grant_exclusive_lease(
+            conn,
+            session_id,
+            owner_metadata=owner_metadata,
+            repo_dir=repo_dir,
+            write_scopes=write_scopes if write_scopes else None,
+        )
+        if not grant["allowed"]:
+            click.echo(f"DENY: {grant['reason']}", err=True)
+            conn.close()
+            sys.exit(1)
+        ok = True
+    else:
+        ok = registry.heartbeat_session_lease(
+            conn,
+            session_id,
+            owner_pid=resolved_owner_pid,
+            repo_dir=repo_dir,
+            repo_lock_mode=None,
+            write_scopes=write_scopes if write_scopes else None,
+        )
     if not ok:
         click.echo(f"Session {session_id} not found", err=True)
         conn.close()
@@ -1749,14 +1790,30 @@ def session_ensure(
                 conn.close()
                 sys.exit(1)
 
-            registry.upsert_session_lease(
-                conn,
-                session_id,
-                owner_pid=resolved_owner_pid,
-                repo_dir=repo_dir,
-                repo_lock_mode="exclusive" if exclusive_repo_lock else None,
-                write_scopes=write_scopes if write_scopes else None,
-            )
+            if exclusive_repo_lock:
+                owner_metadata = registry.collect_owner_metadata(resolved_owner_pid)
+                grant = registry.grant_exclusive_lease(
+                    conn,
+                    session_id,
+                    owner_metadata=owner_metadata,
+                    repo_dir=repo_dir,
+                    write_scopes=write_scopes if write_scopes else None,
+                )
+                if not grant["allowed"]:
+                    if str(grant.get("reason", "")).startswith("registry locked"):
+                        raise sqlite3.OperationalError(grant["reason"])
+                    click.echo(f"DENY: {grant['reason']}", err=True)
+                    conn.close()
+                    sys.exit(1)
+            else:
+                registry.upsert_session_lease(
+                    conn,
+                    session_id,
+                    owner_pid=resolved_owner_pid,
+                    repo_dir=repo_dir,
+                    repo_lock_mode=None,
+                    write_scopes=write_scopes if write_scopes else None,
+                )
             events.log_event(
                 conn,
                 "SESSION_START",

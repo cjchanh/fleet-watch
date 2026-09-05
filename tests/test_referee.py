@@ -566,6 +566,97 @@ def test_repo_denied_by_exclusive_session_lease():
     assert d.holder["repo_lock_mode"] == "exclusive"
 
 
+def test_exclusive_hold_denies_subdir_and_allows_sibling(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "locked"
+    sub = repo / "sub"
+    sibling = tmp_path / "sibling"
+    sub.mkdir(parents=True)
+    sibling.mkdir()
+    registry.upsert_session_lease(
+        conn,
+        "sess-exclusive",
+        owner_pid=None,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    denied = referee.check_repo_with_session(
+        conn, str(sub), current_session_id="sess-mine"
+    )
+    assert denied.allowed is False
+    allowed = referee.check_repo_with_session(
+        conn, str(sibling), current_session_id="sess-mine"
+    )
+    assert allowed.allowed is True
+
+
+def test_exclusive_hold_on_subdir_denies_parent(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "locked"
+    sub = repo / "sub"
+    sub.mkdir(parents=True)
+    registry.upsert_session_lease(
+        conn,
+        "sess-exclusive",
+        owner_pid=None,
+        repo_dir=str(sub),
+        repo_lock_mode="exclusive",
+    )
+    d = referee.check_repo_with_session(
+        conn, str(repo), current_session_id="sess-mine"
+    )
+    assert d.allowed is False
+
+
+def test_exclusive_overlap_denies_when_same_session_external_on_subdir(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "locked"
+    sub = repo / "sub"
+    sub.mkdir(parents=True)
+    registry.upsert_session_lease(
+        conn,
+        "sess-exclusive",
+        owner_pid=None,
+        repo_dir=str(repo),
+        repo_lock_mode="exclusive",
+    )
+    registry.register_external_resource(
+        conn,
+        provider="thunder",
+        resource_type="instance",
+        external_id="abc123",
+        session_id="sess-mine",
+        workstream="paper",
+        name="Thunder abc123",
+        repo_dir=str(sub),
+        status="RUNNING",
+    )
+    d = referee.check_repo_with_session(
+        conn, str(sub), current_session_id="sess-mine"
+    )
+    assert d.allowed is False
+    assert d.holder is not None
+    assert d.holder["session_id"] == "sess-exclusive"
+
+
+def test_cooperative_hold_on_parent_does_not_deny_subdir(tmp_path):
+    conn = _fresh_conn()
+    repo = tmp_path / "locked"
+    sub = repo / "sub"
+    sub.mkdir(parents=True)
+    registry.upsert_session_lease(
+        conn,
+        "sess-coop",
+        owner_pid=None,
+        repo_dir=str(repo),
+        repo_lock_mode="cooperative",
+    )
+    d = referee.check_repo_with_session(
+        conn, str(sub), current_session_id="sess-mine"
+    )
+    assert d.allowed is True
+
+
 def test_repo_denied_by_overlapping_write_scope():
     conn = _fresh_conn()
     registry.upsert_session_lease(

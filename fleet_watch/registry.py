@@ -125,6 +125,9 @@ SESSION_REPO_LOCK_MODES = frozenset({
     "exclusive",
 })
 
+EXCLUSIVE_REPO_INDEX = "ux_session_leases_exclusive_repo"
+REGISTRY_WARNINGS: list[dict[str, Any]] = []
+
 PROCESS_STATES = frozenset({
     "live",
     "disconnected",
@@ -156,6 +159,29 @@ def ensure_dir() -> Path:
 
 def _resolve_repo_dir(repo_dir: str | None) -> str | None:
     return str(Path(repo_dir).resolve()) if repo_dir else None
+
+
+def repo_dirs_overlap(left: str | None, right: str | None) -> bool:
+    """True when resolved paths are equal or one is a directory prefix of the other."""
+    if not left or not right:
+        return False
+    left_resolved = str(Path(left).resolve())
+    right_resolved = str(Path(right).resolve())
+    if left_resolved == right_resolved:
+        return True
+    left_prefix = left_resolved + os.sep
+    right_prefix = right_resolved + os.sep
+    return left_resolved.startswith(right_prefix) or right_resolved.startswith(left_prefix)
+
+
+def _registry_db_key(db_path: Path | str | None = None) -> str:
+    return str(Path(db_path or DB_PATH).expanduser().resolve())
+
+
+def registry_warnings_for(db_path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Warnings recorded for one registry file; later connects to other DBs do not clear these."""
+    key = _registry_db_key(db_path)
+    return [dict(warning) for warning in REGISTRY_WARNINGS if warning.get("db_path") == key]
 
 
 def _resolve_write_scopes(repo_dir: str | None, write_scopes: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -202,6 +228,47 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_exclusive_repo_index(conn: sqlite3.Connection, db_path: Path | str) -> None:
+    """Create the partial unique index for ACTIVE exclusive repo leases.
+
+    If creation fails because an existing registry already holds duplicate
+    ACTIVE exclusive rows for one repo, do NOT close or edit any lease:
+    leave the index absent, record the condition in ``REGISTRY_WARNINGS``,
+    and keep the transactional grant path as the enforcement.
+    """
+    key = _registry_db_key(db_path)
+    try:
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {EXCLUSIVE_REPO_INDEX} "
+            "ON session_leases(repo_dir) "
+            "WHERE status = 'ACTIVE' AND repo_lock_mode = 'exclusive'"
+        )
+    except sqlite3.IntegrityError:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        warning = {
+            "code": "exclusive_repo_index_absent",
+            "reason": (
+                "duplicate ACTIVE exclusive session leases prevent unique index; "
+                "transactional grant remains the enforcement"
+            ),
+            "db_path": key,
+        }
+        if warning not in REGISTRY_WARNINGS:
+            REGISTRY_WARNINGS.append(warning)
+        return
+    REGISTRY_WARNINGS[:] = [
+        warning
+        for warning in REGISTRY_WARNINGS
+        if not (
+            warning.get("code") == "exclusive_repo_index_absent"
+            and warning.get("db_path") == key
+        )
+    ]
 
 
 def _age_seconds(iso_ts: str | None) -> int | None:
@@ -460,6 +527,18 @@ def _inspect_process(pid: int | None) -> dict[str, Any] | None:
             "tty": tty,
             "error": f"unexpected ps output: {line}",
         }
+
+
+def collect_owner_metadata(owner_pid: int | None) -> dict[str, Any]:
+    """Gather ``ps``-derived owner fields. Does not touch the registry DB."""
+    inspect = _inspect_process(owner_pid)
+    return {
+        "owner_pid": owner_pid,
+        "owner_ppid": inspect.get("ppid") if inspect else None,
+        "owner_pgid": inspect.get("pgid") if inspect else None,
+        "owner_tty": inspect.get("tty") if inspect else None,
+        "owner_create_time": _pid_create_time(owner_pid),
+    }
 
 
 def _process_uid(pid: int | None) -> int | None:
@@ -873,6 +952,7 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     # name a live process", never "is it still the SAME process". Appended last
     # (ALTER TABLE ADD COLUMN), which is where ``_row_to_dict`` expects it.
     _ensure_column(conn, "processes", "start_create_time", "TEXT")
+    _ensure_exclusive_repo_index(conn, path)
     # Ensure gpu_budget singleton exists
     conn.execute(
         "INSERT OR IGNORE INTO gpu_budget (id, total_mb, reserve_mb, allocated_mb) "
@@ -896,6 +976,8 @@ def upsert_session_lease(
     status: str = "ACTIVE",
     repo_lock_mode: str | None = None,
     write_scopes: list[str] | tuple[str, ...] | None = None,
+    owner_metadata: dict[str, Any] | None = None,
+    commit: bool = True,
 ) -> None:
     """Create or refresh a session lease with current owner metadata."""
     if status not in SESSION_LEASE_STATUSES:
@@ -913,11 +995,13 @@ def upsert_session_lease(
         if write_scopes is not None
         else prior_scopes
     )
-    inspect = _inspect_process(owner_pid)
-    owner_ppid = inspect.get("ppid") if inspect else None
-    owner_pgid = inspect.get("pgid") if inspect else None
-    owner_tty = inspect.get("tty") if inspect else None
-    owner_create_time = _pid_create_time(owner_pid)
+    if owner_metadata is None:
+        owner_metadata = collect_owner_metadata(owner_pid)
+    owner_pid = owner_metadata.get("owner_pid", owner_pid)
+    owner_ppid = owner_metadata.get("owner_ppid")
+    owner_pgid = owner_metadata.get("owner_pgid")
+    owner_tty = owner_metadata.get("owner_tty")
+    owner_create_time = owner_metadata.get("owner_create_time")
     # Fencing: a (re-)grant issues a monotonically increasing epoch so a stale
     # holder's token can be rejected at any future enforcement point. A new
     # owner taking over the same session id strictly bumps the prior epoch.
@@ -961,7 +1045,8 @@ def upsert_session_lease(
             status,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def heartbeat_session_lease(
@@ -1039,8 +1124,7 @@ def heartbeat_session_lease(
     return cursor.rowcount > 0
 
 
-def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
-    """Mark a session lease as closed."""
+def _close_session_lease_row(conn: sqlite3.Connection, session_id: str) -> bool:
     now = _now_iso()
     cursor = conn.execute(
         """
@@ -1052,8 +1136,126 @@ def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
         """,
         (now, now, session_id),
     )
-    conn.commit()
     return cursor.rowcount > 0
+
+
+def close_session_lease(conn: sqlite3.Connection, session_id: str) -> bool:
+    """Mark a session lease as closed."""
+    closed = _close_session_lease_row(conn, session_id)
+    conn.commit()
+    return closed
+
+
+def _exclusive_grant_conflict(
+    conn: sqlite3.Connection,
+    session_id: str,
+    resolved_repo: str | None,
+) -> str | None:
+    """Return a DENY reason if a live holder blocks an exclusive grant."""
+    if not resolved_repo:
+        return None
+    for lease in list_active_session_leases(conn):
+        if lease["session_id"] == session_id:
+            continue
+        held = lease.get("repo_dir")
+        if not held:
+            continue
+        lease_mode = lease.get("repo_lock_mode", "cooperative")
+        owner_pid = lease.get("owner_pid")
+        heartbeat_age = _age_seconds(lease.get("last_heartbeat_at"))
+        owner_missing = owner_pid is None
+        owner_dead = owner_pid is not None and not _lease_owner_alive(lease)
+        ttl_expired = (
+            heartbeat_age is not None and heartbeat_age > DEFAULT_STALE_SECONDS
+        )
+        if owner_dead or (owner_missing and ttl_expired):
+            _close_session_lease_row(conn, lease["session_id"])
+            continue
+        if lease_mode != "exclusive" and ttl_expired:
+            continue
+        if lease_mode == "exclusive":
+            if not repo_dirs_overlap(resolved_repo, held):
+                continue
+            return (
+                f"repo {resolved_repo} locked by exclusive session "
+                f"{lease['session_id']}"
+            )
+        if held != resolved_repo:
+            continue
+        return (
+            f"exclusive repo lock blocked by active session {lease['session_id']}"
+        )
+    return None
+
+
+def grant_exclusive_lease(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    owner_metadata: dict[str, Any],
+    repo_dir: str | None = None,
+    write_scopes: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Atomically re-check exclusivity and grant. Fail-closed on lock.
+
+    Owner metadata must already be gathered — ``ps`` stays outside the
+    transaction. On ``sqlite3.OperationalError`` after ``busy_timeout``, DENY.
+    """
+    resolved_repo = _resolve_repo_dir(repo_dir)
+    resolved_scopes = (
+        _resolve_write_scopes(resolved_repo, write_scopes)
+        if write_scopes is not None
+        else None
+    )
+    try:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        return {"allowed": False, "reason": f"registry locked: {exc}"}
+    try:
+        if not resolved_repo:
+            prior = get_session_lease(conn, session_id)
+            if prior:
+                resolved_repo = prior.get("repo_dir")
+        conflict = _exclusive_grant_conflict(conn, session_id, resolved_repo)
+        if conflict is not None:
+            conn.rollback()
+            return {"allowed": False, "reason": conflict}
+        upsert_session_lease(
+            conn,
+            session_id,
+            owner_pid=owner_metadata.get("owner_pid"),
+            repo_dir=resolved_repo,
+            repo_lock_mode="exclusive",
+            write_scopes=resolved_scopes,
+            owner_metadata=owner_metadata,
+            commit=False,
+        )
+        conn.commit()
+        return {"allowed": True, "reason": "granted"}
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return {"allowed": False, "reason": f"registry locked: {exc}"}
+    except sqlite3.IntegrityError:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        held = resolved_repo or repo_dir or ""
+        return {
+            "allowed": False,
+            "reason": f"repo {held} exclusive lock already held",
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def get_session_lease(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
