@@ -4,15 +4,7 @@
 
 # Fleet Watch
 
-Local process governance for AI workloads on a single machine, and a read-only GitHub fleet sitrep.
-
-`fleet sitrep` lists repositories GitHub actually returns to the local `gh` CLI. It does not clone, does not read or store tokens, and it never fills in a commit SHA that GitHub did not supply as a full object id.
-
-## The Problem
-
-You're running MLX, Ollama, vLLM, Candle/Cake, experiment runners, and AI coding agents on the same machine. They don't know about each other. Port 8899 gets stolen by a canary model. A 7B model quietly allocates 11 GB of Metal buffers on an 8 GB machine, swapping to SSD and running 65x slower than expected. Two Codex sessions write to the same repo. Health endpoints say "ok" while GPU memory is exhausted.
-
-Fleet Watch prevents these collisions by maintaining a shared registry of what's running, what resources are claimed, and what's available — including pre-flight working set estimation that catches memory overcommit before it becomes a six-hour debug session.
+Local process governance for AI workloads on a single machine. It tracks ports, GPU memory, and repo leases so two jobs do not collide, and it can list GitHub repositories the local `gh` CLI already sees.
 
 ## Install
 
@@ -20,19 +12,29 @@ Fleet Watch prevents these collisions by maintaining a shared registry of what's
 pipx install fleet-watch
 ```
 
-Verify it works:
-
 ```bash
 fleet --version
-fleet status
-fleet sitrep --help
 ```
 
-Or install from source:
+From source: `pipx install ~/path/to/fleet-watch/`
+
+## Example
 
 ```bash
-pipx install ~/path/to/fleet-watch/
+fleet guard --json --port 8899 --repo ~/projects/my-app
 ```
+
+If `"allowed"` is false, do not bind the port or write the repo.
+
+## What it refuses
+
+`fleet guard --json` never silently allows on error: a missing registry, a locked database, an unreadable input, a negative GPU value, or a non-integer port all return `"allowed": false`. `fleet sitrep` talks to GitHub only through local `gh`; it does not clone, store tokens, or invent commit SHAs.
+
+## The Problem
+
+You're running MLX, Ollama, vLLM, Candle/Cake, experiment runners, and AI coding agents on the same machine. They don't know about each other. Port 8899 gets stolen by a canary model. A 7B model quietly allocates 11 GB of Metal buffers on an 8 GB machine, swapping to SSD and running 65x slower than expected. Two Codex sessions write to the same repo. Health endpoints say "ok" while GPU memory is exhausted.
+
+Fleet Watch prevents these collisions by maintaining a shared registry of what's running, what resources are claimed, and what's available — including pre-flight working set estimation that catches memory overcommit before it becomes a six-hour debug session.
 
 ## How It Works
 
@@ -220,9 +222,9 @@ Top-level keys:
 | `fleet reconcile` | Non-destructive ownership diagnosis |
 | `fleet reconcile --json` | Machine-readable ownership diagnosis |
 | `fleet census` | What boots and runs on this machine, and what's stale |
-| `fleet census --json` | Full census receipt (`fleet-census/v1`) |
+| `fleet census --json` | Full census record (`fleet-census/v1`) |
 | `fleet census --emit-launchd-plist` | Print the staged daily-census launchd job; installs nothing |
-| `fleet boot-map` | Census receipt → boot graph + local interactive 3D page |
+| `fleet boot-map` | Census record → boot graph + local interactive 3D page |
 
 #### `fleet census`
 
@@ -235,15 +237,15 @@ Fleet Watch's own registry.
 
 Every item carries a `status`, a `verdict` (`keep` / `investigate` / `close` /
 `remove`), the exact evidence behind it, and the deterministic `rule` that fired.
-Receipts land at `~/.governance/receipts/fleet-census/`, and each run diffs
+Records land at `~/.governance/receipts/fleet-census/`, and each run diffs
 itself against the previous one — new, disappeared and verdict-changed boot
 entries are the signal.
 
 Fleet Watch never kills anything here: `close_command` is advisory text for the
-operator, and the recurring launchd job is staged
+user, and the recurring launchd job is staged
 (`contrib/launchd/io.fleet-watch.census.plist`), never installed.
 
-Receipt contract: [`docs/fleet-census-receipt-contract-v1.md`](docs/fleet-census-receipt-contract-v1.md).
+Record contract: [`docs/fleet-census-receipt-contract-v1.md`](docs/fleet-census-receipt-contract-v1.md).
 
 ### `fleet sitrep`
 
@@ -265,7 +267,7 @@ Rules the command is tested against:
   `git clone` / `gh repo clone` path.
 - **No tokens in this repo.** The code does not read `GITHUB_TOKEN` /
   `GH_TOKEN`, does not run `gh auth token`, and refuses `-t` / `--token`.
-  Auth stays in the operator's `gh` credential store. If `gh` is missing or
+  Auth stays in the user's `gh` credential store. If `gh` is missing or
   the query fails, sitrep prints `REFUSAL` and exits 1 — it does not invent a
   fleet from local checkouts.
 - **No invented SHA.** `sha` is a 40- or 64-char hex object id from GitHub's
@@ -273,7 +275,7 @@ Rules the command is tested against:
   values become `sha: null` plus `sha_absent_reason`. Short SHAs are never
   kept or padded.
 
-Receipts (when not `--no-receipt`) land at
+Records (when not `--no-receipt`) land at
 `~/.governance/receipts/fleet-github-sitrep/` as a dated JSON file plus
 `latest.json`. Schema: `fleet-github-sitrep/v1`. At most `--limit` repos
 (default 30, max 100); `truncated: true` means GitHub said another page
@@ -456,7 +458,7 @@ Fleet Watch uses **session leases** to track who owns what. Process classificati
 
 Repo session leases are cooperative by default. `fleet guard --repo PATH --json` reports active sessions but does not deny solely because another session is in the same repo. Add `--write-scope RELPATH` when a command may edit files; Fleet denies only when another cooperative session has an overlapping declared scope. Use `--exclusive-repo-lock` for destructive git operations, whole-repo rewrites, or other work that truly requires sole repo ownership. An ACTIVE exclusive lease also denies when the requested resolved path equals, contains, or is inside the holder's stored `repo_dir`; cooperative leases stay exact-path.
 
-`--gpu` rejects negative values (exit 2).
+`--gpu` rejects negative values. With `--json`, that is `{"allowed": false}` rather than Click usage text.
 
 1. **Heartbeat expired** — not seen by discovery in >180 seconds
 2. **Session lease missing or closed** — no active owner

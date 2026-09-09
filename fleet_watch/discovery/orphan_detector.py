@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_watch.constants import PS_BIN
+
 
 @dataclass
 class OrphanDetectionResult:
@@ -66,7 +68,7 @@ def _get_runner_processes() -> list[dict[str, Any]]:
     """Find ollama runner processes via ps aux."""
     try:
         out = subprocess.run(
-            ["ps", "aux"],
+            [PS_BIN, "aux"],
             capture_output=True,
             text=True,
             timeout=5,

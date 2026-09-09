@@ -105,6 +105,38 @@ def _reject_negative_gpu(
     return value
 
 
+def _is_guard_json(argv: list[str]) -> bool:
+    return "guard" in argv and "--json" in argv
+
+
+class FleetGroup(click.Group):
+    """Keep ``fleet guard --json`` on the JSON contract through Click usage errors.
+
+    Click raises ``UsageError`` during parameter conversion (negative GPU,
+    non-integer port, etc.) before the command body runs. The guard contract
+    says ``--json`` always emits ``{"allowed": false, ...}``, never usage text.
+    """
+
+    def main(self, args=None, **kwargs):
+        argv = sys.argv[1:] if args is None else list(args)
+        if _is_guard_json(argv):
+            kwargs = dict(kwargs)
+            kwargs["standalone_mode"] = False
+            try:
+                return super().main(args=args, **kwargs)
+            except click.ClickException as exc:
+                click.echo(
+                    json.dumps(
+                        {
+                            "allowed": False,
+                            "reason": f"usage_error: {exc.format_message()}",
+                        }
+                    )
+                )
+                sys.exit(1)
+        return super().main(args=args, **kwargs)
+
+
 # ── Post-commit report refresh on the lease CLAIM paths ──────────────────────
 #
 # WHY THIS EXISTS. `session start` used to run `reporter.write_report(conn)`
@@ -999,7 +1031,7 @@ def _render_launchd_plist(executable: str, interval: int) -> str:
     )
 
 
-@click.group()
+@click.group(cls=FleetGroup)
 @click.version_option(package_name="fleet-watch")
 def cli():
     """Fleet Watch — local process governance, plus read-only GitHub fleet sitrep."""

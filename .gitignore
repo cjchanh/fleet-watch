@@ -11,3 +11,4 @@ release/
 release/evidence/autopilot_*/
 CRAFT_GATE_RESULT.json
 .claude/
+.lineage-state/

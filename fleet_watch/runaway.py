@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_watch.constants import PS_BIN
+
 DEFAULT_CPU_THRESHOLD = 90.0
 DEFAULT_SUSTAINED_SECONDS = 60
 
@@ -91,7 +93,7 @@ def scan_runaways(
     # Get all processes with cpu, elapsed time, pid, and command
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid,pcpu,etime,command"],
+            [PS_BIN, "-eo", "pid,pcpu,etime,command"],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):

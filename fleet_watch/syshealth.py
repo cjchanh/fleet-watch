@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_watch import registry
+from fleet_watch.constants import PS_BIN
 
 
 # --- Default patterns (overridable via config.json) ---
@@ -834,7 +835,7 @@ def _ps_aux_lines() -> list[list[str]]:
     """Run ps aux and return parsed lines (11+ fields each)."""
     try:
         out = subprocess.run(
-            ["ps", "aux"], capture_output=True, text=True, timeout=5, check=False,
+            [PS_BIN, "aux"], capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
         return []

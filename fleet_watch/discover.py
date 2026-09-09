@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_watch import events, gpu_estimator, referee, registry, syshealth
+from fleet_watch.constants import PS_BIN
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "gpu_total_mb": registry.DEFAULT_GPU_TOTAL_MB,
@@ -151,8 +152,8 @@ def _get_listeners() -> dict[int, int]:
 def _get_process_commands() -> dict[int, str]:
     """Return {pid: command} for all running processes."""
     commands = (
-        ["ps", "axww", "-o", "pid=", "-o", "args="],
-        ["ps", "-eo", "pid,command"],
+        [PS_BIN, "axww", "-o", "pid=", "-o", "args="],
+        [PS_BIN, "-eo", "pid,command"],
     )
     result: dict[int, str] = {}
 

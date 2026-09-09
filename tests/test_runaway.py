@@ -63,7 +63,7 @@ class TestScanRunaways:
         import subprocess as real_subprocess
 
         def mock_run(cmd, **kwargs):
-            if cmd[0] == "ps" and "-eo" in cmd:
+            if cmd[0] == "/bin/ps" and "-eo" in cmd:
                 return type("R", (), {"stdout": fake_output, "returncode": 0})()
             return real_subprocess.run(cmd, **kwargs)
 

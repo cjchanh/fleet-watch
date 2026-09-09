@@ -6,7 +6,7 @@ Consumers build against this file.
 
 `fleet census` answers one question: *what boots and runs on this Mac, and
 what's stale.* It is deterministic, read-only, LLM-free and network-free. It
-never kills anything — `close_command` is advisory text for the operator.
+never kills anything — `close_command` is advisory text for the user.
 
 ---
 
@@ -47,7 +47,7 @@ Consumers **must** handle the absent state: no `latest.json` means
 fails if the counts disagree with the domains.
 
 `ranked_investigate` is the top-N (default 10) items with `verdict: investigate`,
-ordered by operator cost: aggregate RSS MB, then CPU %, then failing/orphan
+ordered by attention cost: aggregate RSS MB, then CPU %, then failing/orphan
 status weight, then large-cluster / high-cpu rules. It is **optional** on
 receipts written before ranking existed; when present it must be an array of
 objects with at least `label`, `rank` (positive int), and `score` (number).
@@ -106,8 +106,8 @@ Required on every item: `label`, `path`, `status`, `evidence`, `verdict`,
 `verdict` ∈ `keep | investigate | close | remove`
 
 `rule` names the deterministic heuristic that produced the verdict (e.g.
-`user-agent/missing-target`, `listener/stale-unmanaged`), so a receipt
-testifies *which* rule fired, not just what it concluded.
+`user-agent/missing-target`, `listener/stale-unmanaged`), so a record
+shows *which* rule fired, not just what it concluded.
 
 **Removal safety.** A `remove` verdict only ever comes from an **absolute**
 target path that is absent from disk. Anything the census cannot pin down — a
@@ -199,12 +199,12 @@ boot-surface change under process churn. New / disappeared / verdict-changed
 
 ---
 
-## Recurring run (operator-gated)
+## Recurring run (user-gated)
 
 The staged launchd job lives at
 `contrib/launchd/io.fleet-watch.census.plist` (daily at 09:00). It is **staged,
 not installed** — Fleet Watch never bootstraps a launchd job, because process
-control is an operator action.
+control is a user action.
 
 To install it with the `fleet` path resolved for this machine:
 

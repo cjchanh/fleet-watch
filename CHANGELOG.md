@@ -1,19 +1,34 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-09-08
 
 ### Added
 
-- **`fleet sitrep`** — read-only GitHub fleet sitrep. One `gh api graphql` query lists viewer-owned (or `--owner`) repositories and copies default-branch object ids GitHub actually returned. No clone, no token flags, no invented or abbreviated SHA. Missing `gh` or a failed query is a `REFUSAL`, not a fake fleet. Receipts: `~/.governance/receipts/fleet-github-sitrep/` (`fleet-github-sitrep/v1`).
-- **`fleet census`** — deterministic, read-only census of every boot and runtime surface on the machine: user LaunchAgents (cross-referenced against `launchctl list` and `launchctl print-disabled`, with both-direction orphan detection), `/Library` daemons and agents, live processes clustered by what they actually run, TCP listeners attributed to their owning process, crontab, login items, brew services, and the Fleet Watch registry itself.
-- **Deterministic verdict engine** — every item gets `status`, `verdict` (`keep`/`investigate`/`close`/`remove`), evidence, and the named `rule` that produced it, so a receipt testifies which heuristic fired rather than just its conclusion.
-- **`fleet-census/v1` receipt contract** — dated receipts plus an atomically swapped `latest.json` at `~/.governance/receipts/fleet-census/`. The payload is validated before any write and re-validated from disk before the pointer swap; a receipt that fails validation never replaces a good one. Contract: `docs/fleet-census-receipt-contract-v1.md`.
-- **Drift detection** — each census diffs itself against the previous receipt and reports new, disappeared and verdict-changed boot entries. The volatile `processes` domain is excluded from the diff and named in `drift.excluded_domains`.
+- **`fleet sitrep`** — read-only GitHub fleet view. One `gh api graphql` query lists viewer-owned (or `--owner`) repositories and copies default-branch object ids GitHub actually returned. No clone, no token flags, no invented or abbreviated SHA. Missing `gh` or a failed query is a `REFUSAL`, not a fake fleet. Records: `~/.governance/receipts/fleet-github-sitrep/` (`fleet-github-sitrep/v1`).
+- **`fleet census`** — deterministic, read-only census of boot and runtime surfaces: user LaunchAgents (cross-referenced against `launchctl list` and `launchctl print-disabled`, with both-direction orphan detection), `/Library` daemons and agents, live processes clustered by what they actually run, TCP listeners attributed to their owning process, crontab, login items, brew services, and the Fleet Watch registry itself.
+- **Deterministic verdict engine** — every census item gets `status`, a `verdict` (`keep`/`investigate`/`close`/`remove`), evidence, and the named `rule` that produced it, so a record shows which heuristic fired rather than just its conclusion.
+- **`fleet-census/v1` record contract** — dated JSON plus an atomically swapped `latest.json` at `~/.governance/receipts/fleet-census/`. The payload is validated before any write and re-validated from disk before the pointer swap; a record that fails validation never replaces a good one. Contract: `docs/fleet-census-receipt-contract-v1.md`.
+- **Drift detection** — each census diffs itself against the previous record and reports new, disappeared and verdict-changed boot entries. The volatile `processes` domain is excluded from the diff and named in `drift.excluded_domains`.
 - **Staged daily launchd job** — `contrib/launchd/io.fleet-watch.census.plist`, emitted with the machine's resolved `fleet` path by `fleet census --emit-launchd-plist`. Staged only; Fleet Watch never bootstraps a launchd job.
+- **`fleet boot-map`** — census record to a local boot graph and interactive page.
+- Linux memory-pressure admission via PSI (`/proc/pressure/memory`), with `/proc/meminfo` MemAvailable fallback when PSI is absent. Unreadable pressure stays a deny, not an allow.
+- Guard evidence blocks on every check. A live process that only holds a stale git lock read-only is not a write claim.
+- Session close is authorized to the lease's own lineage; the user seat may close their own leases.
+
+### Changed
+
+- Exclusive repo grants are atomic: owner metadata is gathered first, then `BEGIN IMMEDIATE` around check+insert, with a partial unique index (and a `registry_warnings` fallback). Guard and grant deny path overlap with an exclusive holder without re-keying `repo_dir`.
+- `fleet guard --json` returns `{"allowed": false, "reason": "..."}` for invalid GPU or port values (negative GPU, non-integer GPU, bad port) instead of Click usage text.
+- Process inspection pins `/bin/ps` rather than resolving `ps` from `PATH`.
+- A session lease is stale on proven owner death **or** heartbeat TTL expiry — two independent sufficient triggers.
+- Port availability consults the OS socket table.
+- Runaway auto-kill is opt-in.
+- Session start acknowledges the claim when it commits, not when the report finishes.
+- `AGENTS.md` is a byte-identical mirror of `CLAUDE.md`, enforced by test and CI `cmp`.
 
 ### Notes
 
-- Zero items across all domains is a refusal, not a receipt: nothing is written and the CLI exits 1. An unparseable plist is surfaced as `unknown`/`investigate`, never dropped.
+- Zero census items across all domains is a refusal, not a record: nothing is written and the CLI exits 1. An unparseable plist is surfaced as `unknown`/`investigate`, never dropped.
 - `close_command` is advisory text. `fleet census` is read-only and kills nothing.
 
 ## 0.2.0

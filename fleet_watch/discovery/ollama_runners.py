@@ -14,6 +14,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_watch.constants import PS_BIN
+
 
 @dataclass
 class OllamaRunner:
@@ -105,7 +107,7 @@ def _get_process_info(pid: int) -> dict[str, Any] | None:
     """Get RSS, cmdline, and ppid for a process via ps."""
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "rss=", "-o", "args="],
+            [PS_BIN, "-p", str(pid), "-o", "rss=", "-o", "args="],
             capture_output=True,
             text=True,
             timeout=5,

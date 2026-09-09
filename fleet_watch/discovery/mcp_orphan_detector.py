@@ -18,6 +18,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from fleet_watch.constants import PS_BIN
+
 # CDS MCP stdio server scripts (compile/engines/sitrep/session_memory/lexicon/graph
 # and any future mcp_*_server.py). Matched against the process command line.
 _MCP_SERVER_RE = re.compile(r"mcp_[a-z0-9_]*server\.py|mcp_graph_context_server\.py")
@@ -80,7 +82,7 @@ def _get_mcp_processes() -> list[dict[str, Any]]:
     """List live MCP server processes via ps. Returns [{pid, ppid, rss_mb, cmd}]."""
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid,ppid,rss,command"],
+            [PS_BIN, "-eo", "pid,ppid,rss,command"],
             capture_output=True, text=True, timeout=5, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):

@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_watch.constants import PS_BIN
+
 
 @dataclass
 class PkillTarget:
@@ -100,7 +102,7 @@ def _get_process_detail(pid: int) -> dict[str, Any] | None:
     """Get name, cmdline, RSS, and PPID for a PID."""
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "comm=", "-o", "args="],
+            [PS_BIN, "-p", str(pid), "-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "comm=", "-o", "args="],
             capture_output=True,
             text=True,
             timeout=5,

@@ -1,12 +1,6 @@
-"""census.probes — read-only, timeout-bounded system probes for `fleet census`.
+"""Read-only, timeout-bounded system probes for `fleet census`.
 
-Every probe is deterministic, read-only, and never raises. A probe that cannot
-run returns a :class:`ProbeResult` with ``ok=False`` and an error string so the
-census can testify "probe returned nothing" instead of inventing items
-(Craft Gate pillar 1 — fail-closed).
-
-No network, no LLM, no writes. Parsing is separated from execution so every
-parser is unit-testable against captured fixtures.
+Probes never raise: a failure returns ProbeResult(ok=False). No network, no writes.
 """
 
 from __future__ import annotations
@@ -20,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 from xml.parsers.expat import ExpatError
+
+from fleet_watch.constants import PS_BIN
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -597,7 +593,7 @@ def parse_ps(stdout: str) -> tuple[list[ProcInfo], int]:
 def ps_snapshot(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> tuple[list[ProcInfo], int, ProbeResult]:
-    result = run_probe(["ps", "-Ao", _PS_FORMAT], timeout=timeout)
+    result = run_probe([PS_BIN, "-Ao", _PS_FORMAT], timeout=timeout)
     if not result.ok:
         return [], 0, result
     procs, unparsed = parse_ps(result.stdout)

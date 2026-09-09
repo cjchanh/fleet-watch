@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from fleet_watch.constants import PS_BIN
+
 FLEET_DIR = Path.home() / ".fleet-watch"
 DB_PATH = FLEET_DIR / "registry.db"
 DEFAULT_GPU_TOTAL_MB = 131072
@@ -322,7 +324,7 @@ def _pid_create_time(pid: int | None) -> str | None:
     fixed_env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
     try:
         result = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            [PS_BIN, "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=2,
@@ -466,7 +468,7 @@ def _inspect_process(pid: int | None) -> dict[str, Any] | None:
 
     try:
         result = subprocess.run(
-            ["ps", "-o", "ppid=", "-o", "pgid=", "-o", "tty=", "-p", str(pid)],
+            [PS_BIN, "-o", "ppid=", "-o", "pgid=", "-o", "tty=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=2,
@@ -551,7 +553,7 @@ def _process_uid(pid: int | None) -> int | None:
         return None
     try:
         result = subprocess.run(
-            ["ps", "-o", "uid=", "-p", str(pid)],
+            [PS_BIN, "-o", "uid=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=2,
@@ -579,7 +581,7 @@ def _process_command(pid: int | None) -> str | None:
         return None
     try:
         result = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(pid)],
+            [PS_BIN, "-o", "command=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=2,

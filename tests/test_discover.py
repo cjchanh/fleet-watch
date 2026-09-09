@@ -6,6 +6,7 @@ import time
 
 from fleet_watch import discover, events, registry
 from fleet_watch import syshealth
+from fleet_watch.constants import PS_BIN
 
 
 def _patch_paths(monkeypatch, tmp_path):
@@ -43,7 +44,7 @@ def test_get_process_commands_prefers_wide_ps_output(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        if cmd == ["ps", "axww", "-o", "pid=", "-o", "args="]:
+        if cmd == [PS_BIN, "axww", "-o", "pid=", "-o", "args="]:
             return Result("123 python -u -c long command adversarial_fleet_test server\n")
         raise AssertionError(f"unexpected fallback invocation: {cmd}")
 
@@ -52,7 +53,7 @@ def test_get_process_commands_prefers_wide_ps_output(monkeypatch):
     commands = discover._get_process_commands()
 
     assert commands == {123: "python -u -c long command adversarial_fleet_test server"}
-    assert calls == [["ps", "axww", "-o", "pid=", "-o", "args="]]
+    assert calls == [[PS_BIN, "axww", "-o", "pid=", "-o", "args="]]
 
 
 def test_sync_reports_skipped_conflict(tmp_path, monkeypatch):
