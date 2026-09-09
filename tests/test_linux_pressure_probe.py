@@ -99,4 +99,4 @@ def test_macos_uses_sysctl_runner(monkeypatch):
 
     monkeypatch.setattr(syshealth, "_run_numeric_probe", run)
     assert syshealth.get_vm_pressure_probe(system="Darwin").value == 2
-    assert calls == [["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]]
+    assert calls == [[syshealth.SYSCTL_BIN, "-n", "kern.memorystatus_vm_pressure_level"]]

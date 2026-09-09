@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from fleet_watch.constants import LSOF_BIN
+
 DEFAULT_STALE_SECONDS = 180
 _EXIT = {"ALLOW": 0, "CONFLICT": 3, "UNKNOWN": 4}
 
@@ -63,7 +65,7 @@ def _pid_cwd(pid: int) -> Optional[str]:
     unresolvable — caller treats unresolvable as 'repo unknown', not 'no repo'."""
     try:
         out = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            [LSOF_BIN, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError):

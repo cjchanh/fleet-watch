@@ -1935,7 +1935,7 @@ def heartbeat_external_resource(
     fields = [f"{column} = ?" for column in columns]
     params.extend([provider, external_id])
     cursor = conn.execute(
-        f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",  # nosec B608 - column names validated against _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS
+        f"UPDATE external_resources SET {', '.join(fields)} WHERE provider = ? AND external_id = ?",  # nosec B608 # column names validated against _EXTERNAL_RESOURCE_UPDATABLE_COLUMNS
         params,
     )
     conn.commit()

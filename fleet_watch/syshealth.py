@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_watch import registry
-from fleet_watch.constants import PS_BIN
+from fleet_watch.constants import PS_BIN, SYSCTL_BIN, VM_STAT_BIN
 
 
 # --- Default patterns (overridable via config.json) ---
@@ -207,7 +207,7 @@ def get_swap_state() -> SwapState:
 def _get_macos_swap_state() -> SwapState | None:
     try:
         out = subprocess.run(
-            ["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=3,
+            [SYSCTL_BIN, "vm.swapusage"], capture_output=True, text=True, timeout=3,
             check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
@@ -369,7 +369,7 @@ def get_memory_state() -> MemoryState:
     page_size = 16384  # default, overridden by vm_stat header
     try:
         out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=3, check=False,
+            [VM_STAT_BIN], capture_output=True, text=True, timeout=3, check=False,
         )
         if out.returncode != 0:
             # vm_stat failed: page stats unknown. Fail-closed — return an
@@ -424,7 +424,7 @@ def get_memory_state() -> MemoryState:
 
 def _get_total_memory_probe() -> ProbeResult:
     """Return the raw hw.memsize probe result in bytes."""
-    return _run_numeric_probe(["sysctl", "-n", "hw.memsize"])
+    return _run_numeric_probe([SYSCTL_BIN, "-n", "hw.memsize"])
 
 
 def _get_total_memory_mb() -> int:
@@ -507,7 +507,7 @@ def get_vm_pressure_probe(
     if system != "Darwin":
         return ProbeResult(None, f"unsupported_platform: {system}")
     return _run_numeric_probe(
-        ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+        [SYSCTL_BIN, "-n", "kern.memorystatus_vm_pressure_level"],
     )
 
 

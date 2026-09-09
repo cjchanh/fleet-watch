@@ -50,7 +50,7 @@ fn normalize_matches_python() {
 
 #[test]
 fn normalize_empty_is_empty() {
-    assert!(normalize_write_scopes(Some("/Users/cj"), &[])
+    assert!(normalize_write_scopes(Some("/Users/demo"), &[])
         .unwrap()
         .is_empty());
     assert!(normalize_write_scopes(None, &[]).unwrap().is_empty());

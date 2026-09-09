@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
-from fleet_watch.constants import PS_BIN
+from fleet_watch.constants import PGREP_BIN, PS_BIN
 
 
 @dataclass
@@ -61,7 +61,7 @@ def _get_ollama_serve_pids() -> list[int]:
     """Return PIDs of all running ollama serve processes."""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "ollama serve"],
+            [PGREP_BIN, "-f", "ollama serve"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -84,7 +84,7 @@ def _get_child_pids(parent_pid: int) -> list[int]:
     """Return direct child PIDs of a given parent."""
     try:
         out = subprocess.run(
-            ["pgrep", "-P", str(parent_pid)],
+            [PGREP_BIN, "-P", str(parent_pid)],
             capture_output=True,
             text=True,
             timeout=5,

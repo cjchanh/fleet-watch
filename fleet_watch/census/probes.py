@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from xml.parsers.expat import ExpatError
 
-from fleet_watch.constants import PS_BIN
+from fleet_watch.constants import LSOF_BIN, PS_BIN, SYSCTL_BIN
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -480,7 +480,7 @@ def _resolve_interpreter_target(
 def resolve_job_target(plist: ParsedPlist) -> tuple[str | None, bool | None, str]:
     """Resolve what a job *actually* runs, seeing through interpreter wrappers.
 
-    ``/bin/bash /Users/cj/bin/watchdog.sh`` reports on ``watchdog.sh``, not on
+    ``/bin/bash /Users/demo/bin/watchdog.sh`` reports on ``watchdog.sh``, not on
     bash — otherwise every broken script hides behind an interpreter that always
     exists. Returns ``(display_target, exists, note)`` where ``exists`` is
     ``None`` for "could not be checked", which is neither healthy nor removable.
@@ -700,7 +700,7 @@ def parse_lsof_fields(stdout: str) -> list[Listener]:
 
 def tcp_listeners(timeout: float = DEFAULT_TIMEOUT) -> tuple[list[Listener], ProbeResult]:
     result = run_probe(
-        ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], timeout=timeout
+        [LSOF_BIN, "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], timeout=timeout
     )
     return (parse_lsof_fields(result.stdout) if result.ok else []), result
 
@@ -886,7 +886,7 @@ def machine_info(timeout: float = 5.0) -> tuple[MachineInfo, list[ProbeResult]]:
 
     cores: int | None = None
     ram_gb: int | None = None
-    result = run_probe(["sysctl", "-n", "hw.ncpu", "hw.memsize"], timeout=timeout)
+    result = run_probe([SYSCTL_BIN, "-n", "hw.ncpu", "hw.memsize"], timeout=timeout)
     probes.append(result)
     if result.ok:
         values = result.stdout.split()

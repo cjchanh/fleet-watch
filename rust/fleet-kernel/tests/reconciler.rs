@@ -153,7 +153,7 @@ const FIXED_TS: &str = "2026-06-13T12:00:00+00:00";
 const OLD_TS: &str = "2026-06-13T11:55:00+00:00";
 /// 60s before FIXED_TS (fresh — < 180s).
 const RECENT_TS: &str = "2026-06-13T11:59:00+00:00";
-const REPO: &str = "/Users/cj/tmp/fleet-watch-test-repo";
+const REPO: &str = "/Users/demo/tmp/fleet-watch-test-repo";
 
 fn insert_lease(
     conn: &Connection,
@@ -197,7 +197,7 @@ fn setup_for_scenario(conn: &Connection, scenario: &str) {
             );
         }
         "c_foreign_live_cooperative_no_overlap" => {
-            let scopes = r#"["/Users/cj/tmp/fleet-watch-test-repo/subdir-a"]"#;
+            let scopes = r#"["/Users/demo/tmp/fleet-watch-test-repo/subdir-a"]"#;
             insert_lease(
                 conn,
                 "sess-foreign",
@@ -208,7 +208,7 @@ fn setup_for_scenario(conn: &Connection, scenario: &str) {
             );
         }
         "d_foreign_live_cooperative_overlap" => {
-            let scopes = r#"["/Users/cj/tmp/fleet-watch-test-repo/src"]"#;
+            let scopes = r#"["/Users/demo/tmp/fleet-watch-test-repo/src"]"#;
             insert_lease(
                 conn,
                 "sess-foreign",
@@ -264,7 +264,7 @@ fn call_args(scenario: &str) -> (Option<String>, Vec<String>, bool) {
         "c_foreign_live_cooperative_no_overlap" => (Some("sess-mine".to_owned()), vec![], false),
         "d_foreign_live_cooperative_overlap" => (
             Some("sess-mine".to_owned()),
-            vec!["/Users/cj/tmp/fleet-watch-test-repo/src".to_owned()],
+            vec!["/Users/demo/tmp/fleet-watch-test-repo/src".to_owned()],
             false,
         ),
         "e_foreign_exclusive" => (Some("sess-mine".to_owned()), vec![], false),

@@ -11,7 +11,7 @@ and validation commands.
 ## Source Bundle
 
 - Source path:
-  `/Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z`
+  `~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z`
 - Baseline commit:
   `b460256967fbd0bfd8e6099673e15e19db1f0b6c`
 - Claim scope:

@@ -38,7 +38,7 @@ Docs that were lying by omission were updated: README lead, Commands, limitation
 Offline (this is what this writer ran):
 
 ```bash
-cd /Users/cj/Workspace/active/fleet-watch
+cd ~/Workspace/active/fleet-watch
 .venv/bin/python -m pytest tests/test_github_sitrep.py tests/test_cli.py::test_sitrep_help_is_wired tests/test_no_external_egress.py tests/test_census.py tests/test_gpu_estimator.py tests/test_events.py tests/test_boot_map.py -q
 ```
 

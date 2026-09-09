@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_watch import events, registry
+from fleet_watch.constants import LSOF_BIN, NETSTAT_BIN, SS_BIN
 
 
 @dataclass
@@ -248,9 +249,9 @@ def os_port_held(port: int) -> bool:
 # `netstat -anv -p tcp` showed every one of them with its PID. lsof last means
 # a partial view is only ever consulted when nothing better answered.
 _LISTENER_SOURCES: tuple[tuple[str, list[str]], ...] = (
-    ("ss", ["ss", "-ltnp"]),
-    ("netstat", ["netstat", "-anv", "-p", "tcp"]),
-    ("lsof", ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"]),
+    ("ss", [SS_BIN, "-ltnp"]),
+    ("netstat", [NETSTAT_BIN, "-anv", "-p", "tcp"]),
+    ("lsof", [LSOF_BIN, "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn"]),
 )
 
 
@@ -579,7 +580,7 @@ def _open_file_holders(path: Path) -> dict[int, str] | None:
     """
     try:
         completed = subprocess.run(
-            ["lsof", "-F", "pfa", "--", str(path)],
+            [LSOF_BIN, "-F", "pfa", "--", str(path)],
             capture_output=True,
             text=True,
             timeout=10,

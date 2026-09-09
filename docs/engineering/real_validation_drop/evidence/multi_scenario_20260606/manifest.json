@@ -3,7 +3,7 @@
   "archive_created_utc": "2026-06-06T23:59:00Z",
   "archive_policy": "manifest_and_readme_only",
   "authorized_scope": {
-    "repo": "/Users/cj/Workspace/active/fleet-watch",
+    "repo": "~/Workspace/active/fleet-watch",
     "destination": "docs/engineering/real_validation_drop/evidence/multi_scenario_20260606/",
     "allowed_files": [
       "README.md",
@@ -18,7 +18,7 @@
     ]
   },
   "source_pack": {
-    "path": "/Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z",
+    "path": "~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z",
     "baseline_commit": "b460256967fbd0bfd8e6099673e15e19db1f0b6c",
     "claim_scope": "multi-scenario single-machine Fleet Watch production telemetry pack",
     "guard_scenario_count": 7,
@@ -217,11 +217,11 @@
   ],
   "validation_commands": [
     {
-      "command": "python3 scripts/validate_real_validation_drop.py /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z --receipt-out /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json",
+      "command": "python3 scripts/validate_real_validation_drop.py ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z --receipt-out ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json",
       "decision": "PASS"
     },
     {
-      "command": "python3 scripts/validate_real_validation_promotion.py --intake-receipt /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json --comparator /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/comparator/comparator_receipt.json --ua /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/ua/uncertainty_receipt.json --receipt-out /Users/cj/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/promotion_readiness_receipt.json",
+      "command": "python3 scripts/validate_real_validation_promotion.py --intake-receipt ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/intake_receipt.json --comparator ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/comparator/comparator_receipt.json --ua ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/ua/uncertainty_receipt.json --receipt-out ~/tmp/fleet-watch-multi-scenario-telemetry-pack-20260606T235049Z/receipts/promotion_readiness_receipt.json",
       "decision": "PASS"
     },
     {
@@ -229,7 +229,7 @@
       "result": "355 passed"
     },
     {
-      "command": "python3 ~/.codex/validators/post_session.py /Users/cj/Workspace/active/fleet-watch",
+      "command": "python3 ~/.codex/validators/post_session.py ~/Workspace/active/fleet-watch",
       "result": "POST_SESSION PASS: fleet-watch clean, grade=A"
     }
   ]

@@ -57,7 +57,7 @@ python3 -m pytest tests/test_session_coupling.py tests/test_cli.py -q
 fleet session check --repo "$PWD"      # 0 ALLOW / 3 CONFLICT / 4 UNKNOWN
 ```
 
-## Wiring it as a pre-write gate (operator-paced, not auto-installed)
+## Wiring it as a pre-write gate (user-paced, not auto-installed)
 A session can gate its own writes by calling `fleet session check --repo <repo>
 --me "$FLEET_SESSION_ID"` and refusing to proceed on exit 3. Installing that as
-a hook is an operator decision, not done here.
+a hook is a user decision, not done here.

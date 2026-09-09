@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import click
+import pytest
 from click.testing import CliRunner
 
 from fleet_watch import cli as cli_module
@@ -64,3 +66,40 @@ def test_guard_negative_gpu_without_json_stays_usage_error() -> None:
     assert proc.returncode == 2
     assert "Usage:" in combined
     assert not proc.stdout.strip().startswith("{")
+
+
+def _assert_click_usage_exit_2(proc: subprocess.CompletedProcess[str]) -> None:
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 2, combined
+    assert "Usage:" in combined
+    assert not proc.stdout.strip().startswith("{"), combined
+
+
+def test_pkill_guard_json_is_not_a_guard_verdict() -> None:
+    _assert_click_usage_exit_2(_guard("pkill", "guard", "--json", "--bogus"))
+
+
+def test_register_name_guard_json_is_not_a_guard_verdict() -> None:
+    _assert_click_usage_exit_2(_guard("register", "--name", "guard", "--json"))
+
+
+def test_status_json_guard_is_not_a_guard_verdict() -> None:
+    _assert_click_usage_exit_2(_guard("status", "--json", "guard"))
+
+
+def test_guard_json_ctx_exit_preserves_code() -> None:
+    """standalone_mode=False must still honor ctx.exit(n) as process exit n."""
+
+    @click.group(cls=cli_module.FleetGroup)
+    def tiny() -> None:
+        pass
+
+    @tiny.command()
+    @click.option("--json", "as_json", is_flag=True)
+    @click.pass_context
+    def guard(ctx: click.Context, as_json: bool) -> None:
+        ctx.exit(7)
+
+    with pytest.raises(SystemExit) as caught:
+        tiny.main(args=["guard", "--json"], prog_name="tiny")
+    assert caught.value.code == 7

@@ -158,7 +158,7 @@ because the probe never ran, and those are different facts.
 
 ```json
 {
-  "prior_receipt": "/Users/cj/.governance/receipts/fleet-census/latest.json",
+  "prior_receipt": "~/.governance/receipts/fleet-census/latest.json",
   "prior_status": "ok",
   "excluded_domains": ["processes"],
   "new_items":     [{"key": "user-launch-agents::com.new.job", "domain": "...", "label": "com.new.job", "verdict": "keep"}],

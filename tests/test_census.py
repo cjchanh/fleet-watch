@@ -173,12 +173,12 @@ def test_parse_lsof_on_empty_output_invents_nothing():
 
 def test_parse_crontab_skips_comments_and_env_assignments():
     entries = probes.parse_crontab(
-        "# a comment\nPATH=/usr/bin\n0 8 * * * /Users/cj/tools/run.sh briefing\n"
-        "@reboot /Users/cj/tools/boot.sh\n"
+        "# a comment\nPATH=/usr/bin\n0 8 * * * /Users/demo/tools/run.sh briefing\n"
+        "@reboot /Users/demo/tools/boot.sh\n"
     )
     assert len(entries) == 2
     assert entries[0].schedule == "0 8 * * *"
-    assert entries[0].command.startswith("/Users/cj/tools/run.sh")
+    assert entries[0].command.startswith("/Users/demo/tools/run.sh")
     assert entries[1].schedule == "@reboot"
 
 
@@ -267,11 +267,11 @@ def test_missing_script_behind_a_present_interpreter_is_reported_missing(tmp_pat
         path=tmp_path / "job.plist",
         label="job",
         target="/bin/bash",
-        program_arguments=("/bin/bash", "/Users/cj/gone/watchdog.sh"),
+        program_arguments=("/bin/bash", "/Users/demo/gone/watchdog.sh"),
     )
     target, exists, note = probes.resolve_job_target(plist)
     assert exists is False
-    assert target == "/Users/cj/gone/watchdog.sh"
+    assert target == "/Users/demo/gone/watchdog.sh"
     assert "script it runs is missing" in note
 
 
@@ -403,7 +403,7 @@ def test_job_with_no_program_reports_undeclared_not_missing(tmp_path):
         ("/Applications/Spotify.app/Contents/MacOS/Spotify", "Spotify.app"),
         (
             "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/"
-            "Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/cj/srv.py",
+            "Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/demo/srv.py",
             "Python srv.py",
         ),
         ("/opt/homebrew/bin/git fsmonitor--daemon run", "git fsmonitor--daemon"),

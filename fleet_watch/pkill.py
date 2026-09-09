@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from fleet_watch.constants import PS_BIN
+from fleet_watch.constants import PGREP_BIN, PS_BIN
 
 
 @dataclass
@@ -78,7 +78,7 @@ def _find_matching_pids(pattern: str) -> list[dict[str, Any]]:
     """Find process PIDs matching a pattern via pgrep -f."""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", pattern],
+            [PGREP_BIN, "-f", pattern],
             capture_output=True,
             text=True,
             timeout=5,
@@ -133,7 +133,7 @@ def _get_children(ppid: int, depth: int = 2) -> list[dict[str, Any]]:
         return []
     try:
         out = subprocess.run(
-            ["pgrep", "-P", str(ppid)],
+            [PGREP_BIN, "-P", str(ppid)],
             capture_output=True,
             text=True,
             timeout=5,

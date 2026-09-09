@@ -33,7 +33,7 @@ python3 scripts/validate_real_validation_drop.py /path/to/real_validation_drop \
 The validator can return `PASS` for structural intake while keeping
 `promotion_gate_closed=false`. Promotion still requires comparator receipts,
 calibrated thresholds, uncertainty analysis, and a separate
-operator-authorized promotion gate.
+user-authorized promotion gate.
 
 Valid `metadata.json` values for `data_source`:
 
@@ -75,4 +75,4 @@ Every observed `response.allowed` value must match `expected_allowed`.
 Intake `PASS` means the drop is structurally valid enough to use as evidence.
 It does not promote Fleet Watch validation. Tier A remains blocked until the
 drop also has comparator receipts, uncertainty-analysis receipts, calibrated
-thresholds, and an operator-authorized promotion gate.
+thresholds, and a user-authorized promotion gate.

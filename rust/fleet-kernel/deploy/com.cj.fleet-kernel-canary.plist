@@ -19,15 +19,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/cj/Workspace/active/fleet-watch/rust/fleet-kernel/scripts/canary_run.py</string>
+    <string>/Users/demo/Workspace/active/fleet-watch/rust/fleet-kernel/scripts/canary_run.py</string>
   </array>
   <key>StartInterval</key>
   <integer>600</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/cj/.governance/receipts/fleet-kernel/canary/launchd.out.log</string>
+  <string>/Users/demo/.governance/receipts/fleet-kernel/canary/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/cj/.governance/receipts/fleet-kernel/canary/launchd.err.log</string>
+  <string>/Users/demo/.governance/receipts/fleet-kernel/canary/launchd.err.log</string>
 </dict>
 </plist>

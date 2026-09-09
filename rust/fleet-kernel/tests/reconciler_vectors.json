@@ -3,7 +3,7 @@
     "scenario": "a_free_repo",
     "description": "repo completely free",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": null
     },
     "alive_map": {},
@@ -24,7 +24,7 @@
     "scenario": "b_owned_by_current_session",
     "description": "current session owns this repo -> same-session bypass",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-current"
     },
     "alive_map": {
@@ -44,7 +44,7 @@
       {
         "session_id": "sess-current",
         "owner_pid": 101,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "cooperative",
         "write_scopes": [],
         "started_at": "2026-06-13T12:00:00+00:00",
@@ -59,7 +59,7 @@
     "scenario": "c_foreign_live_cooperative_no_overlap",
     "description": "foreign live cooperative, no write scopes on request -> advisory allow",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-mine",
       "write_scopes": null
     },
@@ -77,12 +77,12 @@
           "workstream": "session",
           "priority": 3,
           "port": null,
-          "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+          "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
           "gpu_mb": 0,
           "session_id": "sess-foreign",
           "repo_lock_mode": "cooperative",
           "write_scopes": [
-            "/Users/cj/tmp/fleet-watch-test-repo/subdir-a"
+            "/Users/demo/tmp/fleet-watch-test-repo/subdir-a"
           ]
         }
       ],
@@ -95,10 +95,10 @@
       {
         "session_id": "sess-foreign",
         "owner_pid": 201,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "cooperative",
         "write_scopes": [
-          "/Users/cj/tmp/fleet-watch-test-repo/subdir-a"
+          "/Users/demo/tmp/fleet-watch-test-repo/subdir-a"
         ],
         "started_at": "2026-06-13T12:00:00+00:00",
         "last_heartbeat_at": "2026-06-13T12:00:00+00:00",
@@ -112,10 +112,10 @@
     "scenario": "d_foreign_live_cooperative_overlap",
     "description": "foreign live cooperative, write-scope overlaps -> deny",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-mine",
       "write_scopes": [
-        "/Users/cj/tmp/fleet-watch-test-repo/src"
+        "/Users/demo/tmp/fleet-watch-test-repo/src"
       ]
     },
     "alive_map": {
@@ -123,19 +123,19 @@
     },
     "decision": {
       "allowed": false,
-      "reason": "repo /Users/cj/tmp/fleet-watch-test-repo write scope overlaps active session sess-foreign",
+      "reason": "repo /Users/demo/tmp/fleet-watch-test-repo write scope overlaps active session sess-foreign",
       "holder": {
         "pid": 201,
         "name": "session sess-foreign",
         "workstream": "session",
         "priority": 3,
         "port": null,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "gpu_mb": 0,
         "session_id": "sess-foreign",
         "repo_lock_mode": "cooperative",
         "write_scopes": [
-          "/Users/cj/tmp/fleet-watch-test-repo/src"
+          "/Users/demo/tmp/fleet-watch-test-repo/src"
         ]
       },
       "holders": [
@@ -145,17 +145,17 @@
           "workstream": "session",
           "priority": 3,
           "port": null,
-          "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+          "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
           "gpu_mb": 0,
           "session_id": "sess-foreign",
           "repo_lock_mode": "cooperative",
           "write_scopes": [
-            "/Users/cj/tmp/fleet-watch-test-repo/src"
+            "/Users/demo/tmp/fleet-watch-test-repo/src"
           ]
         }
       ],
       "overlap_paths": [
-        "/Users/cj/tmp/fleet-watch-test-repo/src"
+        "/Users/demo/tmp/fleet-watch-test-repo/src"
       ],
       "stale_holders": [],
       "safe_mode": null
@@ -165,10 +165,10 @@
       {
         "session_id": "sess-foreign",
         "owner_pid": 201,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "cooperative",
         "write_scopes": [
-          "/Users/cj/tmp/fleet-watch-test-repo/src"
+          "/Users/demo/tmp/fleet-watch-test-repo/src"
         ],
         "started_at": "2026-06-13T12:00:00+00:00",
         "last_heartbeat_at": "2026-06-13T12:00:00+00:00",
@@ -182,7 +182,7 @@
     "scenario": "e_foreign_exclusive",
     "description": "foreign exclusive session -> deny",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-mine"
     },
     "alive_map": {
@@ -190,14 +190,14 @@
     },
     "decision": {
       "allowed": false,
-      "reason": "repo /Users/cj/tmp/fleet-watch-test-repo locked by exclusive session sess-exclusive",
+      "reason": "repo /Users/demo/tmp/fleet-watch-test-repo locked by exclusive session sess-exclusive",
       "holder": {
         "pid": 201,
         "name": "session sess-exclusive",
         "workstream": "session",
         "priority": 3,
         "port": null,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "gpu_mb": 0,
         "session_id": "sess-exclusive",
         "repo_lock_mode": "exclusive",
@@ -210,7 +210,7 @@
           "workstream": "session",
           "priority": 3,
           "port": null,
-          "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+          "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
           "gpu_mb": 0,
           "session_id": "sess-exclusive",
           "repo_lock_mode": "exclusive",
@@ -226,7 +226,7 @@
       {
         "session_id": "sess-exclusive",
         "owner_pid": 201,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "exclusive",
         "write_scopes": [],
         "started_at": "2026-06-13T12:00:00+00:00",
@@ -241,7 +241,7 @@
     "scenario": "f_dead_stale_lease_gc",
     "description": "foreign dead+stale (>180s) -> GC'd, allow",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-mine"
     },
     "alive_map": {
@@ -260,7 +260,7 @@
           "workstream": "session",
           "priority": 3,
           "port": null,
-          "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+          "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
           "gpu_mb": 0,
           "session_id": "sess-dead-stale",
           "repo_lock_mode": "cooperative",
@@ -276,7 +276,7 @@
         "event_type": "CLEAN",
         "pid": 201,
         "workstream": "session",
-        "detail": "{\"reason\":\"dead_session_owner\",\"repo_dir\":\"/Users/cj/tmp/fleet-watch-test-repo\",\"session_id\":\"sess-dead-stale\"}",
+        "detail": "{\"reason\":\"dead_session_owner\",\"repo_dir\":\"/Users/demo/tmp/fleet-watch-test-repo\",\"session_id\":\"sess-dead-stale\"}",
         "prev_hash": "genesis",
         "hash": "f5400e5563c380d7c81d70936be8035be5797d513390db9844730d2f388d9e1e"
       }
@@ -285,7 +285,7 @@
       {
         "session_id": "sess-dead-stale",
         "owner_pid": 201,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "cooperative",
         "write_scopes": [],
         "started_at": "2026-06-13T11:55:00+00:00",
@@ -300,7 +300,7 @@
     "scenario": "g_dead_recent_lease_held",
     "description": "foreign dead but recent (<180s) -> still held, deny (advisory)",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": "sess-mine"
     },
     "alive_map": {
@@ -317,7 +317,7 @@
           "workstream": "session",
           "priority": 3,
           "port": null,
-          "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+          "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
           "gpu_mb": 0,
           "session_id": "sess-dead-recent",
           "repo_lock_mode": "cooperative",
@@ -333,7 +333,7 @@
       {
         "session_id": "sess-dead-recent",
         "owner_pid": 201,
-        "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+        "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
         "repo_lock_mode": "cooperative",
         "write_scopes": [],
         "started_at": "2026-06-13T11:59:00+00:00",
@@ -348,7 +348,7 @@
     "scenario": "h_process_holder_dead_pid",
     "description": "processes row holds repo, PID dead -> auto-release, allow",
     "call": {
-      "repo_dir": "/Users/cj/tmp/fleet-watch-test-repo",
+      "repo_dir": "/Users/demo/tmp/fleet-watch-test-repo",
       "current_session_id": null
     },
     "alive_map": {
@@ -370,7 +370,7 @@
         "event_type": "CLEAN",
         "pid": 301,
         "workstream": "ws",
-        "detail": "{\"reason\":\"dead_pid\",\"repo_dir\":\"/Users/cj/tmp/fleet-watch-test-repo\"}",
+        "detail": "{\"reason\":\"dead_pid\",\"repo_dir\":\"/Users/demo/tmp/fleet-watch-test-repo\"}",
         "prev_hash": "genesis",
         "hash": "1c3a72dd19af9d1e0e9d9354e31f6d6991296fc6e77e24cf305657f8e8a24647"
       }

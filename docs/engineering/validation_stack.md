@@ -1,9 +1,9 @@
 # Fleet Watch Validation Stack
 
 Status: designed/unverified for Tier A closure.
-Plan anchor: `/Users/cj/tmp/bridge-plan-fleet-watch-validation-20260606-A1/engine_plan.json`
-Standard anchor: `/Users/cj/CDS_VALIDATION_ENGINE_STANDARD.md`
-Target repo: `/Users/cj/Workspace/active/fleet-watch`
+Plan anchor: `~/tmp/bridge-plan-fleet-watch-validation-20260606-A1/engine_plan.json`
+Standard anchor: `~/CDS_VALIDATION_ENGINE_STANDARD.md`
+Target repo: `~/Workspace/active/fleet-watch`
 Target file: `docs/engineering/validation_stack.md`
 
 ## Governing Rule
@@ -28,8 +28,8 @@ Verification language:
 | Gate | State | Evidence | Required next action |
 |---|---|---|---|
 | Target manifest | PASS | Engine plan `ep-8f14aa06c6ccd362`; TargetManifest `tm-f3d196d3ec0b9860` | Keep writes inside `docs/engineering/validation_stack.md` |
-| Work order | PASS | WorkOrder `wo-f6bffd1d7789a3c1`; dispatch disabled by plan | Use a separate operator boundary before dispatch, fanout, promotion, or commit |
-| Repo preflight | PASS | `fleet guard --json --repo /Users/cj/Workspace/active/fleet-watch`; pre-session validator PASS | Preserve unrelated state |
+| Work order | PASS | WorkOrder `wo-f6bffd1d7789a3c1`; dispatch disabled by plan | Use a separate user boundary before dispatch, fanout, promotion, or commit |
+| Repo preflight | PASS | `fleet guard --json --repo ~/Workspace/active/fleet-watch`; pre-session validator PASS | Preserve unrelated state |
 | Real validation gate | BLOCKED | No approved production telemetry drop is promoted by this file | Create and validate a real telemetry drop |
 | Promotion | BLOCKED | No Tier A receipt, comparator receipt, or uncertainty-analysis receipt exists for this lane | Promote only after real telemetry plus receipts pass |
 
@@ -111,7 +111,7 @@ Required evidence:
 - Post-calibration thresholds for swap pressure, memory pressure, stale leases,
   runaway detection, and GPU working set estimates.
 - Uncertainty analysis documenting missing telemetry, stale state, sampling
-  gaps, false positives, false negatives, and operator override cases.
+  gaps, false positives, false negatives, and user override cases.
 
 Fail-closed rule: README examples, synthetic tests, and public scheduler
 analogs can exercise mechanics but cannot close the production telemetry gate.
@@ -222,7 +222,7 @@ true:
 6. Dispatch, capability map, commercial readiness, and corpus sitrep are
    updated with the same receipt IDs.
 
-Promotion remains forbidden without a separate operator authorization.
+Promotion remains forbidden without a separate user authorization.
 
 ## Canonical Query Gate
 
@@ -248,7 +248,7 @@ The bridge plan for this lane is dry-run by default:
 - `commit_allowed`: `false`
 - `promotion_allowed`: `false`
 
-Forbidden without a separate operator boundary:
+Forbidden without a separate user boundary:
 
 - dispatch
 - fanout or worker spawn

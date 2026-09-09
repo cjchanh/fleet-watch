@@ -60,9 +60,9 @@ PROCESS_TABLE: dict[int, dict[str, object]] = {
     TERMINAL_PID: {"ppid": LAUNCHD_PID, "command": "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"},
     OWNER_SHELL_PID: {"ppid": TERMINAL_PID, "command": "-zsh"},
     SIBLING_SHELL_PID: {"ppid": TERMINAL_PID, "command": "-zsh"},
-    OWNER_PID: {"ppid": OWNER_SHELL_PID, "command": "/Users/cj/.local/bin/claude --effort max"},
+    OWNER_PID: {"ppid": OWNER_SHELL_PID, "command": "/Users/demo/.local/bin/claude --effort max"},
     AGENT_CHILD_BASH_PID: {"ppid": OWNER_PID, "command": "/bin/bash -c fleet session close"},
-    AGENT_TOOL_PID: {"ppid": AGENT_CHILD_BASH_PID, "command": "/Users/cj/bin/fleet session close"},
+    AGENT_TOOL_PID: {"ppid": AGENT_CHILD_BASH_PID, "command": "/Users/demo/bin/fleet session close"},
 }
 
 
@@ -148,7 +148,7 @@ def test_agent_may_not_close_a_foreign_lease(machine):
     """The rule that must not soften: one agent cannot revoke another's lease."""
     conn = _conn()
     # A second, unrelated agent session owned by the operator's own uid.
-    machine["table"][50000] = {"ppid": SIBLING_SHELL_PID, "command": "/Users/cj/.local/bin/claude --effort max"}
+    machine["table"][50000] = {"ppid": SIBLING_SHELL_PID, "command": "/Users/demo/.local/bin/claude --effort max"}
     machine["uids"][50000] = OPERATOR_UID
     _open_lease(conn, "sess-peer", 50000)
 
@@ -164,17 +164,17 @@ def test_agent_may_not_close_a_foreign_lease(machine):
 @pytest.mark.parametrize(
     "command",
     [
-        "/Users/cj/.local/bin/claude --effort max",   # depth 1: the runtime itself
+        "/Users/demo/.local/bin/claude --effort max",   # depth 1: the runtime itself
         "/opt/homebrew/bin/codex exec",
         "/usr/local/bin/opencode run",
-        "/Users/cj/bin/grok chat",
-        "python3 /Users/cj/.claude/hooks/fleet_guard_hook.py",  # runtime dir in the path
+        "/Users/demo/bin/grok chat",
+        "python3 /Users/demo/.claude/hooks/fleet_guard_hook.py",  # runtime dir in the path
     ],
 )
 def test_every_roster_runtime_in_the_ancestry_declines_the_arm(machine, command):
     conn = _conn()
     machine["table"][60000] = {"ppid": SIBLING_SHELL_PID, "command": command}
-    machine["table"][60001] = {"ppid": 60000, "command": "/Users/cj/bin/fleet session close"}
+    machine["table"][60001] = {"ppid": 60000, "command": "/Users/demo/bin/fleet session close"}
     machine["uids"][60000] = OPERATOR_UID
     machine["uids"][60001] = OPERATOR_UID
     _open_lease(conn, "sess-owner", OWNER_PID)
@@ -190,10 +190,10 @@ def test_agent_ancestry_is_found_at_depth(machine):
     conn = _conn()
     machine["table"][70000] = {"ppid": AGENT_TOOL_PID, "command": "/bin/sh -c x"}
     machine["table"][70001] = {"ppid": 70000, "command": "/usr/bin/env python3"}
-    machine["table"][70002] = {"ppid": 70001, "command": "/Users/cj/bin/fleet session close"}
+    machine["table"][70002] = {"ppid": 70001, "command": "/Users/demo/bin/fleet session close"}
     for pid in (70000, 70001, 70002):
         machine["uids"][pid] = OPERATOR_UID
-    machine["table"][50001] = {"ppid": SIBLING_SHELL_PID, "command": "/Users/cj/.local/bin/claude --effort max"}
+    machine["table"][50001] = {"ppid": SIBLING_SHELL_PID, "command": "/Users/demo/.local/bin/claude --effort max"}
     machine["uids"][50001] = OPERATOR_UID
     _open_lease(conn, "sess-peer", 50001)
 
@@ -313,7 +313,7 @@ def test_a_new_roster_entry_is_honoured_by_the_arm(machine, monkeypatch):
         lambda: [{"name": "Vendor", "kind": "vendor", "process_match": r"/vendorbot\b", "binary": "vendorbot"}],
     )
     machine["table"][90000] = {"ppid": SIBLING_SHELL_PID, "command": "/opt/vendorbot --serve"}
-    machine["table"][90001] = {"ppid": 90000, "command": "/Users/cj/bin/fleet"}
+    machine["table"][90001] = {"ppid": 90000, "command": "/Users/demo/bin/fleet"}
     machine["uids"][90000] = OPERATOR_UID
     machine["uids"][90001] = OPERATOR_UID
 

@@ -31,7 +31,7 @@ OLD_TS    = (FIXED_DT - timedelta(seconds=300)).isoformat(timespec="seconds")
 RECENT_TS = (FIXED_DT - timedelta(seconds=60)).isoformat(timespec="seconds")
 
 # Must resolve to itself (no /tmp symlink on macOS).
-REPO = "/Users/cj/tmp/fleet-watch-test-repo"
+REPO = "/Users/demo/tmp/fleet-watch-test-repo"
 # Verify at import time.
 assert str(Path(REPO).expanduser()) == REPO, f"REPO must be absolute and non-symlinked: {REPO}"
 # The referee resolves repo_dir with Path.resolve(); since the dir doesn't exist,

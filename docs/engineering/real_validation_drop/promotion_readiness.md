@@ -31,11 +31,11 @@ Default thresholds:
 
 The validator may emit `tier_a_promotion_ready=true`, but it always emits
 `promotion_applied=false`. Applying promotion remains a separate
-operator-authorized gate.
+user-authorized gate.
 
-## Receipt Semantics
+## Record Semantics
 
-`PASS` means the package is ready for an operator to consider a separate
+`PASS` means the package is ready for a user to consider a separate
 promotion action. It does not update capability maps, dispatch logs, commercial
 readiness, or corpus state.
 

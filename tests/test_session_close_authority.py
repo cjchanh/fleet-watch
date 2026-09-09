@@ -106,7 +106,7 @@ def _install_fake_process_table(
     def process_command(pid):
         if pid not in tree:
             return None
-        return commands.get(pid, "/Users/cj/.local/bin/claude --effort max")
+        return commands.get(pid, "/Users/demo/.local/bin/claude --effort max")
 
     monkeypatch.setattr(registry, "_pid_exists", pid_exists)
     monkeypatch.setattr(registry, "_pid_create_time", create_time)
@@ -389,7 +389,7 @@ def test_twin_path_matches_single_writer_guard_derivation(tmp_path):
     """The filename is derived, never guessed: `<pid>-<sha256(repo)[:12]>.json`."""
     import hashlib
 
-    repo = "/Users/cj/Workspace/active/fleet-watch"
+    repo = "/Users/demo/Workspace/active/fleet-watch"
     digest = hashlib.sha256(repo.encode("utf-8")).hexdigest()[:12]
     assert (
         claude_lease_twin.twin_lease_path(repo, 21455, state_dir=tmp_path).name
