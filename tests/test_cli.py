@@ -13,6 +13,14 @@ from click.testing import CliRunner
 from fleet_watch import cli as cli_module
 from fleet_watch import registry
 from fleet_watch import syshealth
+from fleet_watch import cli_support
+
+import importlib
+
+
+def _command_module(name: str):
+    """Return commands.<name> the module, not the shadowed Click object."""
+    return importlib.import_module(f"fleet_watch.commands.{name}")
 
 
 def _patch_paths(monkeypatch, tmp_path):
@@ -547,7 +555,7 @@ def test_share_repo_closes_documents_session_lease_and_logs_event(tmp_path, monk
     docs_root = tmp_path / "Documents"
     repo = docs_root / "Substack"
     repo.mkdir(parents=True)
-    monkeypatch.setattr(cli_module, "_documents_root", lambda: docs_root.resolve())
+    monkeypatch.setattr(cli_support, "_documents_root", lambda: docs_root.resolve())
 
     conn = registry.connect()
     registry.upsert_session_lease(
@@ -585,7 +593,7 @@ def test_share_repo_rejects_non_documents_paths(tmp_path, monkeypatch):
     docs_root = tmp_path / "Documents"
     repo = tmp_path / "Workspace" / "active" / "engineering"
     repo.mkdir(parents=True)
-    monkeypatch.setattr(cli_module, "_documents_root", lambda: docs_root.resolve())
+    monkeypatch.setattr(cli_support, "_documents_root", lambda: docs_root.resolve())
 
     conn = registry.connect()
     registry.upsert_session_lease(
@@ -999,7 +1007,7 @@ def test_reap_sessions_confirm_kills_member_pids(tmp_path, monkeypatch):
         terminated_pids.append(pid)
         return True
 
-    monkeypatch.setattr(cli_module, "_terminate_orphan", fake_terminate)
+    monkeypatch.setattr(_command_module("reap"), "_terminate_orphan", fake_terminate)
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["reap-sessions", "--confirm", "--json"])
@@ -1216,7 +1224,7 @@ def test_census_writes_a_valid_receipt_and_reports_its_path(tmp_path, monkeypatc
     monkeypatch.setattr(
         census_mod, "collect_snapshot", lambda *a, **k: _census_snapshot()
     )
-    monkeypatch.setattr(cli_module, "_census_registry_rows", lambda: [])
+    monkeypatch.setattr(_command_module("census"), "_census_registry_rows", lambda: [])
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1241,7 +1249,7 @@ def test_census_refuses_and_exits_nonzero_when_every_probe_returns_nothing(
         machine=census_probes.MachineInfo(host="testhost", os="Darwin 25.5.0")
     )
     monkeypatch.setattr(census_mod, "collect_snapshot", lambda *a, **k: empty)
-    monkeypatch.setattr(cli_module, "_census_registry_rows", lambda: [])
+    monkeypatch.setattr(_command_module("census"), "_census_registry_rows", lambda: [])
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["census", "--receipt-dir", str(tmp_path)])
@@ -1252,7 +1260,7 @@ def test_census_refuses_and_exits_nonzero_when_every_probe_returns_nothing(
 
 
 def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
-    monkeypatch.setattr(cli_module, "_executable_supports_census", lambda _e: True)
+    monkeypatch.setattr(_command_module("census"), "_executable_supports_census", lambda _e: True)
     called = []
     monkeypatch.setattr(
         cli_module.subprocess, "run", lambda *a, **k: called.append(a) or None
@@ -1276,7 +1284,7 @@ def test_sitrep_help_is_wired():
 
 def test_census_emit_launchd_plist_warns_when_installed_fleet_lacks_census(monkeypatch):
     """A job pointing at an older `fleet` would fail silently every morning."""
-    monkeypatch.setattr(cli_module, "_executable_supports_census", lambda _e: False)
+    monkeypatch.setattr(_command_module("census"), "_executable_supports_census", lambda _e: False)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1429,7 +1437,7 @@ def test_run_bounded_degrades_on_exception_without_propagating():
 
 def test_status_json_degrades_when_ollama_scan_hangs(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli_module, "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(_command_module("status"), "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
 
     def _hang():
         time.sleep(5)
@@ -1453,7 +1461,7 @@ def test_status_json_degrades_when_ollama_scan_hangs(tmp_path, monkeypatch):
 
 def test_status_json_degrades_when_orphan_probe_hangs(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli_module, "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(_command_module("status"), "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
 
     def _hang():
         time.sleep(5)

@@ -135,47 +135,11 @@ def cli():
 register_all(cli)
 
 
-def _bind_cli_monkeypatch_surface() -> None:
-    """Command modules imported helpers by name; tests patch ``fleet_watch.cli``.
-
-    LOAD_GLOBAL in a command callback uses that module's dict. Replace each
-    imported helper with a lookup into this module so monkeypatch.setattr on
-    ``cli_module._load_tnr_instances`` (etc.) still reaches the running command.
-    """
-    cli_globals = globals()
-    helper_names = [
-        name
-        for name, value in vars(_cli_support).items()
-        if not name.startswith("__") and callable(value) and not isinstance(value, type)
-    ]
-    for modname in (
-        "fleet_watch.cli_support",
-        "fleet_watch.commands.census",
-        "fleet_watch.commands.discover",
-        "fleet_watch.commands.guard",
-        "fleet_watch.commands.launchd",
-        "fleet_watch.commands.pkill",
-        "fleet_watch.commands.reap",
-        "fleet_watch.commands.runaway",
-        "fleet_watch.commands.session",
-        "fleet_watch.commands.sitrep",
-        "fleet_watch.commands.status",
-        "fleet_watch.commands.thunder",
-    ):
-        mod = sys.modules[modname]
-        for name in helper_names:
-            if name not in mod.__dict__:
-                continue
-
-            def _lookup(*args, _name=name, **kwargs):
-                return cli_globals[_name](*args, **kwargs)
-
-            _lookup.__name__ = name
-            _lookup.__qualname__ = name
-            mod.__dict__[name] = _lookup
-
-
-_bind_cli_monkeypatch_surface()
+# Helpers live in cli_support; command modules import them by name.
+# Tests that need to intercept a command-path helper patch the command
+# module (importlib.import_module("fleet_watch.commands.<group>"), not the
+# shadowed Click object on fleet_watch.commands) or cli_support. Direct
+# helper calls on this module still work via the re-export loop above.
 
 
 def main():

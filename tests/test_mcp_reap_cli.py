@@ -12,6 +12,13 @@ from click.testing import CliRunner
 from fleet_watch import cli
 from fleet_watch.discovery.mcp_orphan_detector import MCPOrphanResult
 
+import importlib
+
+
+def _command_module(name: str):
+    """Return commands.<name> the module, not the shadowed Click object."""
+    return importlib.import_module(f"fleet_watch.commands.{name}")
+
 
 class FakeConn:
     def close(self):
@@ -19,7 +26,7 @@ class FakeConn:
 
 
 def _setup(monkeypatch, mcp_pids):
-    monkeypatch.setattr(cli, "_get_conn", lambda: FakeConn())
+    monkeypatch.setattr(_command_module("reap"), "_get_conn", lambda: FakeConn())
     monkeypatch.setattr(cli.registry, "get_reapable_processes", lambda conn: [])
     monkeypatch.setattr(cli.registry, "_pid_exists", lambda pid: False)
     monkeypatch.setattr(
@@ -31,7 +38,7 @@ def _setup(monkeypatch, mcp_pids):
         ),
     )
     calls: list[int] = []
-    monkeypatch.setattr(cli, "_terminate_orphan", lambda pid, **k: (calls.append(pid), True)[1])
+    monkeypatch.setattr(_command_module("reap"), "_terminate_orphan", lambda pid, **k: (calls.append(pid), True)[1])
     monkeypatch.setattr(cli.events, "log_event", lambda *a, **k: None)
     monkeypatch.setattr(cli.reporter, "write_report", lambda conn: None)
     return calls

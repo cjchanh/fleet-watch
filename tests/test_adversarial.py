@@ -15,6 +15,13 @@ from click.testing import CliRunner
 from fleet_watch import cli as cli_module
 from fleet_watch import events, registry
 
+import importlib
+
+
+def _command_module(name: str):
+    """Return commands.<name> the module, not the shadowed Click object."""
+    return importlib.import_module(f"fleet_watch.commands.{name}")
+
 
 LISTENER_CODE = """
 import signal
@@ -449,7 +456,7 @@ def test_thunder_sync_and_claim_surface(tmp_path, monkeypatch):
         }
     ]
 
-    monkeypatch.setattr(cli_module, "_load_tnr_instances", lambda: payload)
+    monkeypatch.setattr(_command_module("thunder"), "_load_tnr_instances", lambda: payload)
     monkeypatch.setattr(cli_module.syshealth, "get_memory_state", lambda: cli_module.syshealth.MemoryState(0, 0, 0, 0, 0, 0))
 
     sync_result = runner.invoke(cli_module.cli, ["thunder", "sync"])
@@ -492,7 +499,7 @@ def test_guard_fails_closed_when_db_unreachable(tmp_path, monkeypatch):
     def _boom():
         raise RuntimeError("simulated DB locked / unreachable")
 
-    monkeypatch.setattr(cli_module, "_get_conn", _boom)
+    monkeypatch.setattr(_command_module("guard"), "_get_conn", _boom)
     runner = CliRunner()
 
     result = runner.invoke(cli_module.cli, ["guard", "--port", "8100", "--json"])

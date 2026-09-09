@@ -9,6 +9,13 @@ from click.testing import CliRunner
 from fleet_watch import cli as cli_module
 from fleet_watch import events, registry, runaway, syshealth
 
+import importlib
+
+
+def _command_module(name: str):
+    """Return commands.<name> the module, not the shadowed Click object."""
+    return importlib.import_module(f"fleet_watch.commands.{name}")
+
 
 def _patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
@@ -477,7 +484,7 @@ class TestDaemonRunawayLogging:
             observed.append(auto_kill)
             raise SystemExit(0)
 
-        monkeypatch.setattr(cli_module, "_run_runaway_tick", record_option)
+        monkeypatch.setattr(_command_module("discover"), "_run_runaway_tick", record_option)
 
         result = CliRunner().invoke(cli_module.cli, ["watch", *extra_args])
 

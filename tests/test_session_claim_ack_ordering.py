@@ -25,6 +25,13 @@ from click.testing import CliRunner
 from fleet_watch import cli as cli_module
 from fleet_watch import events, referee, registry, reporter
 
+import importlib
+
+
+def _command_module(name: str):
+    """Return commands.<name> the module, not the shadowed Click object."""
+    return importlib.import_module(f"fleet_watch.commands.{name}")
+
 
 @pytest.fixture()
 def isolated(tmp_path, monkeypatch):
@@ -69,7 +76,7 @@ def test_ack_lands_after_the_commit_and_before_the_report(isolated, monkeypatch)
 
     monkeypatch.setattr(registry, "upsert_session_lease", traced_upsert)
     monkeypatch.setattr(events, "log_event", traced_log)
-    monkeypatch.setattr(cli_module, "_ack", traced_ack)
+    monkeypatch.setattr(_command_module("session"), "_ack", traced_ack)
     monkeypatch.setattr(reporter, "write_report", traced_report)
 
     result = CliRunner().invoke(
@@ -99,7 +106,7 @@ def test_heartbeat_and_ensure_use_the_same_ordering(isolated, monkeypatch):
         order.append("report")
         return (isolated / "STATE_REPORT.md", isolated / "state.json")
 
-    monkeypatch.setattr(cli_module, "_ack", traced_ack)
+    monkeypatch.setattr(_command_module("session"), "_ack", traced_ack)
     monkeypatch.setattr(reporter, "write_report", traced_report)
     # Coalescing is exercised separately; this test is about ORDER, so every
     # command must actually reach its report step.
@@ -385,7 +392,7 @@ def test_close_acks_before_its_report(isolated, monkeypatch):
         order.append("ack")
         real_ack(message)
 
-    monkeypatch.setattr(cli_module, "_ack", traced_ack)
+    monkeypatch.setattr(_command_module("session"), "_ack", traced_ack)
     monkeypatch.setattr(reporter, "write_report",
                         lambda conn, output_dir=None: order.append("report") or
                         (isolated / "a", isolated / "b"))

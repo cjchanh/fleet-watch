@@ -1,66 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
-import sqlite3
-import subprocess
 import sys
-import time
-from pathlib import Path
-from typing import Any
 
 import click
 
-from fleet_watch import autonomous as autonomous_mod
-from fleet_watch import boot_map as boot_map_mod
-from fleet_watch import census as census_mod
-from fleet_watch import claude_lease_twin
 from fleet_watch import counters, discover as discover_mod
-from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
+from fleet_watch import events, registry, reporter, syshealth
 from fleet_watch.cli_support import (
-    DEFAULT_REPORT_BUDGET_S,
-    REPORT_ATTEMPT_MARKER,
-    REPORT_BUDGET_ENV,
-    REPORT_MIN_INTERVAL_ENV,
     STATUS_DISCOVERY_TIMEOUT_SECONDS,
-    _ack,
-    _build_guard_payload,
     _build_reconcile_payload,
-    _census_registry_rows,
-    _cooperative_alternative,
-    _default_owner_pid,
-    _documents_root,
-    _executable_supports_census,
-    _extract_json_document,
-    _float_env,
     _get_conn,
-    _holder_conflict_text,
-    _holder_text,
-    _is_documents_path,
-    _is_fleet_owned,
-    _load_tnr_instances,
-    _mark_report_attempt,
-    _mcp_reap_candidates,
-    _mcp_surface_lines,
     _notify_attention,
-    _notify_conflict,
-    _publish_report_after_ack,
-    _reject_negative_gpu,
-    _render_census,
-    _render_guard,
-    _render_launchd_plist,
-    _report_budget_seconds,
-    _report_is_fresh,
-    _report_min_interval_seconds,
-    _repo_unblock_command,
-    _resolved_session_id,
     _run_bounded,
-    _run_runaway_tick,
-    _terminate_orphan,
 )
-from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
-from fleet_watch.guards import memory_pressure
+from fleet_watch.discovery import ollama_runners, orphan_detector
 
 @click.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
@@ -76,9 +30,7 @@ def status(as_json: bool):
     # H1: discover ollama runners. Bounded (see _run_bounded docstring) --
     # a slow/loaded box or several stacked runners must degrade to an empty
     # scan, never hang the command past STATUS_DISCOVERY_TIMEOUT_SECONDS.
-    discovery_timeout = float(
-        getattr(sys.modules.get("fleet_watch.cli"), "STATUS_DISCOVERY_TIMEOUT_SECONDS", STATUS_DISCOVERY_TIMEOUT_SECONDS)
-    )
+    discovery_timeout = float(STATUS_DISCOVERY_TIMEOUT_SECONDS)
     runner_reports, ollama_scan_timed_out = _run_bounded(
         ollama_runners.discover_ollama_runners,
         timeout_seconds=discovery_timeout,
