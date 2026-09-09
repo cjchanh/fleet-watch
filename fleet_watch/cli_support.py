@@ -1161,6 +1161,3 @@ def _render_census(
         lines.append(f"  Latest:  {result.latest_path}")
     return lines
 
-
-if __name__ == "__main__":
-    main()
