@@ -340,7 +340,7 @@ next heartbeat revives it. EXCLUSIVE leases do not lapse.
 
 One question: **what boots on this machine, and where does it go?**
 
-`fleet boot-map` turns a `fleet-census/v1` receipt into a node/link graph and one
+`fleet boot-map` turns a `fleet-census/v1` record into a node/link graph and one
 self-contained HTML page you rotate, zoom, and click through locally.
 
 ```bash
@@ -361,7 +361,7 @@ verdict of what reaches them (a repo reads red when something red lives in it),
 and say so in the detail panel. A red ring means a port bound to all interfaces.
 
 **Outputs** (`graph.json`, `index.html`, `receipt.json`) are regenerable, so they
-live outside the repo. Same receipt in, byte-identical graph and page out — no
+live outside the repo. Same record in, byte-identical graph and page out — no
 wall-clock, no randomness, no layout drift.
 
 **Local and sovereign.** Zero network at build time and at view time: no CDN, no
@@ -369,7 +369,7 @@ fonts, no images, no XHR, no libraries. The page ships a
 `default-src 'none'; connect-src 'none'` CSP, and the test suite asserts the
 artifact contains no `http(s)://` literal at all.
 
-**Fail-closed.** Exit `3` and a `REFUSAL:` line when the receipt is absent,
+**Fail-closed.** Exit `3` and a `REFUSAL:` line when the input file is absent,
 unreadable, unparseable, structurally invalid, or degenerate. There is no
 bundled-fixture fallback: rendering a stand-in as if it were this machine is a
 fake-green, which is worse than no map. Zero domains or zero items is a refusal,
