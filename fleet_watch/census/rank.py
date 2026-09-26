@@ -6,6 +6,13 @@ actually move RAM, CPU, or failure — not flat alphabetical noise.
 
 Pure functions, no I/O, no network. Score is derived only from fields already
 on the item (``resource``, ``reason``, ``evidence``, ``status``, ``rule``).
+
+Known limitation of the sprawl signal: ``proc_count`` alone cannot separate a
+legitimate helper-process application (an Electron app's renderers) from N
+copies of a singleton that should have been one process. It is therefore
+advisory metadata naming a suspicion, not a determination — which is why it
+never gates and never re-orders. Distinguishing the two needs parent-PID or
+bundle-identity data the census does not yet collect.
 """
 
 from __future__ import annotations
@@ -14,6 +21,20 @@ import re
 from typing import Any
 
 DEFAULT_TOP_N = 10
+
+#: A single label holding more than this many processes is flagged as sprawl.
+#:
+#: Anchored on the live census distribution, not on a round number. Across the
+#: ten daily receipts the investigate process clusters are sharply bimodal: a
+#: normal band of single-digit-to-teens fan-out (1-19; helper processes, worker
+#: pools, ordinary Electron apps) and an anomalous band starting at 32 and
+#: running past 100 (duplicated MCP servers, fanned-out browser instances).
+#: The empty 20-31 gap is where this default sits, so it stays clear of both.
+#:
+#: Advisory metadata only. It annotates an item census already surfaced as
+#: ``investigate``; it never promotes, demotes, or gates. See the module
+#: docstring caveat on what proc_count alone can and cannot distinguish.
+SPRAWL_THRESHOLD_DEFAULT = 20
 
 # status → base attention weight (failing jobs outrank quiet dead plists)
 _STATUS_WEIGHT: dict[str, float] = {
@@ -66,8 +87,21 @@ def parse_cost_signals(item: dict[str, Any]) -> dict[str, float | int | None]:
     return {"rss_mb": rss_mb, "cpu_pct": cpu_pct, "proc_count": proc_count}
 
 
-def score_investigate(item: dict[str, Any]) -> tuple[float, list[str]]:
-    """Return (score, cost_drivers). Higher score = look first."""
+def score_investigate(
+    item: dict[str, Any],
+    *,
+    sprawl_threshold: int = SPRAWL_THRESHOLD_DEFAULT,
+) -> tuple[float, list[str]]:
+    """Return (score, cost_drivers). Higher score = look first.
+
+    ``sprawl_threshold`` is the proc_count above which a single label is
+    annotated as possible duplicate-instance sprawl. Pass ``<= 0`` to disable
+    the signal entirely. The annotation is deliberately score-neutral: it adds
+    no weight and changes no ordering, because "this looks like N copies of a
+    singleton" is a *kind* of cost already reflected in the rss/cpu/proc
+    numbers, and re-ordering the operator's top-N on a low-precision signal
+    would be a worse trade than naming it.
+    """
     drivers: list[str] = []
     signals = parse_cost_signals(item)
     rss_mb = signals["rss_mb"]
@@ -87,6 +121,19 @@ def score_investigate(item: dict[str, Any]) -> tuple[float, list[str]]:
         # Large fan-out without parsed RSS still matters (MCP clusters etc.).
         score += float(proc_count) * 5.0
         drivers.append(f"procs={proc_count}")
+
+    # Sprawl: this one label holds more processes than a normal instance ever
+    # should. Emitted as an ADDITIONAL cost_driver next to whatever else
+    # applied — it is a signal, not a fifth verdict, so the four-verdict
+    # contract is untouched. Both the observed count and the threshold that
+    # was crossed are named, so the flag is self-explaining downstream.
+    if (
+        isinstance(proc_count, int)
+        and sprawl_threshold > 0
+        and proc_count > sprawl_threshold
+    ):
+        drivers.append("sprawl")
+        drivers.append(f"sprawl-threshold={sprawl_threshold}")
 
     status = item.get("status") if isinstance(item.get("status"), str) else ""
     weight = _STATUS_WEIGHT.get(status, 100.0)
@@ -121,6 +168,7 @@ def rank_investigate(
     domains: list[dict[str, Any]],
     *,
     top_n: int = DEFAULT_TOP_N,
+    sprawl_threshold: int = SPRAWL_THRESHOLD_DEFAULT,
 ) -> list[dict[str, Any]]:
     """Flatten investigate items across domains and return the top-N by score.
 
@@ -146,7 +194,7 @@ def rank_investigate(
             if item.get("verdict") != "investigate":
                 continue
             label = item.get("label") if isinstance(item.get("label"), str) else "?"
-            score, drivers = score_investigate(item)
+            score, drivers = score_investigate(item, sprawl_threshold=sprawl_threshold)
             signals = parse_cost_signals(item)
             rss = signals["rss_mb"] if isinstance(signals["rss_mb"], int) else 0
             cpu = signals["cpu_pct"] if isinstance(signals["cpu_pct"], (int, float)) else 0.0

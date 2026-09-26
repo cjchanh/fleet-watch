@@ -1123,3 +1123,134 @@ def test_format_rank_line_includes_cost():
     assert line.startswith("#1 git fsmonitor--daemon")
     assert "1482 MB" in line
     assert "171 procs" in line
+
+
+# --------------------------------------------------------------------------
+# sprawl detection (spec 2621012) — a cluster that looks like N copies of a
+# singleton is a distinct signal from "this thing uses RAM". It rides the
+# existing cost_drivers list; it never becomes a fifth verdict.
+# --------------------------------------------------------------------------
+
+
+def _sprawl_item(proc_count: int, **overrides) -> dict:
+    """An investigate process-cluster item on the existing item-dict seam."""
+    item = {
+        "label": "Python mcp_lexicon_engine_server.py",
+        "verdict": "investigate",
+        "status": "running",
+        "resource": f"{proc_count} procs / 3263 MB RSS / 0.4% CPU",
+        "reason": "cluster holds 3263 MB",
+        "rule": "process/large-cluster-rss",
+    }
+    item.update(overrides)
+    return item
+
+
+def test_sprawl_default_threshold_sits_above_the_normal_single_digit_band():
+    from fleet_watch.census import rank
+
+    # AC1: the default must be explicit and anchored above the observed
+    # normal band, never an implicit magic number buried in a comparison.
+    assert isinstance(rank.SPRAWL_THRESHOLD_DEFAULT, int)
+    assert rank.SPRAWL_THRESHOLD_DEFAULT >= 10
+
+
+def test_sprawl_not_flagged_below_threshold():
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(rank.SPRAWL_THRESHOLD_DEFAULT - 1)
+    _score, drivers = rank.score_investigate(item)
+    assert not any(d.startswith("sprawl") for d in drivers)
+    # the pre-existing large-cluster tag is untouched by the new signal
+    assert "large-cluster" in drivers
+
+
+def test_sprawl_not_flagged_exactly_at_threshold():
+    """AC1 says 'exceeds', so the boundary value itself must stay silent."""
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(rank.SPRAWL_THRESHOLD_DEFAULT)
+    _score, drivers = rank.score_investigate(item)
+    assert not any(d.startswith("sprawl") for d in drivers)
+
+
+def test_sprawl_flagged_above_threshold_with_both_values_explainable():
+    """AC1 + AC2: flag fires above threshold; AC2: WHY is visible."""
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(82)
+    _score, drivers = rank.score_investigate(item)
+    assert "sprawl" in drivers
+    # AC2: the exact threshold AND the cluster's proc_count are both present,
+    # so a human or downstream automation sees why it fired, not just that it did.
+    assert f"sprawl-threshold={rank.SPRAWL_THRESHOLD_DEFAULT}" in drivers
+    assert "procs=82" in drivers
+
+
+def test_sprawl_threshold_is_configurable_and_defaults_are_preserved():
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(8)
+    # at the default the same 8-proc cluster is not sprawl...
+    _score, default_drivers = rank.score_investigate(item)
+    assert "sprawl" not in default_drivers
+    # ...but an explicit lower threshold makes it so, without touching the default.
+    _score, tuned = rank.score_investigate(item, sprawl_threshold=5)
+    assert "sprawl" in tuned
+    assert "sprawl-threshold=5" in tuned
+    assert rank.SPRAWL_THRESHOLD_DEFAULT == 20
+
+
+def test_sprawl_disabled_when_threshold_not_positive():
+    """A 0/negative threshold would otherwise flag every cluster ever parsed."""
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(999)
+    for disabled in (0, -1):
+        _score, drivers = rank.score_investigate(item, sprawl_threshold=disabled)
+        assert not any(d.startswith("sprawl") for d in drivers)
+
+
+def test_sprawl_requires_a_parsed_proc_count():
+    """No proc_count means no sprawl claim — never infer one from RSS alone."""
+    from fleet_watch.census import rank
+
+    item = _sprawl_item(1, resource="system daemon", reason="no fan-out")
+    _score, drivers = rank.score_investigate(item)
+    assert not any(d.startswith("sprawl") for d in drivers)
+
+
+def test_sprawl_appears_in_ranked_receipt_entry_alongside_large_cluster():
+    """End-to-end through rank_investigate: the emitted receipt row carries it."""
+    from fleet_watch.census import rank
+
+    domains = [
+        {
+            "domain_id": "processes",
+            "domain": "live processes",
+            "items": [
+                _sprawl_item(82),
+                _sprawl_item(3, label="small.helper", reason="normal fan-out"),
+            ],
+        }
+    ]
+    ranked = rank.rank_investigate(domains, top_n=10)
+    by_label = {e["label"]: e for e in ranked}
+    big = by_label["Python mcp_lexicon_engine_server.py"]
+    small = by_label["small.helper"]
+
+    assert "sprawl" in big["cost_drivers"]
+    assert f"sprawl-threshold={rank.SPRAWL_THRESHOLD_DEFAULT}" in big["cost_drivers"]
+    assert big["proc_count"] == 82
+    # additive alongside the existing tag, not a replacement
+    assert "large-cluster" in big["cost_drivers"]
+    # the four-verdict contract is preserved: still 'investigate'
+    assert big["verdict"] == "investigate"
+    assert "sprawl" not in small["cost_drivers"]
+
+
+def test_sprawl_does_not_change_the_four_verdict_contract():
+    from fleet_watch.census import verdicts
+
+    assert verdicts.VERDICTS == frozenset({"keep", "investigate", "close", "remove"})
+    assert "sprawl" not in verdicts.VERDICTS
