@@ -1,0 +1,83 @@
+{
+  "schema_version": "fleet-session-recovery-result/v1",
+  "status": "DONE",
+  "mission": "correct session census identity without relaxing authorization",
+  "base": "e36fea8efd81f539ab2fa5fc56a379c8bcfc2845",
+  "primary_tree": "/Users/cj/Workspace/active/fleet-watch",
+  "changed_files": [
+    "fleet_watch/syshealth.py",
+    "tests/test_session_identity_regression.py"
+  ],
+  "sha256": {
+    "fleet_watch/syshealth.py": "13b1f16ad0a116de793fb21b9c9442311bd923ca8fb1ef8cce4d6fb6c29cbb13",
+    "tests/test_session_identity_regression.py": "64759de1a037bc9029cac9422018d79f4f273736adaa57da28875963b0f931a7",
+    "fleet_watch/syshealth.py@base": "9ffff51c417cd833aa13d369a5f6cd969cf81f7a20b419751b3a866a82643604"
+  },
+  "tests": {
+    "regressions_base": "8 failed, 10 passed, 1 deselected (cycle test HANGS the base — unbounded family walk; captured under timeout, see evidence/base-failing-regressions.txt)",
+    "regressions_candidate": "19 passed in 0.06s",
+    "focused": "133 passed in 13.59s (tests/test_syshealth.py + tests/test_session_close_operator_seat.py + tests/test_session_close_authority.py + tests/test_session_identity_regression.py)",
+    "full_suite": "2 failed, 864 passed in 216.91s (python -m pytest tests -q)"
+  },
+  "baseline_failures": [
+    {
+      "test": "tests/test_cli.py::test_status_json_degrades_when_ollama_scan_hangs",
+      "kind": "pre-existing, unrelated",
+      "evidence": "identical failure with candidate syshealth.py replaced by base syshealth.py (sha 9ffff51c…, equal to fleet-before.json baseline): 'status hung for 3.14s past its bound' — a 2.0s wall-clock bound on a host running ~1670 processes; fails on base AND candidate",
+      "ab_evidence": "work/session-recovery/evidence/preexisting-failures-base-ab.txt"
+    },
+    {
+      "test": "tests/test_cli.py::test_status_json_degrades_when_orphan_probe_hangs",
+      "kind": "pre-existing, unrelated",
+      "evidence": "same A/B: identical failure on base and candidate",
+      "ab_evidence": "work/session-recovery/evidence/preexisting-failures-base-ab.txt"
+    }
+  ],
+  "acceptance_by_id": {
+    "1_census_labels_by_identity": {
+      "status": "PASS",
+      "evidence": "planted-bad rows relabeled: Devin-with-/codex-arg -> devin (was codex); restic backup mentioning Claude dirs -> unlabeled (was claude-code); shell snapshot with codex paths -> unlabeled (was codex); flag inline value --workdir=/codex-… -> devin (was codex)"
+    },
+    "2_legitimate_variants_observable": {
+      "status": "PASS",
+      "evidence": "positive controls pass before AND after: native codex, node-launched codex, vendor codex, claude --flags, grok versioned exe, opencode.exe; custom-pattern whole-command semantics pinned unchanged"
+    },
+    "3_authorization_unchanged_or_stronger": {
+      "status": "PASS",
+      "evidence": "STRICTLY STRONGER: on base a Devin run with clean arguments was granted operator-seat revocation authority ('requester is the operator seat'); after the roster repair it is denied. Over-match direction preserved (devin-with-codex-arg still denied); operator seat with no agent still allowed; owner/descendant/ancestor arms unchanged; existing auth suites pass (133 focused)"
+    },
+    "4_regressions_fail_before_pass_after": {
+      "status": "PASS",
+      "evidence": "base: 8 failed / 10 passed / 1 hang; candidate: 19 passed; positive controls green on both; no new S1"
+    },
+    "5_suite_and_baseline_separation": {
+      "status": "PASS",
+      "evidence": "focused 133 passed; full 864 passed / 2 failed with exact base-vs-candidate A/B proving the 2 are pre-existing timing-bound failures; no unrelated code altered"
+    },
+    "6_hashes_diff_results_limits": {
+      "status": "PASS",
+      "evidence": "hashes above; minimal diff in SESSION_RECOVERY.patch (527 lines incl. new test file); literal outputs under evidence/; TESTED SOURCE EDITS ONLY — the live pipx install (fleet 0.4.0, site-packages) is a separate copy and still runs the old census; no service restart, no install performed"
+    }
+  },
+  "security_audit": {
+    "threat_surface": "census identity and the shared DEFAULT_SESSION_PATTERNS roster; argument ambiguity must not relabel ordinary arguments as the running agent; the same roster informs registry agent/operator classification",
+    "invariant_impact": ["Fail-Closed", "Constraints Over Plasticity", "Tuesday Bar", "operator/agent authority separation", "public status schema compatible", "shared roster stays the single source"],
+    "key_material": "No key material involved. No secret reads or changes.",
+    "failure_modes": [
+      "unknown/unreadable ancestry stays DENY (unchanged; existing suites + new tests)",
+      "malformed/custom pattern handling stays safe (bad regex skipped; custom API unchanged)",
+      "NEW (fixed): PPID cycle among matched rows previously made the family walk unbounded (hang) — now bounded with deterministic family key; failure mode is termination, never relabel",
+      "no fail-open path introduced; the operator-seat arm is strictly narrower (Devin now recognized as agent runtime)"
+    ],
+    "verification": "failing-before/passing-after regressions; legitimate native + interpreter-launched controls; misleading-argument negatives; existing auth-positive and auth-negative suites; planted-bad fixtures preserved in tests/test_session_identity_regression.py; bounded integration over sanitized real-shaped rows (fixtures taken from live ps shapes 2026-09-26)"
+  },
+  "blocked_reasons": [],
+  "live_consumer_note": "The launchd daemon (com.cds.fleet-watch -> pipx fleet 0.4.0 site-packages) does NOT contain this fix. Deployment/landing is root/operator territory; no commit, push, merge, install, or service restart was performed.",
+  "incident_id": "fleet-session-recovery-20260926",
+  "result_files": [
+    "work/session-recovery/SESSION_RECOVERY_RESULT.json",
+    "work/session-recovery/SESSION_RECOVERY_REPORT.md",
+    "work/session-recovery/SESSION_RECOVERY.patch",
+    "work/session-recovery/evidence/"
+  ]
+}

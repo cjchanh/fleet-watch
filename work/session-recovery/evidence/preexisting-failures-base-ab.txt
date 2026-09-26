@@ -1,0 +1,60 @@
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+_______________ test_status_json_degrades_when_ollama_scan_hangs _______________
+
+tmp_path = PosixPath('/private/var/folders/wk/lds7pm9x7fv6y10hl_xfjwb80000gn/T/pytest-of-cj/pytest-2005/test_status_json_degrades_when0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10bc00180>
+
+    def test_status_json_degrades_when_ollama_scan_hangs(tmp_path, monkeypatch):
+        _patch_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(_command_module("status"), "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+    
+        def _hang():
+            time.sleep(5)
+            return []
+    
+        monkeypatch.setattr(
+            cli_module.ollama_runners, "discover_ollama_runners", _hang
+        )
+    
+        runner = CliRunner()
+        start = time.monotonic()
+        result = runner.invoke(cli_module.cli, ["status", "--json"])
+        elapsed = time.monotonic() - start
+    
+        assert result.exit_code == 0, result.output
+>       assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+E       AssertionError: status hung for 3.53s past its bound
+E       assert 3.5320997500093654 < 2.0
+
+tests/test_cli.py:1724: AssertionError
+______________ test_status_json_degrades_when_orphan_probe_hangs _______________
+
+tmp_path = PosixPath('/private/var/folders/wk/lds7pm9x7fv6y10hl_xfjwb80000gn/T/pytest-of-cj/pytest-2005/test_status_json_degrades_when1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ba4be10>
+
+    def test_status_json_degrades_when_orphan_probe_hangs(tmp_path, monkeypatch):
+        _patch_paths(monkeypatch, tmp_path)
+        monkeypatch.setattr(_command_module("status"), "STATUS_DISCOVERY_TIMEOUT_SECONDS", 0.2)
+    
+        def _hang():
+            time.sleep(5)
+            return cli_module.orphan_detector.OrphanDetectionResult()
+    
+        monkeypatch.setattr(cli_module.orphan_detector, "detect_orphans", _hang)
+    
+        runner = CliRunner()
+        start = time.monotonic()
+        result = runner.invoke(cli_module.cli, ["status", "--json"])
+        elapsed = time.monotonic() - start
+    
+        assert result.exit_code == 0, result.output
+>       assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+E       AssertionError: status hung for 3.63s past its bound
+E       assert 3.6347551659855526 < 2.0
+
+tests/test_cli.py:1746: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_cli.py::test_status_json_degrades_when_ollama_scan_hangs - ...
+FAILED tests/test_cli.py::test_status_json_degrades_when_orphan_probe_hangs
+2 failed in 7.38s

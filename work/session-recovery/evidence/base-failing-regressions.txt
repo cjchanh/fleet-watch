@@ -1,0 +1,131 @@
+FFFFF......F.FF...                                                       [100%]
+=================================== FAILURES ===================================
+________ test_planted_bad_devin_with_codex_path_arg_is_devin_not_codex _________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10aaed6e0>
+
+    def test_planted_bad_devin_with_codex_path_arg_is_devin_not_codex(monkeypatch):
+        """THE proven bug: a Devin run whose prompt path contains /codex-..."""
+        labels = census(monkeypatch, {62279: DEVIN_WITH_CODEX_PATH_ARG})
+>       assert labels == {62279: "devin"}
+E       AssertionError: assert {62279: 'codex'} == {62279: 'devin'}
+E         
+E         Differing items:
+E         {62279: 'codex'} != {62279: 'devin'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:105: AssertionError
+______________ test_planted_bad_mere_path_mention_is_not_an_agent ______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10aaed0f0>
+
+    def test_planted_bad_mere_path_mention_is_not_an_agent(monkeypatch):
+        """A backup tool that merely touches an agent's directory is not an agent."""
+        labels = census(monkeypatch, {30223: RESTIC_BACKUP})
+>       assert labels == {}
+E       AssertionError: assert {30223: 'claude-code'} == {}
+E         
+E         Left contains 1 more item:
+E         {30223: 'claude-code'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:111: AssertionError
+_________________ test_planted_bad_shell_snapshot_is_not_codex _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ab2e690>
+
+    def test_planted_bad_shell_snapshot_is_not_codex(monkeypatch):
+        """A shell snapshot that exports CODEX_* env is not a Codex session."""
+        labels = census(monkeypatch, {54363: ZSH_SNAPSHOT_WITH_CODEX_ENV})
+>       assert labels == {}
+E       AssertionError: assert {54363: 'codex'} == {}
+E         
+E         Left contains 1 more item:
+E         {54363: 'codex'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:117: AssertionError
+___ test_planted_bad_dispatch_script_with_claude_scratch_path_is_not_claude ____
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10aab39b0>
+
+    def test_planted_bad_dispatch_script_with_claude_scratch_path_is_not_claude(monkeypatch):
+        """A dispatch harness whose scratch path contains /claude-501/ is not Claude."""
+        labels = census(monkeypatch, {54014: BASH_DEVIN_DISPATCH_WITH_CLAUDE_SCRATCH})
+>       assert labels == {}
+E       AssertionError: assert {54014: 'claude-code'} == {}
+E         
+E         Left contains 1 more item:
+E         {54014: 'claude-code'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:123: AssertionError
+_________________ test_flag_inline_value_mention_is_not_codex __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10aab3f00>
+
+    def test_flag_inline_value_mention_is_not_codex(monkeypatch):
+        """--workdir=/codex-... is an argument value, not the process identity."""
+        labels = census(monkeypatch, {70001: DEVIN_INLINE_FLAG_VALUE})
+>       assert labels == {70001: "devin"}
+E       AssertionError: assert {70001: 'codex'} == {70001: 'devin'}
+E         
+E         Differing items:
+E         {70001: 'codex'} != {70001: 'devin'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:129: AssertionError
+_________________ test_devin_clean_invocation_visible_as_devin _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ac41230>
+
+    def test_devin_clean_invocation_visible_as_devin(monkeypatch):
+        labels = census(monkeypatch, {106: DEVIN_CLEAN})
+>       assert labels == {106: "devin"}
+E       AssertionError: assert {} == {106: 'devin'}
+E         
+E         Right contains 1 more item:
+E         {106: 'devin'}
+E         Use -v to get more diff
+
+tests/test_session_identity_regression.py:167: AssertionError
+___________ test_roster_contains_devin_with_binary_for_authorization ___________
+
+    def test_roster_contains_devin_with_binary_for_authorization():
+        kinds = {p["kind"] for p in syshealth.DEFAULT_SESSION_PATTERNS}
+>       assert "devin" in kinds
+E       AssertionError: assert 'devin' in {'claude-code', 'codex', 'grok', 'opencode'}
+
+tests/test_session_identity_regression.py:226: AssertionError
+_________________ test_devin_ancestry_is_not_the_operator_seat _________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ab7d850>
+
+    def test_devin_ancestry_is_not_the_operator_seat(monkeypatch):
+        """Load-bearing: a Devin run with CLEAN arguments must not read as a human.
+    
+        Before the roster repair the ancestry walk found no agent runtime and the
+        operator-seat arm ALLOWED the close — an agent holding peer revocation
+        authority. This regression fails on the base behavior.
+        """
+        inject_machine(monkeypatch, DEVIN_CLEAN)
+        conn = _conn()
+        _open_lease(conn, "sess-owner", OWNER_PID)
+    
+        allowed, reason = registry.authorize_session_close(conn, "sess-owner", DEVIN_TOOL_PID)
+    
+>       assert allowed is False, reason
+E       AssertionError: requester is the operator seat (same uid, no agent runtime in its ancestry)
+E       assert True is False
+
+tests/test_session_identity_regression.py:311: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_session_identity_regression.py::test_planted_bad_devin_with_codex_path_arg_is_devin_not_codex
+FAILED tests/test_session_identity_regression.py::test_planted_bad_mere_path_mention_is_not_an_agent
+FAILED tests/test_session_identity_regression.py::test_planted_bad_shell_snapshot_is_not_codex
+FAILED tests/test_session_identity_regression.py::test_planted_bad_dispatch_script_with_claude_scratch_path_is_not_claude
+FAILED tests/test_session_identity_regression.py::test_flag_inline_value_mention_is_not_codex
+FAILED tests/test_session_identity_regression.py::test_devin_clean_invocation_visible_as_devin
+FAILED tests/test_session_identity_regression.py::test_roster_contains_devin_with_binary_for_authorization
+FAILED tests/test_session_identity_regression.py::test_devin_ancestry_is_not_the_operator_seat
+8 failed, 10 passed, 1 deselected in 0.13s
