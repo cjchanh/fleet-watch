@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -1254,3 +1255,131 @@ def test_sprawl_does_not_change_the_four_verdict_contract():
 
     assert verdicts.VERDICTS == frozenset({"keep", "investigate", "close", "remove"})
     assert "sprawl" not in verdicts.VERDICTS
+
+# --------------------------------------------------------------------------
+# deployment integrity: which fleet_watch does a staged launchd job run?
+#
+# The staged plist hardcodes one absolute path, chosen by `shutil.which
+# ("fleet")`. A machine can carry several `fleet` binaries — a venv console
+# script and a pipx copy both answer `fleet census --help`, so the
+# pre-existing "does it support census" check passes for either. The daily job
+# can then run quietly-different code from the tree the operator verified by
+# hand, with no error anywhere. These tests pin the detector for that.
+# --------------------------------------------------------------------------
+
+#: Directory *containing* the `fleet_watch` package this session imported.
+#: census.__file__ is .../fleet_watch/census/__init__.py, so the importable
+#: parent of the package is two levels up from its directory.
+REPO_ROOT = Path(census.__file__).resolve().parents[2]
+
+
+def _console_script(directory: Path) -> Path:
+    """A console script whose shebang names the running interpreter.
+
+    Only the shebang is load-bearing: the probe runs that interpreter directly
+    with `-c`, so the body is never executed.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "fleet"
+    script.write_text(f"#!{sys.executable}\nfrom fleet_watch.cli import main\n")
+    return script
+
+
+@pytest.fixture
+def probeable_fleet(monkeypatch):
+    """Make `sys.executable` able to import fleet_watch, as a real install is.
+
+    A bare interpreter only sees fleet_watch if it is installed or on
+    PYTHONPATH. That is exactly how the two real installations differ, and the
+    probe must work for both, so the tests supply the path rather than assume
+    one particular machine's venv.
+    """
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    return _console_script
+
+
+def test_probe_returns_none_for_a_missing_executable(tmp_path):
+    assert census.probe_fleet_watch_root(str(tmp_path / "nope" / "fleet")) is None
+
+
+def test_probe_returns_none_when_there_is_no_interpreter_to_ask(tmp_path):
+    """A file with no `#!` line cannot be interrogated — say so, do not guess."""
+    script = tmp_path / "fleet"
+    script.write_text("no shebang here\n")
+    assert census.probe_fleet_watch_root(str(script)) is None
+
+
+def test_probe_reports_the_package_directory_not_the_init_file(
+    tmp_path, probeable_fleet
+):
+    probed = census.probe_fleet_watch_root(str(probeable_fleet(tmp_path)))
+    assert probed is not None
+    # A directory, so the emitting side is directly comparable to it.
+    assert Path(probed).is_dir()
+    assert Path(probed).name == "fleet_watch"
+
+
+def test_probe_is_not_answered_by_the_callers_working_directory(
+    tmp_path, monkeypatch, probeable_fleet
+):
+    """A decoy checkout in the cwd must not answer for every binary.
+
+    `python -c` puts the working directory first on sys.path. If the probe ran
+    from the caller's cwd, standing in a fleet-watch checkout would make every
+    `fleet` on the machine report that checkout — the one answer that renders
+    this check worthless. The probe runs from a neutral cwd, so the decoy below
+    is invisible to it.
+    """
+    decoy = tmp_path / "decoy"
+    (decoy / "fleet_watch").mkdir(parents=True)
+    (decoy / "fleet_watch" / "__init__.py").write_text("raise AssertionError('decoy')\n")
+    script = probeable_fleet(tmp_path)
+
+    monkeypatch.chdir(decoy)  # the dangerous case: cwd holds a fleet_watch
+    probed = census.probe_fleet_watch_root(str(script))
+
+    # Answered by the real path, never the decoy (which raises on import).
+    assert probed is not None
+    assert Path(probed).resolve() == REPO_ROOT / "fleet_watch"
+
+
+def test_lineage_divergence_is_named_not_silently_baked_in(
+    tmp_path, monkeypatch, capsys
+):
+    """A staged path from another tree must be called out, both roots shown."""
+    from fleet_watch.commands.census import _warn_on_lineage_divergence
+
+    other_root = tmp_path / "somewhere-else" / "fleet_watch"
+    other_root.mkdir(parents=True)
+    (other_root / "__init__.py").write_text("")
+
+    monkeypatch.setattr(census, "probe_fleet_watch_root", lambda _exe: str(other_root))
+    _warn_on_lineage_divergence(str(tmp_path / "fleet"))
+
+    err = capsys.readouterr().err
+    assert "DIFFERENT fleet_watch" in err
+    assert str(other_root) in err
+    # the emitting side is the fleet_watch PACKAGE dir, the same shape the
+    # probe reports, so the two are comparable by eye
+    assert str(REPO_ROOT / "fleet_watch") in err
+
+
+def test_matching_lineage_says_nothing(tmp_path, monkeypatch, probeable_fleet, capsys):
+    """The common case must stay quiet, or operators learn to ignore it."""
+    from fleet_watch.commands.census import _warn_on_lineage_divergence
+
+    _warn_on_lineage_divergence(str(probeable_fleet(tmp_path)))
+    assert capsys.readouterr().err == ""
+
+
+def test_unprovable_lineage_is_reported_as_unproven_not_as_a_mismatch(
+    tmp_path, capsys
+):
+    """Cannot-prove must never render as a mismatch — that trains people to
+    ignore the warning that matters."""
+    from fleet_watch.commands.census import _warn_on_lineage_divergence
+
+    _warn_on_lineage_divergence(str(tmp_path / "missing"))
+    err = capsys.readouterr().err
+    assert "DIFFERENT" not in err
+    assert "could not prove" in err

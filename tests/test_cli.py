@@ -4,10 +4,12 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from fleet_watch import cli as cli_module
@@ -38,6 +40,43 @@ def _patch_paths(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(cli_module.syshealth, "get_vm_pressure_level", lambda: 1)
     monkeypatch.setattr(cli_module.syshealth, "get_total_memory_mb", lambda: 131072)
+    monkeypatch.setattr(
+        cli_module.runaway,
+        "scan_aggregate_pressure",
+        lambda **kwargs: cli_module.runaway.AggregatePressureScan(
+            status="OK", groups=[]
+        ),
+    )
+
+
+class _CompletedNotificationProcess:
+    pid = 77027
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pytest.fail("completed notification helper must not be killed")
+
+    def wait(self, *args, **kwargs):
+        pytest.fail("bounded notifier must not call wait")
+
+    def communicate(self, *args, **kwargs):
+        pytest.fail("bounded notifier must not call communicate")
+
+
+def _install_successful_notification_process(monkeypatch, tmp_path):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(cli_support, "_notification_process", None)
+    calls: list[list[str]] = []
+
+    def start(command):
+        calls.append(command)
+        return _CompletedNotificationProcess()
+
+    monkeypatch.setattr(cli_support, "_start_notification_process", start)
+    return calls
 
 
 def test_guard_json_denies_taken_port(tmp_path, monkeypatch):
@@ -866,7 +905,7 @@ def test_health_json_reports_session_attention(monkeypatch):
     assert payload["sessions"][0]["member_count"] == 2
 
 
-def test_health_human_notifies_on_detached_hot_sessions(monkeypatch):
+def test_health_human_notifies_on_detached_hot_sessions(tmp_path, monkeypatch):
     """Non-JSON health output triggers macOS notification for attention sessions."""
     monkeypatch.setattr(cli_module.discover_mod, "load_config", lambda: {})
     monkeypatch.setattr(
@@ -898,16 +937,7 @@ def test_health_human_notifies_on_detached_hot_sessions(monkeypatch):
     )
     monkeypatch.setattr(cli_module.syshealth, "get_idle_processes", lambda **kwargs: [])
 
-    osascript_calls: list[list[str]] = []
-    real_subprocess_run = cli_module.subprocess.run
-
-    def capture_run(cmd, **kwargs):
-        if cmd and cmd[0] == "osascript":
-            osascript_calls.append(cmd)
-            return
-        return real_subprocess_run(cmd, **kwargs)
-
-    monkeypatch.setattr(cli_module.subprocess, "run", capture_run)
+    osascript_calls = _install_successful_notification_process(monkeypatch, tmp_path)
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["health"])
@@ -1119,16 +1149,7 @@ def test_discover_notifies_on_detached_hot_sessions(tmp_path, monkeypatch):
         lambda patterns=None: [hot_session],
     )
 
-    osascript_calls: list[list[str]] = []
-    real_subprocess_run = cli_module.subprocess.run
-
-    def capture_run(cmd, **kwargs):
-        if cmd and cmd[0] == "osascript":
-            osascript_calls.append(cmd)
-            return
-        return real_subprocess_run(cmd, **kwargs)
-
-    monkeypatch.setattr(cli_module.subprocess, "run", capture_run)
+    osascript_calls = _install_successful_notification_process(monkeypatch, tmp_path)
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["discover"])
@@ -1139,6 +1160,254 @@ def test_discover_notifies_on_detached_hot_sessions(tmp_path, monkeypatch):
     assert "Attention Required" in script
     assert "1 detached hot session(s)" in script
     assert "70%" in script
+
+
+def _aggregate_rg_group():
+    return cli_module.runaway.AggregatePressureGroup(
+        identity="rg",
+        aggregate_cpu_pct=840.0,
+        capacity_pct=46.7,
+        contributor_count=84,
+        logical_cpu_count=18,
+        parent_one_count=84,
+        pids=list(range(1000, 1084)),
+    )
+
+
+def test_aggregate_pressure_notification_is_bounded(tmp_path, monkeypatch):
+    calls = _install_successful_notification_process(monkeypatch, tmp_path)
+
+    result = cli_module._notify_aggregate_pressure(_aggregate_rg_group())
+
+    assert result["status"] == "SENT"
+    assert result["reaped"] is True
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:2] == ["osascript", "-e"]
+    assert "84 rg processes" in command[2]
+    assert "840% aggregate CPU" in command[2]
+    assert "18 logical CPUs" in command[2]
+
+
+class _UnreapableNotificationProcess:
+    pid = 77727
+
+    def __init__(self):
+        self.kill_calls = 0
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.kill_calls += 1
+
+    def wait(self, *args, **kwargs):
+        pytest.fail("bounded notifier must not call wait on an unreapable child")
+
+    def communicate(self, *args, **kwargs):
+        pytest.fail("bounded notifier must not communicate with an unreapable child")
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(seconds, 0.01)
+
+
+def test_unreapable_notification_returns_and_suppresses_repeated_helpers(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(cli_support, "_notification_process", None)
+    monkeypatch.setattr(cli_support, "NOTIFICATION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(cli_support, "NOTIFICATION_REAP_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(cli_support, "NOTIFICATION_POLL_SECONDS", 0.05)
+    clock = _FakeClock()
+    monkeypatch.setattr(cli_support.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cli_support.time, "sleep", clock.sleep)
+    process = _UnreapableNotificationProcess()
+    starts: list[list[str]] = []
+
+    def start(command):
+        starts.append(command)
+        return process
+
+    monkeypatch.setattr(cli_support, "_start_notification_process", start)
+
+    first = cli_module._notify_aggregate_pressure(_aggregate_rg_group())
+    # A launchd StartInterval starts a fresh Fleet process. Lose the in-memory
+    # handle to model that boundary; the durable PID marker must still suppress.
+    monkeypatch.setattr(cli_support, "_notification_process", None)
+    monkeypatch.setattr(
+        cli_support,
+        "_notification_pid_alive",
+        lambda pid: True,
+        raising=False,
+    )
+    second = cli_module._notify_attention(
+        [
+            syshealth.SessionProcess(
+                pid=88001,
+                name="Codex",
+                kind="codex",
+                rss_mb=100,
+                cpu_pct=70.0,
+                started="2:00PM",
+                tty="??",
+                command="codex",
+                attention=True,
+            )
+        ]
+    )
+
+    assert first == {
+        "status": "TIMEOUT_UNREAPED",
+        "pid": 77727,
+        "reaped": False,
+        "returncode": None,
+    }
+    assert second == {
+        "status": "SUPPRESSED_IN_FLIGHT",
+        "pid": 77727,
+        "reaped": False,
+        "returncode": None,
+    }
+    assert len(starts) == 1
+    assert process.kill_calls == 1
+    assert clock.now <= 0.4
+    notification_state = json.loads(
+        (tmp_path / "notification_helper.json").read_text()
+    )
+    assert notification_state["helper_pid"] == 77727
+    assert notification_state["status"] == "TIMEOUT_UNREAPED"
+    error_output = capsys.readouterr().err
+    assert "TIMEOUT_UNREAPED" in error_output
+    assert "SUPPRESSED_IN_FLIGHT" in error_output
+    assert "pid 77727" in error_output
+    assert "reaped=false" in error_output
+
+
+def test_aggregate_pressure_notification_is_suppressed_during_tests(monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "active")
+    monkeypatch.setattr(
+        cli_support,
+        "_start_notification_process",
+        lambda *args, **kwargs: pytest.fail("test must not reach desktop notifier"),
+        raising=False,
+    )
+
+    assert cli_module._notify_aggregate_pressure(_aggregate_rg_group()) == {
+        "status": "SUPPRESSED_TEST",
+        "pid": None,
+        "reaped": True,
+        "returncode": None,
+    }
+
+
+def test_runaway_tick_reports_aggregate_pressure_without_signaling_and_deduplicates(
+    tmp_path, monkeypatch
+):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module.runaway, "scan_runaways", lambda **kwargs: [])
+    pressure = cli_module.runaway.AggregatePressureScan(
+        status="OK", groups=[_aggregate_rg_group()]
+    )
+    monkeypatch.setattr(
+        cli_module.runaway, "scan_aggregate_pressure", lambda: pressure
+    )
+    notifications: list[str] = []
+
+    def notify(group):
+        notifications.append(group.identity)
+        return {"status": "SENT", "pid": 77027, "reaped": True, "returncode": 0}
+
+    monkeypatch.setattr(
+        cli_support,
+        "_notify_aggregate_pressure",
+        notify,
+    )
+    monkeypatch.setattr(
+        cli_module.runaway,
+        "kill_runaway",
+        lambda pid: pytest.fail("aggregate pressure must never signal a process"),
+    )
+    tracker = cli_module.runaway.DaemonRunawayTracker()
+    conn = registry.connect()
+
+    cli_module._run_runaway_tick(conn, tracker, tracker_path=tmp_path / "tracker.json")
+    cli_module._run_runaway_tick(conn, tracker, tracker_path=tmp_path / "tracker.json")
+
+    assert notifications == ["rg"]
+    assert tracker.aggregate_active_keys == {"rg"}
+    conn.close()
+
+
+def test_runaway_tick_allows_notification_after_pressure_clears(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module.runaway, "scan_runaways", lambda **kwargs: [])
+    scans = iter(
+        [
+            cli_module.runaway.AggregatePressureScan(
+                status="OK", groups=[_aggregate_rg_group()]
+            ),
+            cli_module.runaway.AggregatePressureScan(status="OK", groups=[]),
+            cli_module.runaway.AggregatePressureScan(
+                status="OK", groups=[_aggregate_rg_group()]
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        cli_module.runaway, "scan_aggregate_pressure", lambda: next(scans)
+    )
+    notifications: list[str] = []
+
+    def notify(group):
+        notifications.append(group.identity)
+        return {"status": "SENT", "pid": 77027, "reaped": True, "returncode": 0}
+
+    monkeypatch.setattr(
+        cli_support,
+        "_notify_aggregate_pressure",
+        notify,
+    )
+    tracker = cli_module.runaway.DaemonRunawayTracker()
+    conn = registry.connect()
+
+    for _ in range(3):
+        cli_module._run_runaway_tick(conn, tracker)
+
+    assert notifications == ["rg", "rg"]
+    conn.close()
+
+
+def test_runaway_json_surfaces_unknown_collection(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli_module.runaway, "scan_runaways", lambda **kwargs: [])
+    monkeypatch.setattr(
+        cli_module.runaway,
+        "scan_aggregate_pressure",
+        lambda **kwargs: cli_module.runaway.AggregatePressureScan(
+            status="UNKNOWN", groups=[], reason="ps_permission_denied"
+        ),
+    )
+    result = CliRunner().invoke(
+        cli_module.cli,
+        ["runaway", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["aggregate_pressure_scan"] == {
+        "status": "UNKNOWN",
+        "reason": "ps_permission_denied",
+    }
+    assert payload["aggregate_pressure"] == []
 
 
 def test_guard_repo_uses_env_session_id_for_same_session_bypass(tmp_path, monkeypatch):
@@ -1262,16 +1531,26 @@ def test_census_refuses_and_exits_nonzero_when_every_probe_returns_nothing(
 def test_census_emit_launchd_plist_installs_nothing(monkeypatch):
     monkeypatch.setattr(_command_module("census"), "_executable_supports_census", lambda _e: True)
     called = []
-    monkeypatch.setattr(
-        cli_module.subprocess, "run", lambda *a, **k: called.append(a) or None
-    )
+
+    def _record(argv, *a, **k):
+        called.append(argv)
+        # Emit also runs a read-only lineage probe (one interpreter asking
+        # which fleet_watch it imports) so a staged path from another install
+        # can be named rather than baked in silently. That is an inspection,
+        # not an install step, so hand back a well-formed result for it.
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _record)
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["census", "--emit-launchd-plist"])
 
     assert result.exit_code == 0
     assert "io.fleet-watch.census" in result.output
-    assert called == [], "emitting the plist must not shell out to launchctl"
+    # Named invariant, not "spawned nothing": the probe is allowed, a
+    # launchctl bootstrap/bootout is not.
+    launchctl = [c for c in called if c and "launchctl" in " ".join(map(str, c))]
+    assert launchctl == [], "emitting the plist must not shell out to launchctl"
 
 
 def test_sitrep_help_is_wired():
@@ -1453,7 +1732,14 @@ def test_status_json_degrades_when_ollama_scan_hangs(tmp_path, monkeypatch):
     elapsed = time.monotonic() - start
 
     assert result.exit_code == 0, result.output
-    assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+    # The stub above sleeps 5s, so elapsed staying under 5.0 is what proves the
+    # bound held — a leaked bound costs the full stub sleep, not a fraction of
+    # it. Measured cost of this scenario is ~0.95-1.2s (two 0.2s probes plus
+    # baseline status work), so 4.0 leaves ~4x headroom for a loaded box while
+    # staying below the 5.0s discriminator. The old 2.0 ceiling left only ~1.7x
+    # and flaked at 3.24s under fleet load; 3.24 < 5.0 is the signature of
+    # scheduler contention, not of a lost bound.
+    assert elapsed < 4.0, f"status hung for {elapsed:.2f}s past its bound"
     payload = json.loads(result.output)
     assert payload["discovery_degraded"]["ollama_runner_scan_timed_out"] is True
     assert payload["ollama_runners"] == []
@@ -1475,7 +1761,14 @@ def test_status_json_degrades_when_orphan_probe_hangs(tmp_path, monkeypatch):
     elapsed = time.monotonic() - start
 
     assert result.exit_code == 0, result.output
-    assert elapsed < 2.0, f"status hung for {elapsed:.2f}s past its bound"
+    # The stub above sleeps 5s, so elapsed staying under 5.0 is what proves the
+    # bound held — a leaked bound costs the full stub sleep, not a fraction of
+    # it. Measured cost of this scenario is ~0.95-1.2s (two 0.2s probes plus
+    # baseline status work), so 4.0 leaves ~4x headroom for a loaded box while
+    # staying below the 5.0s discriminator. The old 2.0 ceiling left only ~1.7x
+    # and flaked at 3.24s under fleet load; 3.24 < 5.0 is the signature of
+    # scheduler contention, not of a lost bound.
+    assert elapsed < 4.0, f"status hung for {elapsed:.2f}s past its bound"
     payload = json.loads(result.output)
     assert payload["discovery_degraded"]["orphan_probe_timed_out"] is True
     assert payload["orphan_detection"]["orphans_detected"] is False

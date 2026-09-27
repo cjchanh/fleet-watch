@@ -9,6 +9,7 @@ from pathlib import Path
 
 import click
 
+import fleet_watch
 from fleet_watch import boot_map as boot_map_mod
 from fleet_watch import census as census_mod
 from fleet_watch import registry
@@ -63,6 +64,51 @@ def boot_coverage(as_json: bool):
     click.echo(f"Receipt: {payload.get('receipt_path', 'N/A')}")
 
 
+def _warn_on_lineage_divergence(executable: str) -> None:
+    """Refuse to let a plist bake in a `fleet` from a different source tree.
+
+    Existence is not identity. Both a venv console script and a pipx copy on
+    this machine answer to `fleet census --help`, so the pre-existing
+    "does it support census" check passes for either — and a daily job can then
+    run quietly-different code from the one the operator verified by hand, with
+    no error anywhere. Observed exactly this: an installed
+    ``io.fleet-watch.census`` pointing at a pipx copy that predates the census
+    ranking changes, so it emitted receipts without the new signals.
+
+    Silence is the defect, so this only speaks when it has proof. A probe that
+    cannot answer is reported as unproven rather than as a mismatch.
+    """
+    emitting_root = Path(fleet_watch.__file__).resolve().parent
+    staged_root = census_mod.probe_fleet_watch_root(executable)
+    if staged_root is None:
+        click.echo(
+            f"\nNOTE: could not prove which fleet_watch {executable} imports "
+            "(no readable shebang, or the interpreter failed the probe).\n"
+            "  The staged path is emitted unresolved. Verify it by hand before "
+            "bootstrapping:\n"
+            f"    {executable} --version",
+            err=True,
+        )
+        return
+    try:
+        same_tree = Path(staged_root) == emitting_root
+    except OSError:
+        same_tree = False
+    if same_tree:
+        return
+    click.echo(
+        f"\nWARNING: {executable} imports a DIFFERENT fleet_watch than the one "
+        "emitting this plist.\n"
+        f"  this process : {emitting_root}\n"
+        f"  staged binary: {staged_root}\n"
+        "  The job you are about to bootstrap would run different code from "
+        "the one\n  you just verified, and would keep doing so silently every "
+        "run. Either\n  re-emit this plist from the binary you intend to run, or "
+        "point the\n  ProgramArguments entry at that binary by hand.",
+        err=True,
+    )
+
+
 @click.command()
 @click.option("--json", "as_json", is_flag=True, help="Emit the full receipt as JSON")
 @click.option("--quiet", is_flag=True, help="Print only totals and the receipt path")
@@ -93,6 +139,11 @@ def census(
 ):
     """Census what boots and runs on this machine, and what is stale."""
     if emit_launchd_plist:
+        # `shutil.which` is PATH-dependent, and this machine has at least two
+        # `fleet` binaries on PATH (a venv console script and a pipx copy). The
+        # PATH winner is not always the one carrying the code the operator just
+        # ran, so the resolved path is proven against the running tree below
+        # rather than trusted.
         executable = shutil.which("fleet") or census_mod.DEFAULT_FLEET_BIN
         log_path = os.path.join(tempfile.gettempdir(), "fleet-census.log")
         click.echo(census_mod.render_launchd_plist(executable, log_path=log_path), nl=False)
@@ -119,6 +170,7 @@ def census(
                 f"{Path(__file__).resolve().parent.parent})",
                 err=True,
             )
+        _warn_on_lineage_divergence(executable)
         return
 
     try:

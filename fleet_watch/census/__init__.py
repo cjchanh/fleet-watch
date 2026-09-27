@@ -19,6 +19,8 @@ Receipt contract: ``docs/fleet-census-receipt-contract-v1.md``.
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,72 @@ __all__ = [
 LAUNCHD_LABEL = "io.fleet-watch.census"
 STAGED_PLIST_PATH = "~/Library/LaunchAgents/io.fleet-watch.census.plist"
 DEFAULT_FLEET_BIN = "/usr/local/bin/fleet"
+
+#: Seconds allowed for the lineage subprocess below. It is one bare interpreter
+#: start (no imports of fleet_watch beyond the package itself), so this is
+#: generous; exceeding it means "cannot prove", never "proved different".
+LINEAGE_PROBE_TIMEOUT_SECONDS = 10.0
+
+#: Prints the package DIRECTORY, not ``__init__.py``, so the emitting side can
+#: be compared against it directly. Comparing a subpackage module path against a
+#: package path looks like a mismatch on every run and proves nothing.
+_PROBE_SNIPPET = (
+    "import fleet_watch, pathlib; "
+    "print(pathlib.Path(fleet_watch.__file__).resolve().parent)"
+)
+
+
+def probe_fleet_watch_root(executable: str) -> str | None:
+    """Return the ``fleet_watch`` package directory a ``fleet`` executable loads.
+
+    ``None`` means *cannot prove* — missing, unreadable, no ``#!`` interpreter
+    line, or the probe timed out or failed. It never means "different".
+
+    The check is a real interpreter run rather than a path comparison because
+    every plausible-looking shortcut is wrong somewhere: an editable install
+    puts the repo on ``sys.path`` from a venv that lives somewhere else
+    entirely, a pipx copy keeps its own ``site-packages``, and a source
+    checkout has no venv at all. Only the interpreter can say which
+    ``fleet_watch`` it would actually import, so that is what is asked.
+
+    The console script's shebang names its interpreter, so the probe reuses the
+    very interpreter that binary would run under rather than guessing from
+    ``PATH`` — otherwise the probe could itself be answered by a third,
+    different installation.
+
+    The probe runs from a neutral cwd, never the caller's. ``python -c`` puts
+    the working directory first on ``sys.path``, so a probe launched while the
+    operator happens to be standing in a fleet-watch checkout would import
+    *that* tree and cheerfully report every binary on the machine as matching
+    it — the one answer that makes this check worthless. launchd likewise runs
+    the real job from a fixed cwd, so matching that is also the honest
+    comparison.
+    """
+    try:
+        script = Path(executable)
+        first_line = script.read_text(errors="replace").split("\n", 1)[0]
+    except OSError:
+        return None
+    if not first_line.startswith("#!"):
+        return None
+    interpreter = first_line[2:].strip().split(" ", 1)[0]
+    if not interpreter or not Path(interpreter).exists():
+        return None
+    try:
+        result = subprocess.run(
+            [interpreter, "-c", _PROBE_SNIPPET],
+            capture_output=True,
+            text=True,
+            timeout=LINEAGE_PROBE_TIMEOUT_SECONDS,
+            cwd=tempfile.gettempdir(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    return out or None
+
 # Template default for the staged plist. `fleet census --emit-launchd-plist`
 # substitutes the machine's own temp dir (cli.census), so the shared-/tmp
 # path only ever appears in the in-repo template, never in an installed agent.
