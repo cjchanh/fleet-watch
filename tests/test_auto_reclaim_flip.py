@@ -875,11 +875,12 @@ def test_fleet_status_text_names_the_flip_and_its_source(tmp_path, monkeypatch):
 def test_status_reports_off_when_the_config_file_cannot_be_read(monkeypatch):
     """Uncertainty reads as off, on the surface exactly as in the daemon.
 
-    Probed at the field's own seam rather than through the command:
-    ``reporter.build_state`` reads the config unguarded (see the CHILD_WORK note
-    on the report), so an unreadable config kills ``fleet status --json`` before
-    this field is ever added. What is under test here is only that the flip
-    surface itself never turns an unreadable config into anything but ``off``.
+    Probed at the field's own seam rather than through the command.
+    (``reporter.build_state`` degrades on an unreadable config via
+    ``_load_config_degraded``, so ``fleet status --json`` no longer dies
+    before this field is added.) What is under test here is only that the
+    flip surface itself never turns an unreadable config into anything but
+    ``off``.
     """
     def boom() -> dict[str, Any]:
         raise OSError("config unreadable")

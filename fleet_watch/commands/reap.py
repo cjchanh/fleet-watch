@@ -297,7 +297,7 @@ def _emit_verified(
 
 
 @click.command()
-@click.option("--confirm", is_flag=True, help="Kill and release orphan-confirmed processes")
+@click.option("--confirm", is_flag=True, help="Request release of orphan-confirmed candidates (policy-gated; default: report)")
 @click.option("--include-mcp", is_flag=True, default=False,
               help="Also reap dead-session MCP servers (opt-in; kill requires --confirm)")
 @click.option("--mcp", "mcp_surface", is_flag=True, default=False,

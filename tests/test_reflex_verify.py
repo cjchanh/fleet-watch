@@ -443,3 +443,35 @@ def test_cli_verify_reports_no_open_receipts(tmp_path):
     ])
     assert result.exit_code == 0, result.output
     assert "No open receipts." in result.output
+
+
+def test_escalation_keeps_the_goal_id_binding(tmp_path):
+    """Review S2 (2026-09-27): the TTL re-queue must carry the goal binding."""
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    clock = FakeClock()
+    report = reflex.emit(
+        [stale_finding()],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        goal_id="canonical_aefae214df0480ce",
+    )
+    finding_id = report.emitted[0]["finding_id"]
+    clock.advance(7200)
+    probe = RecordingProbe({finding_id: True})
+    result = reflex.verify_open(
+        probe=probe,
+        receipts_dir=receipts,
+        queue_dir=queue,
+        write=True,
+        ttl_seconds=3600,
+        clock=clock,
+    )
+    assert len(result.escalated) == 1
+    new_spec = Path(result.escalated[0]["spec_path"]).read_text(encoding="utf-8")
+    assert "goal_id: canonical_aefae214df0480ce" in new_spec
+    receipt = json.loads(next(receipts.glob("*.json")).read_text(encoding="utf-8"))
+    assert receipt["goal_id"] == "canonical_aefae214df0480ce"
+    assert receipt["requeues"] == 1

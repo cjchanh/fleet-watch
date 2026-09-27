@@ -13,7 +13,7 @@ from fleet_watch.cli_support import (
 )
 
 @click.command("runaway")
-@click.option("--kill", "do_kill", is_flag=True, help="SIGKILL flagged processes (default: dry-run)")
+@click.option("--kill", "do_kill", is_flag=True, help="Request termination of flagged runaways (policy-gated; default: dry-run report)")
 @click.option("--cpu-threshold", type=float, default=runaway.DEFAULT_CPU_THRESHOLD,
               help="CPU percentage threshold (default 90)")
 @click.option("--sustained-seconds", type=int, default=runaway.DEFAULT_SUSTAINED_SECONDS,

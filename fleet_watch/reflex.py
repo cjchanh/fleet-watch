@@ -772,6 +772,7 @@ def verify_open(
                 repo=repo,
                 evidence_hash=str(receipt.get("evidence_sha256") or ""),
                 escalation_note=note,
+                goal_id=receipt.get("goal_id"),
             )
             spec_path = Path(queue_dir) / f"{spec_id}.md"
             if write:
@@ -788,6 +789,7 @@ def verify_open(
                 min_ticks=int(receipt.get("min_ticks") or DEFAULT_MIN_TICKS),
                 previous=receipt,
                 escalation_note=note,
+                goal_id=receipt.get("goal_id"),
             )
             updated["requeues"] = requeues
             report.escalated.append(
