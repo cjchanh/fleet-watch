@@ -20,6 +20,57 @@ from fleet_watch.discovery import mcp_orphan_detector
 
 VERIFIED_MCP_MODE = "mcp-verified-reclaim"
 
+# --- the operator's auto-reclaim flip (spec 2626903's deliberate seam) ---------
+#
+# The verified reclaim path above is the ONLY thing permitted to signal an MCP
+# process. This flip decides whether the daemon is allowed to ask it to, and it
+# has exactly three states:
+#
+#   off       (DEFAULT) the daemon never asks; it behaves exactly as it did
+#                     before this flip existed — advisory surfacing only.
+#   dry_run           the daemon asks every tick, writes the decisions it would
+#                     make, and sends nothing at all.
+#   on                the daemon asks every tick and acts on the candidates the
+#                     verified path approves. The verified path's denials always
+#                     stand, so "on" is NOT a licence to signal.
+#
+# SOURCE: the `auto_reclaim` key in the fleet-watch config file
+# (~/.fleet-watch/config.json). It is the ONLY source — no environment variable
+# is consulted, deliberately: an ambient env var inherited by any child process
+# would be a second, invisible way to arm a kill path. The value is re-read on
+# every tick, so turning it off takes effect on the next tick.
+#
+# FAIL-CLOSED: anything that is not one of the three literals below resolves to
+# `off` — a missing key, a non-string, an unknown spelling, a config that fails
+# to load. Uncertainty is never read as permission.
+AUTO_RECLAIM_OFF = "off"
+AUTO_RECLAIM_DRY_RUN = "dry_run"
+AUTO_RECLAIM_ON = "on"
+AUTO_RECLAIM_STATES = (AUTO_RECLAIM_OFF, AUTO_RECLAIM_DRY_RUN, AUTO_RECLAIM_ON)
+AUTO_RECLAIM_CONFIG_KEY = "auto_reclaim"
+
+
+def resolve_auto_reclaim(config: dict[str, Any] | None = None) -> str:
+    """Return the operator's auto-reclaim flip: one of the three states, else OFF.
+
+    ``config`` is injectable so callers (and tests) can resolve a flip without
+    touching the real config file. A None config means "read it fresh now" —
+    the daemon deliberately re-reads every tick so that flipping OFF takes
+    effect immediately rather than at the next process start.
+    """
+    try:
+        if config is None:
+            config = discover_mod.load_config()
+        if not isinstance(config, dict):
+            return AUTO_RECLAIM_OFF
+        value = config.get(AUTO_RECLAIM_CONFIG_KEY)
+    except Exception:  # noqa: BLE001 — an unreadable flip is OFF, never a guess
+        return AUTO_RECLAIM_OFF
+    if not isinstance(value, str):
+        return AUTO_RECLAIM_OFF
+    normalized = value.strip().lower()
+    return normalized if normalized in AUTO_RECLAIM_STATES else AUTO_RECLAIM_OFF
+
 
 def _mcp_identity_probes() -> process_policy.Probes:
     """Path 1 probes (kernel identity). Seam: tests inject fakes."""
@@ -74,14 +125,31 @@ def _log_reclaim_decision(
     return receipt
 
 
-def _mcp_verified_reclaim(*, do_kill: bool, do_kill_force: bool, as_json: bool) -> None:
-    """`fleet reap --mcp --verify` — two-path verified reclaim of MCP orphans.
+def verified_reclaim_pass(
+    conn: sqlite3.Connection,
+    *,
+    do_kill: bool,
+    do_kill_force: bool,
+    probes: process_policy.Probes | None = None,
+    reclaim: process_policy.ReclaimProbes | None = None,
+    sender: Any = None,
+) -> tuple[dict[str, Any], list[process_policy.ProcessDecision]]:
+    """Run one verified reclaim pass and return ``(payload, plans)``.
 
-    Dry-run unless ``--kill``. Phase order is load-bearing: capture, decide,
-    AUDIT, act, audit. Nothing is signalled before its decision receipt is in
-    the chain, and a denied or dry-run plan never reaches a signal at all.
+    This is the whole governed path, factored out of the Click command so the
+    daemon and the CLI run the SAME code. It is not a policy of its own: the
+    only thing a caller chooses is ``do_kill``, and even then a signal requires
+    an authorized plan that re-proves both paths at the moment of action.
+
+    Phase order is load-bearing and unchanged: capture, decide, AUDIT, act,
+    audit. Every decision is receipted BEFORE any signal is sent, so a decision
+    that cannot be written down is not acted on. A scan error is returned as
+    ``scan_error`` on the payload — an unscannable host is UNKNOWN, never
+    "nothing to clean" — and never as an exception or a signal.
+
+    The ``probes``/``reclaim``/``sender`` parameters default to the same seams
+    the CLI uses; they exist so a caller can inject a test world.
     """
-    conn = _get_conn()
     payload: dict[str, Any] = {
         "mode": VERIFIED_MCP_MODE,
         "verify": True,
@@ -98,73 +166,90 @@ def _mcp_verified_reclaim(*, do_kill: bool, do_kill_force: bool, as_json: bool) 
         "denied": [],
         "failed": [],
     }
-    try:
-        candidates, scan_error = mcp_orphan_detector.scan_candidates()
-        if scan_error:
-            # An unscannable host is UNKNOWN, never "nothing to clean".
-            payload["scan_error"] = scan_error
-            payload["candidate_count"] = 0
-            _emit_verified(payload, as_json, [])
-            sys.exit(1)
+    plans: dict[int, process_policy.ProcessDecision] = {}
 
+    candidates, scan_error = mcp_orphan_detector.scan_candidates()
+    if scan_error:
+        payload["scan_error"] = scan_error
+        payload["candidate_count"] = 0
+        return payload, []
+
+    if probes is None:
         probes = _mcp_identity_probes()
+    if reclaim is None:
         reclaim = _mcp_reclaim_probes(conn)
+    if sender is None:
         sender = _mcp_signal_sender()
 
-        # Phase 1 — capture each candidate's identity snapshot.
-        snapshots: dict[int, Any] = {}
-        claims: dict[int, process_policy.MCPOwnerClaim] = {}
-        for candidate in candidates:
-            claim = _owner_claim(candidate)
-            claims[candidate.pid] = claim
-            snapshots[candidate.pid] = process_policy.capture_mcp_identity(
-                candidate.pid, probes=probes, claim=claim,
+    # Phase 1 — capture each candidate's identity snapshot.
+    snapshots: dict[int, Any] = {}
+    claims: dict[int, process_policy.MCPOwnerClaim] = {}
+    for candidate in candidates:
+        claim = _owner_claim(candidate)
+        claims[candidate.pid] = claim
+        snapshots[candidate.pid] = process_policy.capture_mcp_identity(
+            candidate.pid, probes=probes, claim=claim,
+        )
+        payload["candidates"].append({
+            **candidate.to_dict(),
+            "snapshot_captured": snapshots[candidate.pid] is not None,
+        })
+    payload["candidate_count"] = len(candidates)
+
+    # Phase 2 — decide (identity re-validated against the snapshot + the
+    # independent second path). Pure: no signal is possible here.
+    for candidate in candidates:
+        pid = candidate.pid
+        plan = process_policy.decide_mcp_reclaim(
+            pid, snapshots[pid], claims[pid],
+            probes=probes, reclaim=reclaim, kill=do_kill,
+        )
+        plans[pid] = plan
+        payload["decisions"].append(plan.to_dict())
+
+    # Phase 3 — audit every decision BEFORE any signal.
+    for pid, plan in plans.items():
+        _log_reclaim_decision(conn, plan, "plan")
+
+    # Phase 4 — act on authorized plans only.
+    for pid, plan in plans.items():
+        final = plan
+        if plan.authorized and plan.action == process_policy.RECLAIM_ACTION_SIGTERM:
+            final = process_policy.execute_mcp_reclaim(
+                plan, snapshots[pid], claims[pid],
+                probes=probes, reclaim=reclaim, force=do_kill_force,
+                sender=sender,
             )
-            payload["candidates"].append({
-                **candidate.to_dict(),
-                "snapshot_captured": snapshots[candidate.pid] is not None,
-            })
-        payload["candidate_count"] = len(candidates)
+            _log_reclaim_decision(conn, final, "outcome")
+        if final.outcome == process_policy.RECLAIM_OUTCOME_EXITED:
+            payload["exited"].append(final.to_dict())
+        elif final.outcome == process_policy.RECLAIM_OUTCOME_DENIED:
+            payload["denied"].append(final.to_dict())
+        elif final.outcome in {
+            process_policy.RECLAIM_OUTCOME_SURVIVED,
+            process_policy.RECLAIM_OUTCOME_FAILED,
+        }:
+            payload["failed"].append(final.to_dict())
+    return payload, list(plans.values())
 
-        # Phase 2 — decide (identity re-validated against the snapshot + the
-        # independent second path). Pure: no signal is possible here.
-        plans: dict[int, process_policy.ProcessDecision] = {}
-        for candidate in candidates:
-            pid = candidate.pid
-            plan = process_policy.decide_mcp_reclaim(
-                pid, snapshots[pid], claims[pid],
-                probes=probes, reclaim=reclaim, kill=do_kill,
-            )
-            plans[pid] = plan
-            payload["decisions"].append(plan.to_dict())
 
-        # Phase 3 — audit every decision BEFORE any signal.
-        for pid, plan in plans.items():
-            _log_reclaim_decision(conn, plan, "plan")
+def _mcp_verified_reclaim(*, do_kill: bool, do_kill_force: bool, as_json: bool) -> None:
+    """`fleet reap --mcp --verify` — two-path verified reclaim of MCP orphans.
 
-        # Phase 4 — act on authorized plans only.
-        for pid, plan in plans.items():
-            final = plan
-            if plan.authorized and plan.action == process_policy.RECLAIM_ACTION_SIGTERM:
-                final = process_policy.execute_mcp_reclaim(
-                    plan, snapshots[pid], claims[pid],
-                    probes=probes, reclaim=reclaim, force=do_kill_force,
-                    sender=sender,
-                )
-                _log_reclaim_decision(conn, final, "outcome")
-            if final.outcome == process_policy.RECLAIM_OUTCOME_EXITED:
-                payload["exited"].append(final.to_dict())
-            elif final.outcome == process_policy.RECLAIM_OUTCOME_DENIED:
-                payload["denied"].append(final.to_dict())
-            elif final.outcome in {
-                process_policy.RECLAIM_OUTCOME_SURVIVED,
-                process_policy.RECLAIM_OUTCOME_FAILED,
-            }:
-                payload["failed"].append(final.to_dict())
+    Dry-run unless ``--kill``. A thin Click shell over :func:`verified_reclaim_pass`:
+    the policy, the phase order and the receipts are that function's, unchanged.
+    """
+    conn = _get_conn()
+    try:
+        payload, plans = verified_reclaim_pass(
+            conn, do_kill=do_kill, do_kill_force=do_kill_force,
+        )
     finally:
         conn.close()
 
-    _emit_verified(payload, as_json, plans.values())
+    _emit_verified(payload, as_json, plans)
+    if payload.get("scan_error"):
+        sys.exit(1)
     if do_kill and (payload["failed"] or payload["denied"]):
         sys.exit(1)
 

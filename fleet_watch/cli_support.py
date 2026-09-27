@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import queue
@@ -596,6 +597,11 @@ def _finish_notification(
 def _send_notification(title: str, body: str) -> dict[str, Any]:
     """Send a notification without any unbounded wait after timeout.
 
+    Design polarity (2026-09-27): the bounded subprocess path here is the
+    committed contract — tests/test_cli.py pins its status-dict result. The
+    0.4.x campaign had briefly simplified this to a bare subprocess.run; the
+    sep-10 reunion (18d4b97) restored the bounded path as the single source.
+
     One unresolved helper is retained in memory and recorded in Fleet state.
     Further attempts are suppressed until its PID is gone, preventing stuck
     osascript accumulation across both watch ticks and launchd invocations.
@@ -799,6 +805,139 @@ def _is_fleet_owned(conn: sqlite3.Connection, proc: runaway.RunawayProcess) -> b
     )
 
 
+def _auto_reclaim_receipts(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    flip: str,
+    mode: str,
+) -> list[dict[str, Any]]:
+    """Receipt the flip's own verdict for every decision the verified pass made.
+
+    One PROCESS_DECISION per candidate carrying the three facts an auditor needs
+    and the pass's receipts do not state on their own: which flip was in force,
+    whether this candidate WOULD have been reaped (``would_act``), and whether a
+    signal was actually sent (``acted``). ``would_act`` is the dry-run channel —
+    it is how the operator sees what arming the flip would do before arming it.
+    """
+    signaled = {
+        d.get("pid")
+        for d in list(payload.get("exited", [])) + list(payload.get("failed", []))
+    }
+    authorized_outcomes = {
+        process_policy.RECLAIM_OUTCOME_REPORTED,
+        process_policy.RECLAIM_OUTCOME_ALLOWED,
+    }
+    written: list[dict[str, Any]] = []
+    for decision in payload.get("decisions", []):
+        pid = decision.get("pid")
+        detail = {
+            "phase": "auto_reclaim",
+            "mode": mode,
+            "flip": flip,
+            "would_act": decision.get("outcome") in authorized_outcomes,
+            "acted": pid in signaled,
+            "receipt": decision,
+        }
+        try:
+            events.log_event(
+                conn,
+                "PROCESS_DECISION",
+                pid=pid,
+                workstream="mcp_reclaim",
+                detail=detail,
+            )
+        except Exception:  # noqa: BLE001 — an unwritable chain denies, never permits
+            return written
+        written.append(detail)
+    return written
+
+
+def _run_auto_reclaim_tick(
+    conn: sqlite3.Connection,
+    auto_reclaim: str | None = None,
+) -> dict[str, Any]:
+    """One daemon tick of the operator's auto-reclaim flip (spec 2626903's seam).
+
+    Three states, resolved FRESH every tick so that flipping OFF takes effect on
+    the very next tick rather than at the next process start:
+
+      off       the default, and the only state that existed before this flip.
+                Returns before scanning anything: no receipts, no signals, no
+                output — the daemon behaves exactly as it did.
+      dry_run   runs the verified pass in its dry-run mode, receipts what it
+                would do, and sends nothing at all.
+      on        runs the verified pass in kill mode with force DISABLED, so the
+                flip authorises one graceful SIGTERM per verified candidate and
+                never a SIGKILL. The verified path's denials always stand: "on"
+                is a request to evaluate, not a licence to signal.
+
+    The flip lives in the config file only (`auto_reclaim`, see
+    ``reap.resolve_auto_reclaim``); no environment variable can arm it.
+
+    Every uncertainty denies. A tick that cannot read the flip, cannot run the
+    pass, or cannot write its receipts acts on nothing it cannot prove, and a
+    tick error must never crash the watch loop that called it.
+    """
+    # Imported here, not at module scope: fleet_watch.commands.reap imports this
+    # module at import time, so a top-level import would be a cycle. And it must
+    # be importlib, NOT `from fleet_watch.commands import reap` — that name on
+    # the package is the Click `reap` command, not this module (the same
+    # shadowing fleet_watch.cli documents for tests). A plain attribute import
+    # here would raise AttributeError, which the fail-closed guard below would
+    # swallow into a permanent, silent `off`.
+    reap_mod = importlib.import_module("fleet_watch.commands.reap")
+
+    result: dict[str, Any] = {
+        "flip": "off", "considered": 0, "would_act": 0, "acted": 0, "denied": 0,
+    }
+    try:
+        flip = auto_reclaim if auto_reclaim is not None else reap_mod.resolve_auto_reclaim()
+        if flip not in reap_mod.AUTO_RECLAIM_STATES:
+            flip = reap_mod.AUTO_RECLAIM_OFF  # an invented value is never permission
+    except Exception:  # noqa: BLE001 — an unreadable flip is off, not a guess
+        return result
+    result["flip"] = flip
+    if flip == reap_mod.AUTO_RECLAIM_OFF:
+        return result  # exactly today's behaviour: no scan, no receipt, no signal
+
+    try:
+        payload, _plans = reap_mod.verified_reclaim_pass(
+            conn,
+            do_kill=(flip == reap_mod.AUTO_RECLAIM_ON),
+            do_kill_force=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — a failed pass reports, it does not act
+        result["error"] = f"{type(exc).__name__}:{exc}"
+        return result
+
+    scan_error = payload.get("scan_error")
+    if scan_error:
+        result["scan_error"] = scan_error  # UNKNOWN is never "nothing to clean"
+        return result
+
+    result["considered"] = len(payload.get("decisions", []))
+    receipts = _auto_reclaim_receipts(conn, payload, flip, reap_mod.VERIFIED_MCP_MODE)
+    result["would_act"] = sum(1 for r in receipts if r["would_act"])
+    result["acted"] = sum(1 for r in receipts if r["acted"])
+    result["denied"] = len(payload.get("denied", []))
+
+    outcomes = {
+        d.get("pid"): d.get("outcome")
+        for d in list(payload.get("exited", [])) + list(payload.get("failed", []))
+    }
+    for detail in receipts:
+        decision = detail["receipt"]
+        pid, reason = decision.get("pid"), decision.get("reason")
+        if detail["acted"]:
+            status = f"SIGTERM → {outcomes.get(pid)}"
+        elif detail["would_act"]:
+            status = f"would SIGTERM (verified), {reason}"
+        else:
+            status = f"denied — {reason}"
+        click.echo(f"AUTO-RECLAIM ({flip}): PID {pid} — {status}")
+    return result
+
+
 def _run_runaway_tick(
     conn: sqlite3.Connection,
     tracker: runaway.DaemonRunawayTracker,
@@ -810,7 +949,17 @@ def _run_runaway_tick(
     CPU/runtime is advisory. A signal is attempted only when an explicit
     disposable registration and the shared identity contract are both present;
     this daemon does not manufacture missing parent/session/stdio evidence.
+
+    This tick is also where the operator's MCP auto-reclaim flip is evaluated
+    (see :func:`_run_auto_reclaim_tick`) — it is the daemon's only recurring
+    seam, and the flip defaults to off, so the cost at rest is one config read.
+    It is invoked before the tracker and shares none of the tracker's health,
+    so a broken tracker can neither suppress nor trigger it.
     """
+    try:
+        _run_auto_reclaim_tick(conn)
+    except Exception:  # noqa: BLE001 — a failed tick must not crash discover
+        pass
     try:
         newly_flagged = tracker.tick()
     except Exception:  # noqa: BLE001 — tick failure must not crash discover; no guard reads this

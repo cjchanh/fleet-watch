@@ -828,9 +828,12 @@ def _census_identity_window(cmd: str) -> str:
 
     argv[0] + flag NAMES (inline values stripped at ``=``) + the interpreter's
     script token. Argument VALUES never enter the window, so a /codex-... path
-    mentioned in an ordinary argument can never relabel the process. Splitting
-    on whitespace is approximate under quoted spaces; the failure mode is a
-    missed census row (allowed by design), never a mislabel.
+    mentioned in an ordinary argument cannot relabel the process. One pinned
+    boundary remains: a value that itself starts with ``-`` is indistinguishable
+    from a flag name and can still carry a family token into the window
+    (pinned in tests/test_session_identity_adversary.py). Splitting on
+    whitespace is approximate under quoted spaces; the failure mode is a
+    missed census row (allowed by design).
     """
     tokens = cmd.split()
     if not tokens:
