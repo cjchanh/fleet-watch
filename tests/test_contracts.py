@@ -130,6 +130,7 @@ def test_guard_state_contract_shape(tmp_path, monkeypatch):
     state = reporter.build_guard_state(conn)
     assert set(state.keys()) == {
         "agent_interface",
+        "config_degraded",
         "generated_utc",
         "processes",
         "external_resources",
@@ -191,6 +192,7 @@ def test_state_json_contract_shape(tmp_path, monkeypatch):
 
     assert set(state.keys()) == {
         "agent_interface",
+        "config_degraded",
         "generated_utc",
         "processes",
         "external_resources",

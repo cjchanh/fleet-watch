@@ -72,6 +72,7 @@ while running:
 
 STATE_KEYS = {
     "agent_interface",
+    "config_degraded",
     "generated_utc",
     "processes",
     "external_resources",
