@@ -7,6 +7,7 @@ import sys
 
 import click
 
+from fleet_watch import __version__
 from fleet_watch import cli_support as _cli_support
 from fleet_watch.commands import register_all
 from fleet_watch.commands.census import boot_coverage, boot_map, census
@@ -36,6 +37,7 @@ from fleet_watch.commands.session import (
 from fleet_watch.commands.sitrep import sitrep
 from fleet_watch.commands.status import (
     changelog,
+    decisions,
     health,
     history,
     reconcile,
@@ -126,7 +128,7 @@ class FleetGroup(click.Group):
 
 
 @click.group(cls=FleetGroup)
-@click.version_option(package_name="fleet-watch")
+@click.version_option(version=__version__, package_name="fleet-watch")
 def cli():
     """Fleet Watch — local process governance, plus read-only GitHub fleet sitrep."""
     pass

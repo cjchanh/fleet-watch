@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -145,37 +144,39 @@ def scan_runaways(
 MIN_SAFE_PID = 100  # Never kill kernel threads or core system daemons
 
 
-def kill_runaway(pid: int) -> bool:
-    """Send SIGKILL to a runaway process. Returns True if process is gone."""
-    if pid < MIN_SAFE_PID:
-        return False
-    if pid == os.getpid() or pid == os.getppid():
-        return False
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
+def kill_runaway(
+    pid: int,
+    *,
+    candidate: dict[str, Any] | None = None,
+    disposable_registration: dict[str, Any] | None = None,
+    operator_confirmed: bool = False,
+    allow_force: bool = False,
+) -> bool:
+    """Compatibility wrapper around the shared fail-closed process policy.
 
-    # Brief wait to confirm
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False
-        time.sleep(0.05)
+    CPU/runtime and a bare PID are never authorization.  Callers must pass the
+    candidate evidence and explicit disposable registration; force remains
+    separately gated.
+    """
+    from fleet_watch import process_policy
 
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
+    identity = process_policy.snapshot_process(pid)
+    decision = process_policy.evaluate(
+        identity,
+        candidate=candidate,
+        disposable_registration=disposable_registration,
+        operator_confirmed=operator_confirmed,
+        allow_force=allow_force,
+    )
+    if not decision.allowed:
         return False
-    return False
+    outcome = process_policy.revalidate_and_terminate(
+        decision,
+        candidate=candidate,
+        disposable_registration=disposable_registration,
+        allow_force=allow_force,
+    )
+    return outcome.outcome == "exited"
 
 
 @dataclass

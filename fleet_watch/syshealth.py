@@ -25,6 +25,11 @@ from fleet_watch.constants import PS_BIN, SYSCTL_BIN, VM_STAT_BIN
 #   process_match — the CENSUS regex. Narrow on purpose: it answers "is this
 #                   process a live agent session worth counting", so it may
 #                   miss an idle or oddly-invoked runtime without harm.
+#                   Roster entries carry match_scope="identity": the regex runs
+#                   against the executable-identity WINDOW (argv[0] + flag
+#                   names + the interpreter's script), never against arbitrary
+#                   argument values, so a /codex-... path mentioned in an
+#                   ordinary argument can never relabel the process.
 #   binary        — the AUTHORIZATION name (registry._agent_runtime_in_ancestry).
 #                   Matched against every argv token's basename, so it catches a
 #                   runtime the census regex would skip. Authorization asks the
@@ -35,31 +40,44 @@ from fleet_watch.constants import PS_BIN, SYSCTL_BIN, VM_STAT_BIN
 #
 # Keeping both fields in one table is the point: a runtime added for the census
 # is simultaneously known to the authorization path, and a runtime that is
-# invisible to authorization is visibly missing from the census too.
+# invisible to authorization is visibly missing from the census too. Custom
+# patterns (config-supplied dicts without match_scope) keep whole-command
+# semantics — that API intentionally matches arbitrary commands.
 DEFAULT_SESSION_PATTERNS: list[dict[str, str]] = [
     {
         "name": "Claude Code",
         "kind": "claude-code",
         "process_match": r"/claude\b.*--",
         "binary": "claude",
+        "match_scope": "identity",
     },
     {
         "name": "Codex",
         "kind": "codex",
         "process_match": r"/codex\b",
         "binary": "codex",
+        "match_scope": "identity",
+    },
+    {
+        "name": "Devin",
+        "kind": "devin",
+        "process_match": r"/devin\b",
+        "binary": "devin",
+        "match_scope": "identity",
     },
     {
         "name": "OpenCode",
         "kind": "opencode",
         "process_match": r"/opencode\b",
         "binary": "opencode",
+        "match_scope": "identity",
     },
     {
         "name": "Grok CLI",
         "kind": "grok",
         "process_match": r"/grok\b",
         "binary": "grok",
+        "match_scope": "identity",
     },
 ]
 
@@ -641,14 +659,17 @@ def get_session_processes(
 
     lines = _ps_aux_lines()
     raw_matches: list[dict[str, Any]] = []
+    need_window = any(scope == "identity" for *_, scope in compiled)
 
     for parts in lines:
         cmd = parts[10]
         matched_name = None
         matched_kind = None
+        identity_window = _census_identity_window(cmd) if need_window else ""
 
-        for regex, name, kind in compiled:
-            if regex.search(cmd):
+        for regex, name, kind, scope in compiled:
+            hay = identity_window if scope == "identity" else cmd
+            if regex.search(hay):
                 matched_name = name
                 matched_kind = kind
                 break
@@ -690,13 +711,21 @@ def get_session_processes(
         for m in members:
             cursor = m["pid"]
             ppid = m["ppid"]
-            while ppid in by_pid:
+            walked: set[int] = {cursor}
+            while ppid in by_pid and ppid not in walked:
+                walked.add(ppid)
                 cursor = ppid
                 ppid = by_pid[cursor]["ppid"]
-            # cursor is the topmost member; ppid is its external parent.
-            # Siblings spawned by the same external parent share ppid here,
-            # so use ppid as the family key when it exists.
-            family = ppid if ppid is not None else cursor
+            if ppid in walked:
+                # Parent cycle among matched rows: no topmost member exists.
+                # Canonicalize to the smallest pid in the cycle so every member
+                # derives the same family key; the walk must always terminate.
+                family = min(walked)
+            else:
+                # cursor is the topmost member; ppid is its external parent.
+                # Siblings spawned by the same external parent share ppid here,
+                # so use ppid as the family key when it exists.
+                family = ppid if ppid is not None else cursor
             grouped.setdefault((kind, pgid, family), []).append(m)
 
     sessions: list[SessionProcess] = []
@@ -763,8 +792,13 @@ def get_session_processes(
 
 def _compile_session_patterns(
     patterns: list[dict[str, str]],
-) -> list[tuple[re.Pattern, str, str]]:
-    """Compile session pattern dicts to (regex, name, kind) tuples."""
+) -> list[tuple[re.Pattern, str, str, str]]:
+    """Compile session pattern dicts to (regex, name, kind, match_scope) tuples.
+
+    ``match_scope`` is ``"identity"`` (match the executable-identity window) or
+    ``"command"`` (legacy whole-command match). Custom dicts default to
+    ``"command"`` so the documented custom-pattern API cannot silently narrow.
+    """
     compiled = []
     for p in patterns:
         try:
@@ -772,10 +806,45 @@ def _compile_session_patterns(
                 re.compile(p["process_match"]),
                 p["name"],
                 p["kind"],
+                p.get("match_scope", "command"),
             ))
         except (KeyError, re.error):
             continue
     return compiled
+
+
+# Interpreters whose FIRST non-flag argument is the launched script:
+# `node /opt/homebrew/bin/codex …` is a Codex session even though the
+# executable is node. Shells are deliberately absent — `sh -c "…"` strings are
+# the classic argument-injection surface, and a missed census row is allowed
+# while a mislabel is the bug this replaces.
+_INTERPRETER_BASENAMES = re.compile(
+    r"^(node|nodejs|deno|bun|python|python2|python3)(\.\d+)?$"
+)
+
+
+def _census_identity_window(cmd: str) -> str:
+    """Executable-identity window for CENSUS matching (roster entries only).
+
+    argv[0] + flag NAMES (inline values stripped at ``=``) + the interpreter's
+    script token. Argument VALUES never enter the window, so a /codex-... path
+    mentioned in an ordinary argument can never relabel the process. Splitting
+    on whitespace is approximate under quoted spaces; the failure mode is a
+    missed census row (allowed by design), never a mislabel.
+    """
+    tokens = cmd.split()
+    if not tokens:
+        return ""
+    window = [tokens[0]]
+    is_interpreter = bool(_INTERPRETER_BASENAMES.match(Path(tokens[0]).name))
+    script_taken = False
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            window.append(token.split("=", 1)[0])
+        elif is_interpreter and not script_taken:
+            window.append(token)
+            script_taken = True
+    return " ".join(window)
 
 
 # --- Idle detection ---

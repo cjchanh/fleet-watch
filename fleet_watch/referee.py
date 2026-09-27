@@ -6,7 +6,6 @@ import errno
 import json
 import os
 import re
-import signal
 import socket
 import sqlite3
 import subprocess
@@ -18,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fleet_watch import events, registry
+from fleet_watch import events, process_policy, registry
 from fleet_watch.constants import LSOF_BIN, NETSTAT_BIN, SS_BIN
 
 
@@ -307,19 +306,25 @@ def _parse_lsof(output: str) -> list[tuple[int, int]]:
     return pairs
 
 
-def socket_table_listeners() -> list[tuple[int, int]] | None:
+def socket_table_listeners(timeout: float | None = None) -> list[tuple[int, int]] | None:
     """Return every ``(pid, port)`` TCP LISTEN pair the OS will show us.
 
     ``None`` means no enumeration tool ran at all — distinct from ``[]``,
     which means a tool ran and saw nothing listening. Callers must not read
-    ``None`` as "nothing is listening".
+    ``None`` as "nothing is listening". ``timeout`` lets discovery spend only
+    the remaining portion of its aggregate budget on this probe.
     """
     parsers = {"ss": _parse_ss, "netstat": _parse_netstat, "lsof": _parse_lsof}
     ran_any = False
+    per_probe = 5.0 if timeout is None else max(0.05, min(5.0, float(timeout)))
     for name, argv in _LISTENER_SOURCES:
         try:
             completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=5, check=False
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=per_probe,
+                check=False,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
             continue
@@ -1481,26 +1486,45 @@ def preempt_port(
         },
     )
 
-    # Send SIGTERM to the holder
-    try:
-        os.kill(holder["pid"], signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already dead
+    # Re-observe immediately before the signal. The typed policy owns the
+    # signal path; a stale/reused holder or a newly protected process is denied
+    # rather than passed to os.kill by integer identity.
+    fresh = process_policy.snapshot_process(holder["pid"])
+    recorded = process_policy.RecordedIdentity(
+        pid=holder["pid"],
+        create_time=str(holder.get("start_create_time") or ""),
+        exe=fresh.executable if fresh else "",
+        uid=fresh.uid if fresh else -1,
+        evidence=process_policy.OwnerEvidence(
+            session_id=str(holder.get("session_id") or ""),
+            owner=str(holder.get("name") or ""),
+            status="idle",
+            kind="user",
+        ),
+    )
+    probes = process_policy.default_probes()
+    receipt = process_policy.terminate_gracefully(
+        recorded,
+        probes,
+        sender=os.kill,
+        grace_seconds=float(grace_seconds),
+    )
+    if receipt.outcome != process_policy.OUTCOME_EXITED:
+        return Decision(
+            allowed=False,
+            reason=(
+                f"preempt denied for PID {holder['pid']} ({holder['name']}): "
+                f"{receipt.reason}"
+            ),
+            holder=holder,
+            evidence={"decision_receipt": receipt.to_dict()},
+        )
 
-    # Wait for grace period
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(holder["pid"], 0)
-            time.sleep(1)
-        except ProcessLookupError:
-            break  # Process exited
-
-    # Force-release claims
+    # Release only after a verified graceful exit. A survivor keeps its claim.
     registry.release_process(conn, holder["pid"])
-
     return Decision(
         allowed=True,
         reason=f"preempted PID {holder['pid']} ({holder['name']}) for: {reason}",
         holder=holder,
+        evidence={"decision_receipt": receipt.to_dict()},
     )

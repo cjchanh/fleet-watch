@@ -13,6 +13,7 @@ from fleet_watch.cli_support import (
     _get_conn,
     _notify_attention,
     _run_bounded,
+    _run_bounded_result,
 )
 from fleet_watch.discovery import ollama_runners, orphan_detector
 
@@ -27,27 +28,28 @@ def status(as_json: bool):
         events.log_event(conn, "CLEAN", pid=c["pid"], workstream=c["workstream"],
                          detail={"reason": "dead_pid", "name": c["name"]})
 
-    # H1: discover ollama runners. Bounded (see _run_bounded docstring) --
-    # a slow/loaded box or several stacked runners must degrade to an empty
-    # scan, never hang the command past STATUS_DISCOVERY_TIMEOUT_SECONDS.
+    # H1: discover ollama runners. The bounded helper returns an explicit
+    # reason; an exception is not reported as a clean empty scan.
     discovery_timeout = float(STATUS_DISCOVERY_TIMEOUT_SECONDS)
-    runner_reports, ollama_scan_timed_out = _run_bounded(
+    runner_reports, runner_reason = _run_bounded_result(
         ollama_runners.discover_ollama_runners,
         timeout_seconds=discovery_timeout,
         default=[],
     )
+    ollama_scan_timed_out = runner_reason in {"timeout", "in_flight"}
     runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
     actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
 
-    # H3: detect orphan runners. Same bound -- the HTTP probe against a
-    # local ollama port already carries its own socket timeout, but a
-    # hung/black-holed port could still stall this call past the CLI's
-    # advisory response budget without an outer bound.
-    orphan_result, orphan_probe_timed_out = _run_bounded(
+    # H3: detect orphan runners. Same bound, with a distinct error state for
+    # timeout, already-in-flight work, and an exception.
+    orphan_result, orphan_reason = _run_bounded_result(
         orphan_detector.detect_orphans,
         timeout_seconds=discovery_timeout,
-        default=orphan_detector.OrphanDetectionResult(error="probe_timed_out"),
+        default=orphan_detector.OrphanDetectionResult(),
     )
+    orphan_probe_timed_out = orphan_reason in {"timeout", "in_flight"}
+    if orphan_reason in {"timeout", "in_flight", "error"}:
+        orphan_result.error = f"probe_{orphan_reason}"
     if orphan_result.orphans_detected:
         events.log_event(
             conn,
@@ -69,12 +71,31 @@ def status(as_json: bool):
         # bounded call above returned on time, then build_state() re-ran the
         # same unbounded probe and blocked on it.
         state = reporter.build_state(
-            conn, runner_reports=runner_reports, orphan_result=orphan_result
+            conn,
+            runner_reports=runner_reports,
+            orphan_result=orphan_result,
+            bounded=True,
         )
-        state["discovery_degraded"] = {
+        degraded_payload = {
+            # Legacy booleans remain additive-compatible for existing panel and
+            # hook consumers; the reason fields carry the honest distinction.
             "ollama_runner_scan_timed_out": ollama_scan_timed_out,
             "orphan_probe_timed_out": orphan_probe_timed_out,
         }
+        if runner_reason is not None or orphan_reason is not None:
+            degraded_payload.update(
+                {
+                    "ollama_runner_scan": {
+                        "degraded": runner_reason is not None,
+                        "reason": runner_reason,
+                    },
+                    "orphan_probe": {
+                        "degraded": orphan_reason is not None,
+                        "reason": orphan_reason,
+                    },
+                }
+            )
+        state["discovery_degraded"] = degraded_payload
         click.echo(json.dumps(state, indent=2, default=str))
     else:
         procs = registry.get_all_processes(conn)
@@ -132,15 +153,15 @@ def status(as_json: bool):
             click.echo(f"  Estimated recovered: {orphan_result.estimated_recovered_mb:,} MB")
             click.echo(f"  Suggested: {orphan_result.suggested_kill_command}")
 
-        if ollama_scan_timed_out or orphan_probe_timed_out:
+        if runner_reason is not None or orphan_reason is not None:
             degraded = []
-            if ollama_scan_timed_out:
-                degraded.append("ollama runner scan")
-            if orphan_probe_timed_out:
-                degraded.append("orphan probe")
+            if runner_reason is not None:
+                degraded.append(f"ollama runner scan ({runner_reason})")
+            if orphan_reason is not None:
+                degraded.append(f"orphan probe ({orphan_reason})")
             click.echo(
-                f"\nDEGRADED: {', '.join(degraded)} exceeded "
-                f"{discovery_timeout}s and was skipped this run."
+                f"\nDEGRADED/UNKNOWN: {', '.join(degraded)}; "
+                "no clean-empty claim was made."
             )
 
     conn.close()
@@ -240,6 +261,49 @@ def reconcile(as_json: bool):
         click.echo(
             f"PID {item['pid']} ({item['name']}) — {item['classification']}"
             + (f" — {evidence}" if evidence else "")
+        )
+
+
+@click.command("decisions")
+@click.option("--hours", type=int, default=24, help="Hours of decision receipts to include")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON")
+def decisions(hours: int, as_json: bool):
+    """Expose bounded process-policy receipts and their freshness."""
+    conn = _get_conn()
+    rows = events.get_events(
+        conn, hours=hours, event_type="PROCESS_DECISION", limit=100
+    )
+    receipts = [row.get("detail", {}).get("receipt", {}) for row in rows]
+    generated = registry._now_iso()
+    latest_ts = rows[0].get("timestamp") if rows else None
+    if latest_ts is None:
+        freshness = {"status": "unknown", "latest_event": None}
+    else:
+        age = registry._age_seconds(latest_ts)
+        freshness = {
+            "status": "fresh" if age is not None and age <= 300 else "stale",
+            "latest_event": latest_ts,
+            "age_seconds": age,
+        }
+    payload = {
+        "schema_version": "fleet-watch/decision-feed/v1",
+        "generated_utc": generated,
+        "freshness": freshness,
+        "receipts": receipts,
+    }
+    conn.close()
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        return
+    if not receipts:
+        click.echo("No process decision receipts.")
+        return
+    click.echo(f"Decision receipts: {len(receipts)} ({freshness['status']})")
+    for receipt in receipts[:20]:
+        click.echo(
+            f"PID {receipt.get('observed_identity', {}).get('pid', '?')} — "
+            f"{receipt.get('permitted_action', '?')} — {receipt.get('outcome', '?')} — "
+            f"{receipt.get('reason', '?')}"
         )
 
 

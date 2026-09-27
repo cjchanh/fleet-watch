@@ -293,8 +293,8 @@ class TestRunawayCLI:
         assert payload["flagged"][0]["pid"] == 12345
         assert payload["killed"] == []
 
-    def test_kill_mode_sends_kill_and_logs(self, tmp_path, monkeypatch):
-        """fleet runaway --kill terminates processes and logs events."""
+    def test_kill_mode_refuses_unregistered_process(self, tmp_path, monkeypatch):
+        """fleet runaway --kill refuses a CPU-only unregistered process."""
         _patch_paths(monkeypatch, tmp_path)
         flagged = [
             runaway.RunawayProcess(
@@ -306,8 +306,8 @@ class TestRunawayCLI:
 
         killed_pids: list[int] = []
 
-        def fake_kill(pid):
-            killed_pids.append(pid)
+        def fake_kill(*args, **kwargs):
+            killed_pids.append(args[0])
             return True
 
         monkeypatch.setattr(runaway, "kill_runaway", fake_kill)
@@ -315,18 +315,12 @@ class TestRunawayCLI:
         runner = CliRunner()
         result = runner.invoke(cli_module.cli, ["runaway", "--kill", "--json"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         payload = json.loads(result.output)
         assert payload["confirmed"] is True
-        assert payload["killed"][0]["pid"] == 12345
-        assert killed_pids == [12345]
-
-        # Verify event was logged
-        conn = registry.connect()
-        logged = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
-        assert len(logged) == 1
-        assert logged[0]["pid"] == 12345
-        conn.close()
+        assert payload["killed"] == []
+        assert payload["failed"][0]["pid"] == 12345
+        assert killed_pids == []
 
     def test_kill_failure_reports_failed(self, tmp_path, monkeypatch):
         """fleet runaway --kill reports failures when kill fails."""
@@ -612,14 +606,15 @@ class TestDaemonRunawayLogging:
             result = runner.invoke(cli_module.cli, ["discover", "--auto-kill"])
             assert result.exit_code == 0
 
-        assert killed_pids == [77777]
+        assert killed_pids == []
 
         conn = registry.connect()
         detected = events.get_events(conn, hours=1, event_type="RUNAWAY_DETECTED")
         assert len(detected) == 1
+        decisions_seen = events.get_events(conn, hours=1, event_type="RUNAWAY_DECISION")
+        assert len(decisions_seen) == 1
         kill_events = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL")
-        assert len(kill_events) == 1
-        assert kill_events[0]["pid"] == 77777
+        assert kill_events == []
         conn.close()
 
     def test_discover_kill_failure_logs_failed_event(self, tmp_path, monkeypatch):
@@ -656,8 +651,10 @@ class TestDaemonRunawayLogging:
 
         conn = registry.connect()
         failed = events.get_events(conn, hours=1, event_type="RUNAWAY_KILL_FAILED")
-        assert len(failed) == 1
-        assert failed[0]["pid"] == 88888
+        assert failed == []
+        decisions_seen = events.get_events(conn, hours=1, event_type="RUNAWAY_DECISION")
+        assert len(decisions_seen) == 1
+        assert decisions_seen[0]["pid"] == 88888
         conn.close()
 
 

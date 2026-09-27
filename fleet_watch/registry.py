@@ -7,7 +7,8 @@ import os
 import re
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,17 @@ CREATE TABLE IF NOT EXISTS processes (
     start_create_time TEXT,
     UNIQUE(port),
     UNIQUE(repo_dir)
+);
+
+CREATE TABLE IF NOT EXISTS disposable_workloads (
+    pid              INTEGER PRIMARY KEY,
+    create_time      TEXT NOT NULL,
+    executable       TEXT NOT NULL,
+    uid              INTEGER NOT NULL,
+    owner_id         TEXT NOT NULL,
+    service_class    TEXT NOT NULL DEFAULT 'disposable',
+    registered_at    TEXT NOT NULL,
+    expires_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_leases (
@@ -594,6 +606,36 @@ def _process_command(pid: int | None) -> str | None:
     if result.returncode != 0 or not line:
         return None
     return line
+
+
+def _process_executable(pid: int | None) -> str | None:
+    """Return a normalized executable identity for a live PID.
+
+    The first argv token is preferred because ``ps comm`` is often abbreviated
+    (for example ``Python``).  A missing/unreadable executable is a denial for
+    every caller, never a guess.
+    """
+    command = _process_command(pid)
+    if not command:
+        return None
+    first = command.split(None, 1)[0]
+    if first.startswith("/") or first.startswith("~"):
+        return str(Path(first).expanduser().resolve())
+    return os.path.basename(first)
+
+
+def _executable_matches(observed: str | None, expected: str | None) -> bool:
+    if not observed or not expected:
+        return False
+    left = os.path.basename(str(observed)).casefold()
+    right = os.path.basename(str(expected)).casefold()
+    if left == right:
+        return True
+    # macOS may report the framework app binary as ``Python`` while the
+    # registration caller names the versioned symlink ``python3.x``.  Accept
+    # only this narrow interpreter spelling equivalence; all other executable
+    # mismatches remain a denial.
+    return left.startswith("python") and right.startswith("python")
 
 
 def _agent_runtime_roster() -> list[dict[str, str]]:
@@ -1392,6 +1434,106 @@ def register_process(
     conn.commit()
 
 
+def register_disposable_workload(
+    conn: sqlite3.Connection,
+    *,
+    pid: int,
+    executable: str,
+    owner_id: str,
+    service_class: str = "disposable",
+    ttl_seconds: int = 3600,
+) -> dict[str, Any]:
+    """Register a live, explicitly disposable process for policy evaluation.
+
+    Registration is an operator/creator assertion, not a classification
+    heuristic.  It is refused unless PID, kernel create-time, executable, and
+    UID are all positively readable at registration time.
+    """
+    if not owner_id or not owner_id.strip():
+        raise ValueError("owner_id is required")
+    if service_class != "disposable":
+        raise ValueError("only service_class='disposable' may be registered")
+    if pid <= 0 or not _pid_exists(pid):
+        raise ValueError("identity unavailable: process is not live")
+    create_time = _pid_create_time(pid)
+    observed_executable = _process_executable(pid)
+    # A just-started interpreter can briefly report its launcher argv before
+    # settling on the framework binary.  Require two stable reads rather than
+    # persisting a transient executable identity.
+    stable_executable = observed_executable
+    for _attempt in range(3):
+        if stable_executable and stable_executable == _process_executable(pid):
+            break
+        time.sleep(0.01)
+        stable_executable = _process_executable(pid)
+    observed_executable = stable_executable
+    uid = _process_uid(pid)
+    if not create_time or not observed_executable or uid is None:
+        raise ValueError("identity unavailable")
+    if not _executable_matches(observed_executable, executable):
+        raise ValueError("identity mismatch: executable changed")
+    now = _now_iso()
+    expires = (
+        (datetime.now(timezone.utc) + timedelta(seconds=max(1, ttl_seconds))).isoformat(
+            timespec="seconds"
+        )
+        if ttl_seconds and ttl_seconds > 0
+        else None
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO disposable_workloads
+            (pid, create_time, executable, uid, owner_id, service_class,
+             registered_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            pid,
+            create_time,
+            observed_executable,
+            uid,
+            owner_id,
+            service_class,
+            now,
+            expires,
+        ),
+    )
+    conn.commit()
+    return {
+        "pid": pid,
+        "create_time": create_time,
+        "executable": observed_executable,
+        "uid": uid,
+        "owner_id": owner_id,
+        "service_class": service_class,
+        "registered_at": now,
+        "expires_at": expires,
+    }
+
+
+def get_disposable_registration(
+    conn: sqlite3.Connection, pid: int
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT pid, create_time, executable, uid, owner_id, service_class, "
+        "registered_at, expires_at FROM disposable_workloads WHERE pid = ?",
+        (pid,),
+    ).fetchone()
+    if row is None:
+        return None
+    keys = (
+        "pid", "create_time", "executable", "uid", "owner_id", "service_class",
+        "registered_at", "expires_at",
+    )
+    return dict(zip(keys, row))
+
+
+def clear_disposable_registration(conn: sqlite3.Connection, pid: int) -> bool:
+    cursor = conn.execute("DELETE FROM disposable_workloads WHERE pid = ?", (pid,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def release_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None:
     """Release a registered process and decrement its GPU budget claim."""
     row = conn.execute(
@@ -1401,6 +1543,7 @@ def release_process(conn: sqlite3.Connection, pid: int) -> dict[str, Any] | None
         return None
 
     gpu_mb = row[4] or 0
+    conn.execute("DELETE FROM disposable_workloads WHERE pid = ?", (pid,))
     conn.execute("DELETE FROM processes WHERE pid = ?", (pid,))
     if gpu_mb > 0:
         conn.execute(
@@ -1546,7 +1689,7 @@ def get_reapable_processes(
     return [
         proc
         for proc in get_process_classifications(conn, stale_seconds=stale_seconds)
-        if proc["classification"] == "orphan_confirmed"
+        if proc["classification"] == "orphan_confirmed" and proc.get("process_identity_proven")
     ]
 
 
@@ -1701,14 +1844,24 @@ def get_process_classifications(
     """Classify each registered process by liveness and ownership evidence."""
     results: list[dict[str, Any]] = []
     for proc in get_all_processes(conn):
-        process_alive = _pid_exists(proc["pid"])
+        process_identity = _owner_identity_proven(
+            proc["pid"], proc.get("start_create_time")
+        )
+        # ``None`` means identity could not be proven. Keep the process visible
+        # as live/unknown for fail-closed reporting, but never make it reapable.
+        process_alive = process_identity is not False
         heartbeat_age = _age_seconds(proc.get("last_heartbeat"))
         stale = heartbeat_age is not None and heartbeat_age > stale_seconds
         lease = get_session_lease(conn, proc["session_id"])
         lease_present = lease is not None
         lease_active = bool(lease and lease["status"] == "ACTIVE" and lease["shutdown_at"] is None)
         owner_pid = lease.get("owner_pid") if lease else None
-        owner_alive = _pid_exists(owner_pid) if owner_pid else None
+        owner_identity = (
+            _owner_identity_proven(owner_pid, lease.get("owner_create_time"))
+            if owner_pid
+            else None
+        )
+        owner_alive = owner_identity if owner_identity is not None else (_pid_exists(owner_pid) if owner_pid else None)
         process_info = _inspect_process(proc["pid"]) if process_alive else None
         parent_chain_detached = (
             _is_parent_chain_detached(proc["pid"])
@@ -1770,6 +1923,12 @@ def get_process_classifications(
             "heartbeat_age_seconds": heartbeat_age,
             "stale_seconds": heartbeat_age if stale else 0,
             "process_alive": process_alive,
+            "process_identity_proven": process_identity is True,
+            "process_identity_status": (
+                "proven" if process_identity is True
+                else "reused_or_dead" if process_identity is False
+                else "unknown"
+            ),
             "session_lease_present": lease_present,
             "session_lease_status": lease["status"] if lease else "MISSING",
             "session_lease_owner_pid": owner_pid,

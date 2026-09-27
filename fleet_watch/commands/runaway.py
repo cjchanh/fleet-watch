@@ -6,8 +6,9 @@ from typing import Any
 
 import click
 
-from fleet_watch import events, runaway
+from fleet_watch import events, registry, runaway
 from fleet_watch.cli_support import (
+    _candidate_from_process_row,
     _get_conn,
 )
 
@@ -32,7 +33,21 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
         conn = _get_conn()
         try:
             for proc in flagged:
-                success = runaway.kill_runaway(proc.pid)
+                row = registry.get_process(conn, proc.pid)
+                registration = registry.get_disposable_registration(conn, proc.pid)
+                candidate = (
+                    _candidate_from_process_row({**row, "session_lease": registry.get_session_lease(conn, row["session_id"])})
+                    if row
+                    else {"classification": None, "inspection_complete": False}
+                )
+                success = False
+                if row is not None and registration is not None:
+                    success = runaway.kill_runaway(
+                        proc.pid,
+                        candidate=candidate,
+                        disposable_registration=registration,
+                        operator_confirmed=True,
+                    )
                 entry = proc.to_dict()
                 if success:
                     killed.append(entry)
@@ -48,7 +63,7 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
                         },
                     )
                 else:
-                    entry["reason"] = "kill failed"
+                    entry["reason"] = "policy denied or termination unverified"
                     failed.append(entry)
         finally:
             conn.close()
