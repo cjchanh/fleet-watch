@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fleet-watch"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local process governance for AI workloads, plus a read-only GitHub fleet sitrep"
 readme = "README.md"
 license = {text = "MIT"}
