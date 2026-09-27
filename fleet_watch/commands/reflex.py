@@ -77,6 +77,7 @@ def reflex_group():
 @click.option("--queue-dir", default=None, help="Spec queue directory")
 @click.option("--receipts-dir", default=None, help="Receipt directory")
 @click.option("--repo", default=reflex.DEFAULT_REPO, help="Repo path recorded in each spec")
+@click.option("--goal-id", default=None, help="Canonical goal id bound in spec front-matter and receipt")
 def emit_command(
     do_write: bool,
     as_json: bool,
@@ -85,6 +86,7 @@ def emit_command(
     queue_dir: str | None,
     receipts_dir: str | None,
     repo: str,
+    goal_id: str | None,
 ):
     """Queue one spec per open finding and record an emission receipt."""
     queue, receipts = _paths(queue_dir, receipts_dir)
@@ -96,6 +98,7 @@ def emit_command(
         write=do_write,
         min_ticks=min_ticks,
         repo=repo,
+        goal_id=goal_id,
     )
     payload = report.to_dict()
     if errors:

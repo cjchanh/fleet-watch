@@ -565,3 +565,34 @@ def test_reflex_group_is_registered_on_the_root_cli():
     assert "reflex" in cli_module.cli.commands
     assert set(reflex_command.reflex_group.commands) == {"emit", "verify", "status"}
     assert reflex_command.reflex_group.name == "reflex"
+
+
+def test_goal_id_is_bound_in_spec_front_matter_and_receipt(tmp_path):
+    """The direct receipt->goal id space: the carrier starts here."""
+    import json
+
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    reflex.emit(
+        [denial_finding()],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        goal_id="canonical_aefae214df0480ce",
+    )
+    spec_text = next(queue.glob("*.md")).read_text()
+    assert "goal_id: canonical_aefae214df0480ce" in spec_text
+    receipt = json.loads(next(receipts.glob("*.json")).read_text())
+    assert receipt["goal_id"] == "canonical_aefae214df0480ce"
+
+
+def test_goal_id_absent_by_default(tmp_path):
+    import json
+
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    reflex.emit([denial_finding()], queue_dir=queue, receipts_dir=receipts, write=True)
+    spec_text = next(queue.glob("*.md")).read_text()
+    assert "goal_id:" not in spec_text
+    receipt = json.loads(next(receipts.glob("*.json")).read_text())
+    assert receipt["goal_id"] is None

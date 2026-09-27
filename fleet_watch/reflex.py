@@ -388,6 +388,7 @@ def render_spec(
     repo: str = DEFAULT_REPO,
     evidence_hash: str = "",
     escalation_note: str | None = None,
+    goal_id: str | None = None,
 ) -> str:
     """Render the fixed Tuesday-style spec for one finding."""
     sha = evidence_hash or evidence_sha256(finding)
@@ -413,6 +414,7 @@ def render_spec(
         f"repo: {repo}",
         f"created: {created}",
         f"evidence_sha256: {sha}",
+        *([f"goal_id: {goal_id}"] if goal_id else []),
         f"ticks_observed: {finding.ticks}",
         f"severity: {finding.severity}",
     ]
@@ -519,6 +521,7 @@ def _build_receipt(
     min_ticks: int,
     previous: Mapping[str, Any] | None = None,
     escalation_note: str | None = None,
+    goal_id: str | None = None,
 ) -> dict[str, Any]:
     prior = dict(previous or {})
     emissions = list(prior.get("emissions") or [])
@@ -544,6 +547,7 @@ def _build_receipt(
         "emitted_at": _iso(now),
         "emitted_at_epoch": now,
         "evidence_sha256": sha,
+        "goal_id": goal_id,
         "evidence": dict(finding.detail),
         "ticks_observed": finding.ticks,
         "min_ticks": min_ticks,
@@ -583,6 +587,7 @@ def emit(
     min_ticks: int = DEFAULT_MIN_TICKS,
     clock: Clock = time.time,
     repo: str = DEFAULT_REPO,
+    goal_id: str | None = None,
 ) -> EmitReport:
     """Screen findings and queue one spec per open finding.
 
@@ -626,6 +631,7 @@ def emit(
             created=_day(now),
             repo=repo,
             evidence_hash=sha,
+            goal_id=goal_id,
         )
         spec_path = Path(queue_dir) / f"{spec_id}.md"
         receipt = _build_receipt(
@@ -635,6 +641,7 @@ def emit(
             spec_path=spec_path,
             spec_text=spec_text,
             sha=sha,
+            goal_id=goal_id,
             now=now,
             min_ticks=report.min_ticks,
             previous=prior,
