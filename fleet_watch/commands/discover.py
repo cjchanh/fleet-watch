@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -58,6 +60,53 @@ def _write_report_bounded(conn) -> tuple[bool, str | None]:
         default=None,
     )
     return reason is None, reason
+
+
+def _resolve_daemon_auto_reclaim() -> str:
+    """Resolve the operator's auto-reclaim flip the way the daemon does.
+
+    Fresh from the config file on every call, so flipping OFF takes effect on
+    the next tick; uncertainty resolves to ``off`` (never a guess). The import is
+    deferred and by module path for the same reason
+    :func:`fleet_watch.cli_support._run_auto_reclaim_tick` does it: the
+    ``fleet_watch.commands`` package attribute named ``reap`` is the Click
+    command, not this module.
+    """
+    reap_mod = importlib.import_module("fleet_watch.commands.reap")
+    try:
+        return reap_mod.resolve_auto_reclaim()
+    except Exception:  # noqa: BLE001 — an unreadable flip is off, never a guess
+        return "off"
+
+
+def _daemon_runaway_tick(conn, tracker, *, tracker_path=None, auto_kill=False):
+    """The daemon's ONLY entry into the runaway tick, and the only flip resolver.
+
+    ``_run_runaway_tick`` takes the flip as an explicit argument defaulting to
+    off, so it never reads the config file itself. This wrapper is what makes the
+    daemon armed: it resolves the flip from config and passes it in. Every other
+    caller of the tick — a test, or any future caller — therefore gets ``off``
+    regardless of the host config, and cannot reach the REAL verified path
+    because of an operator's local setting.
+
+    A substituted callable (a test double, a future wrapper) whose signature
+    predates the parameter simply does not receive the flip, which leaves the
+    tick off — the fail-closed direction. The signature of the REAL seam is
+    pinned by ``tests/test_auto_reclaim_flip.py``; it is not checked here,
+    because a silent downgrade to off must never be the thing that keeps a
+    daemon running.
+    """
+    tick = _run_runaway_tick
+    kwargs: dict[str, Any] = {"tracker_path": tracker_path, "auto_kill": auto_kill}
+    try:
+        params = inspect.signature(tick).parameters
+    except (TypeError, ValueError):  # an opaque callable: no flip, so off
+        params = {}
+    if "auto_reclaim" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        kwargs["auto_reclaim"] = _resolve_daemon_auto_reclaim()
+    return tick(conn, tracker, **kwargs)
 
 
 @click.command()
@@ -343,7 +392,7 @@ def discover(auto_kill: bool):
         # registration passes the shared identity gate inside the policy layer.
         tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
         tracker = runaway.DaemonRunawayTracker.load(tracker_path)
-        _run_runaway_tick(
+        _daemon_runaway_tick(
             conn,
             tracker,
             tracker_path=tracker_path,
@@ -430,7 +479,7 @@ def watch(interval: int, auto_kill: bool, autonomous: bool, once: bool,
                     )
                 # CPU/runtime heuristics are advisory unless an eligible
                 # disposable registration passes the identity gate.
-                _run_runaway_tick(conn, tracker, auto_kill=auto_kill)
+                _daemon_runaway_tick(conn, tracker, auto_kill=auto_kill)
         except Exception as e:  # noqa: BLE001 — watch loop must not traceback
             click.echo(f"Error: {type(e).__name__}: {e}", err=True)
         finally:

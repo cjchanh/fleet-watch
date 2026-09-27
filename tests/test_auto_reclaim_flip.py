@@ -16,13 +16,21 @@ states and a default of ``off``:
                     make a denied candidate actionable, and it can never
                     escalate to SIGKILL.
 
-THE PLANTED BADS (marked ``PLANTED BAD``): the same eight the governed
+THE PLANTED BADS (marked ``PLANTED BAD``): the same nine the governed
 ``fleet reap --mcp --verify --kill --kill-force`` batch rejects — a live owning
 session, a recycled target PID, a live session lease (referencing the owner and
 naming the target), a re-parented server that grew a live parent, a root-owned
-target, an agent executable, and an unprovable owner. Each one MUST be denied
-and MUST receive no signal AT ALL, with the flip in its most aggressive state
-(``on``). If any planted bad is ever signalled, this batch is void.
+target, an agent executable, an unprovable owner, and an unreadable ancestry.
+Each one MUST be denied and MUST receive no signal AT ALL, with the flip in its
+most aggressive state (``on``). If any planted bad is ever signalled, this batch
+is void. The count above is not prose: it is pinned to the batch itself by
+``test_the_docstring_counts_exactly_the_planted_bads``.
+
+THE SEAM (the daemon, not this file, is what arms the flip): the flip reaches
+``_run_runaway_tick`` as an EXPLICIT argument, resolved by
+``fleet_watch.commands.discover`` — the daemon's only caller — and defaulting to
+off, so a direct call to the tick runs off whatever the host config says.
+Status is the read-only surface for the same value.
 
 Determinism: every kernel probe, clock, lease table, registry connection, signal
 sender and config read is injected. The one real process is a disposable child
@@ -34,6 +42,9 @@ not spawn, and no real MCP server is ever a candidate here.
 from __future__ import annotations
 
 import importlib
+import inspect
+import json
+import re
 import signal as signal_mod
 import subprocess
 import sys
@@ -41,13 +52,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fleet_watch import cli_support, events, process_policy as pp
+from fleet_watch import cli_support, counters as counters_mod, events
+from fleet_watch import process_policy as pp
+from fleet_watch import registry, runaway
 from fleet_watch.discovery import mcp_orphan_detector as M
+from fleet_watch.discovery import ollama_runners, orphan_detector
 
+discover_cmd = importlib.import_module("fleet_watch.commands.discover")
 reap_mod = importlib.import_module("fleet_watch.commands.reap")
+status_mod = importlib.import_module("fleet_watch.commands.status")
 
 TARGET = 4242
 OWNER = 777
@@ -259,6 +276,95 @@ def _wire(monkeypatch, world: FakeWorld, candidates, *, conn: FakeConn | None = 
 def _config(monkeypatch, config: dict[str, Any]) -> None:
     """Point the flip's only source (the config file) at an injected dict."""
     monkeypatch.setattr(reap_mod.discover_mod, "load_config", lambda: config)
+
+
+def _counting_config(monkeypatch, config: dict[str, Any]) -> list[str]:
+    """Like ``_config``, but every read is recorded.
+
+    A tick that resolves the flip from config shows up here. A tick that takes
+    the flip as an argument shows an empty list — which is the whole point of
+    the seam: "off" here must come from the ARGUMENT, never from the file.
+    """
+    reads: list[str] = []
+    monkeypatch.setattr(reap_mod.discover_mod, "load_config", lambda: reads.append("read") or config)
+    return reads
+
+
+def _silent_tracker(monkeypatch) -> runaway.DaemonRunawayTracker:
+    """A real tracker whose host probe is stubbed.
+
+    The runaway tick calls ``tracker.tick()`` after the flip seam. The real
+    scanner shells out to ``ps``; this file never does, and the flip assertions
+    are about the reclaim seam, not about runaway CPU detection.
+    """
+    monkeypatch.setattr(runaway, "scan_runaways", lambda **kwargs: [])
+    return runaway.DaemonRunawayTracker()
+
+
+def _status_paths(monkeypatch, tmp_path) -> None:
+    """Point every writable surface `fleet status` touches at ``tmp_path``."""
+    monkeypatch.setattr(registry, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "registry.db")
+    # counters binds FLEET_DIR at import, so patching registry alone would write
+    # the operator's REAL ~/.fleet-watch/state.json from a test.
+    monkeypatch.setattr(counters_mod, "FLEET_DIR", tmp_path)
+    monkeypatch.setattr(ollama_runners, "discover_ollama_runners", lambda: [])
+    monkeypatch.setattr(
+        orphan_detector, "detect_orphans", lambda: orphan_detector.OrphanDetectionResult(),
+    )
+
+
+def _planted_bad_worlds() -> list[tuple[str, FakeWorld, M.MCPCandidate]]:
+    """The nine planted bads, each as (name, world, candidate).
+
+    Module level so the batch, the tripwire and the docstring's count are all
+    derived from ONE list — a bad that is added or dropped cannot leave the
+    prose lying about it.
+    """
+    out: list[tuple[str, FakeWorld, M.MCPCandidate]] = []
+
+    out.append(("live_owning_session",
+                FakeWorld().orphan(owner_exists=True),
+                _candidate(FakeWorld().orphan(owner_exists=True))))
+
+    # captured first, then the kernel hands the PID to a different process
+    recycled = FakeWorld().orphan()
+    recycled_candidate = _candidate(recycled)
+    recycled.pids[TARGET]["create_time"] = "CT-REUSED"
+    out.append(("target_pid_recycled", recycled, recycled_candidate))
+
+    leased = FakeWorld().orphan()
+    leased.leases = [{"session_id": "sess-live", "owner_pid": OWNER}]
+    leased.lease_alive["sess-live"] = True
+    out.append(("live_session_lease", leased, _candidate(leased)))
+
+    leased_target = FakeWorld().orphan()
+    leased_target.leases = [{"session_id": "sess-target", "owner_pid": TARGET}]
+    leased_target.lease_alive["sess-target"] = True
+    out.append(("lease_names_target", leased_target, _candidate(leased_target)))
+
+    reparented = FakeWorld().orphan()
+    reparented.pids[TARGET]["ppid"] = 888
+    reparented.add(888, create_time="PCT-1", exists=True)
+    out.append(("parent_changed_since_scan", reparented, _candidate(reparented)))
+
+    root = FakeWorld().orphan()
+    root.pids[TARGET]["uid"] = 0
+    out.append(("root_owned_target", root, _candidate(root)))
+
+    agent = FakeWorld().orphan()
+    agent.pids[TARGET]["exe"] = "/usr/local/bin/claude"
+    out.append(("agent_executable", agent, _candidate(agent)))
+
+    unprovable = FakeWorld().orphan(owner_exists=True)
+    unprovable.pids[OWNER]["create_time"] = None
+    out.append(("owner_identity_unprovable", unprovable, _candidate(unprovable)))
+
+    unreadable = FakeWorld().orphan()
+    unreadable.raise_on["ppid"] = PermissionError("denied")
+    out.append(("unreadable_ancestry", unreadable, _candidate(unreadable)))
+
+    return out
 
 
 def _tick(state: dict[str, Any]) -> dict[str, Any]:
@@ -604,55 +710,9 @@ def test_every_planted_bad_in_this_batch_is_never_signalled_by_the_daemon(monkey
     batch must come back with ZERO signals. If any planted bad is ever signalled,
     this test fails and the batch is void.
     """
-    def planted_bad_worlds() -> list[tuple[str, FakeWorld, M.MCPCandidate]]:
-        out: list[tuple[str, FakeWorld, M.MCPCandidate]] = []
-
-        out.append(("live_owning_session",
-                    FakeWorld().orphan(owner_exists=True),
-                    _candidate(FakeWorld().orphan(owner_exists=True))))
-
-        # captured first, then the kernel hands the PID to a different process
-        recycled = FakeWorld().orphan()
-        recycled_candidate = _candidate(recycled)
-        recycled.pids[TARGET]["create_time"] = "CT-REUSED"
-        out.append(("target_pid_recycled", recycled, recycled_candidate))
-
-        leased = FakeWorld().orphan()
-        leased.leases = [{"session_id": "sess-live", "owner_pid": OWNER}]
-        leased.lease_alive["sess-live"] = True
-        out.append(("live_session_lease", leased, _candidate(leased)))
-
-        leased_target = FakeWorld().orphan()
-        leased_target.leases = [{"session_id": "sess-target", "owner_pid": TARGET}]
-        leased_target.lease_alive["sess-target"] = True
-        out.append(("lease_names_target", leased_target, _candidate(leased_target)))
-
-        reparented = FakeWorld().orphan()
-        reparented.pids[TARGET]["ppid"] = 888
-        reparented.add(888, create_time="PCT-1", exists=True)
-        out.append(("parent_changed_since_scan", reparented, _candidate(reparented)))
-
-        root = FakeWorld().orphan()
-        root.pids[TARGET]["uid"] = 0
-        out.append(("root_owned_target", root, _candidate(root)))
-
-        agent = FakeWorld().orphan()
-        agent.pids[TARGET]["exe"] = "/usr/local/bin/claude"
-        out.append(("agent_executable", agent, _candidate(agent)))
-
-        unprovable = FakeWorld().orphan(owner_exists=True)
-        unprovable.pids[OWNER]["create_time"] = None
-        out.append(("owner_identity_unprovable", unprovable, _candidate(unprovable)))
-
-        unreadable = FakeWorld().orphan()
-        unreadable.raise_on["ppid"] = PermissionError("denied")
-        out.append(("unreadable_ancestry", unreadable, _candidate(unreadable)))
-
-        return out
-
     _config(monkeypatch, {"auto_reclaim": FLIP_ON})
     verdicts: dict[str, str] = {}
-    for name, world, candidate in planted_bad_worlds():
+    for name, world, candidate in _planted_bad_worlds():
         state = _wire(monkeypatch, world, [candidate])
         result = _tick(state)
 
@@ -698,6 +758,171 @@ def test_the_flip_only_ever_acts_through_the_one_governed_path(monkeypatch):
     _tick(state)
 
     assert seen == [{"do_kill": True, "do_kill_force": False}]
+
+
+# ── (f) the seam: only the daemon can arm the flip ───────────────────────────
+
+def test_a_direct_runaway_tick_call_cannot_inherit_the_hosts_config(monkeypatch):
+    """THE FOOTGUN, closed: a config of ``on`` is not enough to run the tick.
+
+    ``_run_runaway_tick`` is called DIRECTLY by tests/test_cli.py and
+    tests/test_runaway.py, with no flip argument. If the tick resolved the flip
+    from config itself, an operator who once set ``auto_reclaim: on`` on this
+    machine would turn those direct calls into the REAL verified path against
+    the REAL host. So: zero scans, zero receipts, zero signals — and the config
+    is not even READ, which is what proves the argument (not the file) is what
+    holds this closed.
+    """
+    reads = _counting_config(monkeypatch, {"auto_reclaim": FLIP_ON})
+    world = FakeWorld().orphan()
+    state = _wire(monkeypatch, world, [_candidate(world)])
+    tracker = _silent_tracker(monkeypatch)
+
+    cli_support._run_runaway_tick(state["conn"], tracker)
+
+    assert reads == [], "the tick must take the flip as an argument, not read config"
+    assert state["scans"] == 0
+    assert state["events"] == []
+    _never_signalled(world, "direct tick call with the host config on")
+
+
+def test_the_daemon_resolves_the_flip_and_hands_it_to_the_tick(monkeypatch):
+    """The other half: the daemon is what arms the flip, explicitly, every tick.
+
+    Also pins the REAL seam's signature. If ``_run_runaway_tick`` ever loses the
+    parameter, this fails here — loudly, in the tests — instead of leaving the
+    daemon quietly stuck off.
+    """
+    assert "auto_reclaim" in inspect.signature(cli_support._run_runaway_tick).parameters, (
+        "the real seam must accept the flip as an argument; without it the "
+        "daemon's resolved value would be dropped and the flip stuck off"
+    )
+    reads = _counting_config(monkeypatch, {"auto_reclaim": FLIP_ON})
+    world = FakeWorld().orphan()
+    state = _wire(monkeypatch, world, [_candidate(world)])
+    tracker = _silent_tracker(monkeypatch)
+
+    discover_cmd._daemon_runaway_tick(state["conn"], tracker)
+
+    assert reads == ["read"], "the daemon re-reads the flip from config every tick"
+    assert state["scans"] == 1, "the daemon's resolved flip must reach the tick"
+    assert world.signals == [(TARGET, int(signal_mod.SIGTERM))]
+    assert _auto_reclaim_receipts(state)[0]["flip"] == FLIP_ON
+
+
+def test_a_callable_that_cannot_take_the_flip_gets_off_not_a_crash(monkeypatch):
+    """A substituted tick that predates the parameter runs OFF — never a guess.
+
+    Fail-closed in the only direction that matters: a signature that cannot
+    carry the flip leaves it off rather than inventing one or raising.
+    """
+    _config(monkeypatch, {"auto_reclaim": FLIP_ON})
+    seen: list[bool] = []
+
+    def old_signature(conn, tracker, *, tracker_path=None, auto_kill=False):
+        seen.append(auto_kill)
+        return []
+
+    monkeypatch.setattr(discover_cmd, "_run_runaway_tick", old_signature)
+    discover_cmd._daemon_runaway_tick(FakeConn(), FakeConn(), auto_kill=True)
+
+    assert seen == [True], "the old signature is still honoured, just not armed"
+
+
+# ── (g) status: the operator can see the flip without opening a config ───────
+
+@pytest.mark.parametrize("config,expected", [
+    ({"auto_reclaim": FLIP_ON},
+     {"state": FLIP_ON, "source": "config:auto_reclaim", "config_key": "auto_reclaim",
+      "configured": True, "armed": True}),
+    ({"auto_reclaim": FLIP_DRY_RUN},
+     {"state": FLIP_DRY_RUN, "source": "config:auto_reclaim", "config_key": "auto_reclaim",
+      "configured": True, "armed": True}),
+    ({},
+     {"state": FLIP_OFF, "source": "default", "config_key": "auto_reclaim",
+      "configured": False, "armed": False}),
+    # a key the daemon rejected: OFF, but the operator can see they DID set one
+    ({"auto_reclaim": "on-ish"},
+     {"state": FLIP_OFF, "source": "default", "config_key": "auto_reclaim",
+      "configured": True, "armed": False}),
+])
+def test_fleet_status_json_surfaces_the_flip_and_its_source(
+    tmp_path, monkeypatch, config, expected,
+):
+    """GAP 2: `fleet status --json` states the flip and where it came from."""
+    _status_paths(monkeypatch, tmp_path)
+    _config(monkeypatch, config)
+
+    result = CliRunner().invoke(status_mod.status, ["--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["auto_reclaim"] == expected
+
+
+def test_fleet_status_text_names_the_flip_and_its_source(tmp_path, monkeypatch):
+    """The same fact in text, so it is readable without opening JSON."""
+    _status_paths(monkeypatch, tmp_path)
+    _config(monkeypatch, {"auto_reclaim": FLIP_OFF})
+
+    result = CliRunner().invoke(status_mod.status, [])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Auto-reclaim flip: off (from config key auto_reclaim)" in result.output
+    ), result.output
+
+
+def test_status_reports_off_when_the_config_file_cannot_be_read(monkeypatch):
+    """Uncertainty reads as off, on the surface exactly as in the daemon.
+
+    Probed at the field's own seam rather than through the command:
+    ``reporter.build_state`` reads the config unguarded (see the CHILD_WORK note
+    on the report), so an unreadable config kills ``fleet status --json`` before
+    this field is ever added. What is under test here is only that the flip
+    surface itself never turns an unreadable config into anything but ``off``.
+    """
+    def boom() -> dict[str, Any]:
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(reap_mod.discover_mod, "load_config", boom)
+
+    flip = status_mod._auto_reclaim_flip()
+
+    assert flip == {
+        "state": FLIP_OFF,
+        "source": "default",
+        "config_key": "auto_reclaim",
+        "configured": False,
+        "armed": False,
+    }
+
+    # An operator who typed a value the daemon rejected is told THAT is why it is
+    # off, rather than being shown a bare "default".
+    _config(monkeypatch, {"auto_reclaim": "on-ish"})
+    rejected = status_mod._auto_reclaim_flip()
+    assert rejected["configured"] is True and rejected["armed"] is False
+    assert status_mod._auto_reclaim_flip_line(rejected) == (
+        "Auto-reclaim flip: off (default — the configured auto_reclaim value is "
+        "not one of off/dry_run/on)"
+    )
+
+
+# ── the docstring is not prose: it is pinned to the batch ───────────────────
+
+def test_the_docstring_counts_exactly_the_planted_bads():
+    words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    stated = re.search(r"the same (\w+) the governed", __doc__ or "")
+    assert stated, "the docstring must state how many planted bads the batch holds"
+    assert words[stated.group(1)] == len(_planted_bad_worlds()), (
+        f"the docstring says {stated.group(1)}; the batch holds "
+        f"{len(_planted_bad_worlds())}"
+    )
+    # the two the prose used to conflate or drop entirely
+    for bad in ("unreadable", "unprovable"):
+        assert bad in (__doc__ or ""), f"the prose must name the {bad} planted bad"
 
 
 if __name__ == "__main__":

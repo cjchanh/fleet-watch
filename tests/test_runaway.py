@@ -474,7 +474,7 @@ class TestDaemonRunawayLogging:
         )
         observed: list[bool] = []
 
-        def record_option(conn, tracker, *, auto_kill=True, tracker_path=None):
+        def record_option(conn, tracker, *, auto_kill=True, tracker_path=None, **kwargs):
             observed.append(auto_kill)
             raise SystemExit(0)
 

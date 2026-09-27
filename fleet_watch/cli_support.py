@@ -943,6 +943,7 @@ def _run_runaway_tick(
     tracker: runaway.DaemonRunawayTracker,
     tracker_path: Path | None = None,
     auto_kill: bool = False,
+    auto_reclaim: str = "off",
 ) -> list[runaway.RunawayProcess]:
     """Run one runaway tracker tick and log policy-bounded decisions.
 
@@ -952,12 +953,20 @@ def _run_runaway_tick(
 
     This tick is also where the operator's MCP auto-reclaim flip is evaluated
     (see :func:`_run_auto_reclaim_tick`) — it is the daemon's only recurring
-    seam, and the flip defaults to off, so the cost at rest is one config read.
-    It is invoked before the tracker and shares none of the tracker's health,
-    so a broken tracker can neither suppress nor trigger it.
+    seam. It is invoked before the tracker and shares none of the tracker's
+    health, so a broken tracker can neither suppress nor trigger it.
+
+    THE FLIP IS AN ARGUMENT, NOT A CONFIG READ (``auto_reclaim``, default
+    ``off``). The daemon resolves it from config and passes it in; this function
+    never reads the config file. That is deliberate: a direct caller — a test, or
+    any other future caller — therefore runs OFF whatever the host config says,
+    so no caller can reach the REAL verified path just because an operator once
+    set ``auto_reclaim: on`` on this machine. The cost at rest is one parameter
+    pass, and a value that is not one of the three states is still downgraded to
+    off inside the tick.
     """
     try:
-        _run_auto_reclaim_tick(conn)
+        _run_auto_reclaim_tick(conn, auto_reclaim)
     except Exception:  # noqa: BLE001 — a failed tick must not crash discover
         pass
     try:

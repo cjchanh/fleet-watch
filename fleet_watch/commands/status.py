@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import json
 import sys
+from typing import Any
 
 import click
 
@@ -16,6 +18,67 @@ from fleet_watch.cli_support import (
     _run_bounded_result,
 )
 from fleet_watch.discovery import ollama_runners, orphan_detector
+
+
+def _auto_reclaim_flip() -> dict[str, Any]:
+    """The operator's kill-path flip as the daemon would resolve it, READ-ONLY.
+
+    Nothing here arms, disarms or writes anything — this surface exists so an
+    operator can confirm the auto-reclaim kill path is off without opening a
+    config file. The state is the daemon's own resolution
+    (``reap.resolve_auto_reclaim``, re-read fresh every tick), so this field and
+    the daemon's next tick can never disagree, and ``source`` says which of the
+    two it came from: the operator's ``auto_reclaim`` config key, or the shipped
+    default. An unreadable or invalid configuration reports ``off`` exactly as
+    the daemon would — uncertainty is never displayed as permission.
+
+    ``configured`` is kept separate from ``source`` so an operator who typed a
+    value the daemon rejected (``auto_reclaim: on-ish``) can see that they DID
+    set a key, rather than reading "default" as "no key was set".
+    """
+    reap_mod = importlib.import_module("fleet_watch.commands.reap")
+    key = reap_mod.AUTO_RECLAIM_CONFIG_KEY
+    try:
+        state = reap_mod.resolve_auto_reclaim()
+    except Exception:  # noqa: BLE001 — an unreadable flip reports off, never a guess
+        state = reap_mod.AUTO_RECLAIM_OFF
+    configured = False
+    source = "default"
+    try:
+        config = discover_mod.load_config()
+        if isinstance(config, dict):
+            configured = key in config
+            raw = config.get(key)
+            accepted = (
+                isinstance(raw, str)
+                and raw.strip().lower() in reap_mod.AUTO_RECLAIM_STATES
+            )
+            if accepted:
+                source = f"config:{key}"
+    except Exception:  # noqa: BLE001 — an unreadable config is the default, not a guess
+        configured = False
+    return {
+        "state": state,
+        "source": source,
+        "config_key": key,
+        "configured": configured,
+        "armed": state != reap_mod.AUTO_RECLAIM_OFF,
+    }
+
+
+def _auto_reclaim_flip_line(flip: dict[str, Any]) -> str:
+    """One human line for the flip, honest about WHY it resolved the way it did."""
+    if flip["source"] == "default":
+        why = (
+            f"default — the configured {flip['config_key']} value is not one of "
+            "off/dry_run/on"
+            if flip["configured"]
+            else f"default — no {flip['config_key']} key in the config file"
+        )
+    else:
+        why = f"from config key {flip['config_key']}"
+    return f"Auto-reclaim flip: {flip['state']} ({why})"
+
 
 @click.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
@@ -96,6 +159,9 @@ def status(as_json: bool):
                 }
             )
         state["discovery_degraded"] = degraded_payload
+        # Read-only: the resolved kill-path flip and where it came from, so an
+        # operator can confirm it is off without opening the config by hand.
+        state["auto_reclaim"] = _auto_reclaim_flip()
         click.echo(json.dumps(state, indent=2, default=str))
     else:
         procs = registry.get_all_processes(conn)
@@ -163,6 +229,10 @@ def status(as_json: bool):
                 f"\nDEGRADED/UNKNOWN: {', '.join(degraded)}; "
                 "no clean-empty claim was made."
             )
+
+        # The kill path's state is a fact an operator must be able to read here,
+        # not something they have to go find a config file for.
+        click.echo(f"\n{_auto_reclaim_flip_line(_auto_reclaim_flip())}")
 
     conn.close()
 
