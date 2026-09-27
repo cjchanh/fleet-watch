@@ -21,6 +21,7 @@ from fleet_watch.commands.session import session
 from fleet_watch.commands.sitrep import sitrep
 from fleet_watch.commands.status import (
     changelog,
+    decisions,
     health,
     history,
     reconcile,
@@ -59,6 +60,7 @@ def register_all(cli) -> None:
         health,
         boot_coverage,
         changelog,
+        decisions,
         thunder,
         runaway_scan,
         census,

@@ -24,6 +24,7 @@ from fleet_watch import boot_map as boot_map_mod
 from fleet_watch import census as census_mod
 from fleet_watch import claude_lease_twin
 from fleet_watch import counters, discover as discover_mod
+from fleet_watch import process_policy
 from fleet_watch import events, gpu_estimator, referee, registry, reporter, runaway, syshealth
 from fleet_watch.discovery import mcp_orphan_detector, ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
@@ -62,35 +63,72 @@ from fleet_watch.guards import memory_pressure
 STATUS_DISCOVERY_TIMEOUT_SECONDS = 3.0
 
 
-def _run_bounded(fn, *, timeout_seconds: float, default: Any):
-    """Run ``fn()`` in a daemon thread bounded by ``timeout_seconds``.
+_BOUNDED_CALLS: dict[tuple[str, str, int], "queue.Queue[tuple[str, Any]]"] = {}
+_BOUNDED_CALLS_GUARD = threading.Lock()
 
-    Returns ``(result, timed_out)``. On timeout, returns ``default`` and
-    ``timed_out=True`` without waiting for the underlying call to finish.
-    The worker thread is daemonized specifically so a still-blocked
-    subprocess/socket call inside ``fn`` can never hold the CLI process open
-    past its own exit -- a non-daemon thread (e.g. via
-    concurrent.futures.ThreadPoolExecutor, whose atexit hook joins pending
-    workers) would still make the process hang even after this function
-    returns a degraded result.
+
+def _bounded_key(fn) -> tuple[str, str, int]:
+    code = getattr(fn, "__code__", None)
+    identity = id(code) if code is not None else id(fn)
+    return (
+        str(getattr(fn, "__module__", type(fn).__module__)),
+        str(getattr(fn, "__qualname__", type(fn).__qualname__)),
+        identity,
+    )
+
+
+def _run_bounded_result(
+    fn, *args, timeout_seconds: float, default: Any
+) -> tuple[Any, str | None]:
+    """Run a probe once, returning ``(value, degradation_reason)``.
+
+    ``None`` means the callable completed successfully.  ``timeout`` means the
+    worker is still running; ``in_flight`` means a later caller refused to
+    start a duplicate worker; ``error`` means the callable raised.  A timed-out
+    worker remains registered until it exits, so repeated status/discover
+    calls cannot accumulate one thread per timeout.
     """
-    result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=1)
+    key = _bounded_key(fn)
+    with _BOUNDED_CALLS_GUARD:
+        if key in _BOUNDED_CALLS:
+            return default, "in_flight"
+        result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=1)
+        _BOUNDED_CALLS[key] = result_queue
 
     def _worker() -> None:
         try:
-            result_queue.put(("ok", fn()))
-        except Exception as exc:  # noqa: BLE001 -- degrade, never propagate
+            result_queue.put(("ok", fn(*args)))
+        except Exception as exc:  # noqa: BLE001 -- failure is data
             result_queue.put(("error", exc))
+        finally:
+            with _BOUNDED_CALLS_GUARD:
+                if _BOUNDED_CALLS.get(key) is result_queue:
+                    _BOUNDED_CALLS.pop(key, None)
 
-    thread = threading.Thread(target=_worker, daemon=True)
+    thread = threading.Thread(
+        target=_worker,
+        name=f"bounded-{key[1]}",
+        daemon=True,
+    )
     thread.start()
     try:
-        kind, payload = result_queue.get(timeout=timeout_seconds)
+        kind, payload = result_queue.get(timeout=max(0.0, timeout_seconds))
     except queue.Empty:
-        return default, True
+        return default, "timeout"
     if kind == "error":
-        return default, False
-    return payload, False
+        return default, "error"
+    return payload, None
+
+
+def _run_bounded(fn, *args, timeout_seconds: float, default: Any):
+    """Backward-compatible boolean wrapper around :func:`_run_bounded_result`."""
+    value, reason = _run_bounded_result(
+        fn, *args, timeout_seconds=timeout_seconds, default=default
+    )
+    # Preserve the historical boolean meaning for callers that only need to
+    # distinguish a timeout. New consumers use ``_run_bounded_result`` to see
+    # the explicit error reason as well.
+    return value, reason in {"timeout", "in_flight"}
 
 
 def _get_conn():
@@ -445,35 +483,33 @@ def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
         return
 
 
-_CODEX_ORPHAN_RE = re.compile(r"codex/codex\b")
-
-
 def _is_fleet_owned(conn: sqlite3.Connection, proc: runaway.RunawayProcess) -> bool:
-    """Check if a process is owned by Fleet Watch.
+    """Return true only for an explicitly registered disposable workload.
 
-    Auto-kill requires real ownership evidence, not regex classification.
-    Two paths qualify:
-    1. Registered in Fleet Watch registry (explicit registration via discover/register)
-    2. Codex binary orphan — launched by our bootstrap but never registered
-       (narrow exception: only the Codex native binary path, not broad patterns)
+    A command-line resemblance (including a Codex path) is never ownership
+    evidence and can never authorize a signal.
     """
-    if registry.get_process(conn, proc.pid) is not None:
-        return True
-    if _CODEX_ORPHAN_RE.search(proc.command):
-        return True
-    return False
+    if registry.get_process(conn, proc.pid) is None:
+        return False
+    registration = registry.get_disposable_registration(conn, proc.pid)
+    return bool(
+        registration
+        and registration.get("service_class") == process_policy.SERVICE_DISPOSABLE
+        and registration.get("owner_id")
+    )
 
 
 def _run_runaway_tick(
     conn: sqlite3.Connection,
     tracker: runaway.DaemonRunawayTracker,
     tracker_path: Path | None = None,
-    auto_kill: bool = True,
+    auto_kill: bool = False,
 ) -> list[runaway.RunawayProcess]:
-    """Run one runaway tracker tick, log events, kill Fleet-owned runaways if auto_kill.
+    """Run one runaway tracker tick and log policy-bounded decisions.
 
-    Auto-kill requires real ownership evidence: registry entry or Codex orphan match.
-    Unowned processes (ML training, ffmpeg, external vllm) get an EXTERNAL warning only.
+    CPU/runtime is advisory. A signal is attempted only when an explicit
+    disposable registration and the shared identity contract are both present;
+    this daemon does not manufacture missing parent/session/stdio evidence.
     """
     try:
         newly_flagged = tracker.tick()
@@ -494,8 +530,30 @@ def _run_runaway_tick(
                 "fleet_owned": fleet_owned,
             },
         )
-        if auto_kill and fleet_owned:
-            success = runaway.kill_runaway(proc.pid)
+        registration = registry.get_disposable_registration(conn, proc.pid)
+        candidate = {
+            "classification": "orphan_confirmed" if fleet_owned else None,
+            "owner_dead": False,
+            "inspection_complete": False,
+        }
+        decision = process_policy.evaluate(
+            process_policy.snapshot_process(proc.pid),
+            candidate=candidate,
+            disposable_registration=registration,
+            operator_confirmed=auto_kill,
+        )
+        if auto_kill and decision.allowed:
+            outcome = process_policy.revalidate_and_terminate(
+                decision,
+                candidate=candidate,
+                disposable_registration=registration,
+            )
+            success = outcome.outcome == "exited"
+            _log_process_decision(
+                conn,
+                outcome,
+                context="runaway:termination",
+            )
             event_type = "RUNAWAY_KILL" if success else "RUNAWAY_KILL_FAILED"
             events.log_event(
                 conn,
@@ -505,9 +563,10 @@ def _run_runaway_tick(
                 detail={
                     "cpu_pct": proc.cpu_pct,
                     "command": proc.command[:200],
+                    "decision": outcome.receipt(),
                 },
             )
-            status = "killed" if success else "KILL FAILED"
+            status = "killed" if success else f"KILL DENIED ({outcome.reason})"
             click.echo(
                 f"RUNAWAY: PID {proc.pid} ({proc.name}) — "
                 f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} ticks — {status}"
@@ -517,6 +576,21 @@ def _run_runaway_tick(
             click.echo(
                 f"{label}: runaway PID {proc.pid} ({proc.name}) — "
                 f"CPU {proc.cpu_pct:.1f}% for {runaway.DAEMON_CONSECUTIVE_TICKS} consecutive ticks"
+            )
+            _log_process_decision(
+                conn,
+                decision,
+                context=f"runaway:{'auto' if auto_kill else 'advisory'}",
+            )
+            events.log_event(
+                conn,
+                "RUNAWAY_DECISION",
+                pid=proc.pid,
+                workstream="runaway",
+                detail={
+                    "decision": decision.receipt(),
+                    "auto_kill_requested": auto_kill,
+                },
             )
     if tracker_path is not None:
         tracker.save(tracker_path)
@@ -566,8 +640,14 @@ def _build_guard_payload(
     budget = state["gpu_budget"]
     normalized_write_scopes = referee.normalize_write_scopes(repo_dir, write_scopes)
 
-    # H1: discover ollama runners for guard decisions
-    runner_reports = ollama_runners.discover_ollama_runners()
+    # H1: discover ollama runners for guard decisions. The advisory scan is
+    # bounded and its uncertainty is additive; it never changes the independent
+    # port/repo/GPU decision.
+    runner_reports, runner_reason = _run_bounded_result(
+        ollama_runners.discover_ollama_runners,
+        timeout_seconds=STATUS_DISCOVERY_TIMEOUT_SECONDS,
+        default=[],
+    )
     runner_entries = ollama_runners.runner_entries_for_status(runner_reports)
     actual_gpu = ollama_runners.total_actual_gpu_mb(runner_reports)
 
@@ -597,6 +677,13 @@ def _build_guard_payload(
             "actual_ollama_gpu_mb": actual_gpu,
         },
     }
+    if runner_reason is not None:
+        payload["discovery_degraded"] = {
+            "ollama_runner_scan": {
+                "degraded": True,
+                "reason": runner_reason,
+            }
+        }
     registry_warnings = registry.registry_warnings_for()
     if registry_warnings:
         payload["registry_warnings"] = registry_warnings
@@ -938,33 +1025,119 @@ def _build_reconcile_payload(conn) -> dict[str, Any]:
     }
 
 
-def _terminate_orphan(pid: int, grace_seconds: float = 1.5) -> bool:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
+def _candidate_from_process_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Translate a registry classification into conservative policy evidence."""
+    lease = row.get("session_lease") or {}
+    owner_pid = lease.get("owner_pid", row.get("session_lease_owner_pid"))
+    owner_create = lease.get("owner_create_time")
+    owner_identity = registry._owner_identity_proven(owner_pid, owner_create)
+    parent_pid = row.get("parent_pid")
+    parent_alive = registry._pid_exists(parent_pid) if parent_pid else False
+    return {
+        "classification": row.get("classification"),
+        "owner_dead": owner_identity is False,
+        "owner_identity_proven": owner_identity,
+        "lease_active": bool(row.get("session_lease_status") == "ACTIVE"),
+        "parent_alive": parent_alive,
+        "session_alive": bool(row.get("session_lease_owner_alive")),
+        # Registry rows do not establish stdio-peer or active-work ownership.
+        "stdio_peer_alive": None,
+        "active_work": None,
+        "inspection_complete": False,
+    }
+
+
+def _decide_orphan(
+    pid: int,
+    *,
+    candidate: dict[str, Any] | None = None,
+    disposable_registration: dict[str, Any] | None = None,
+    operator_confirmed: bool = False,
+    allow_force: bool = False,
+) -> process_policy.PolicyDecision:
+    """Return the shared policy decision without sending a signal."""
+    # Callers that have a candidate provide all required evidence.  A bare PID
+    # is intentionally insufficient; there is no implicit registry lookup that
+    # can manufacture missing ownership/stdio evidence.
+    identity = process_policy.snapshot_process(pid)
+    if candidate is None:
+        candidate = {
+            "classification": None,
+            "owner_dead": False,
+            "inspection_complete": False,
+        }
+    if disposable_registration is None:
+        try:
+            conn = registry.connect()
+            try:
+                disposable_registration = registry.get_disposable_registration(conn, pid)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - uncertainty is a denial
+            disposable_registration = None
+    return process_policy.evaluate(
+        identity,
+        candidate=candidate,
+        disposable_registration=disposable_registration,
+        operator_confirmed=operator_confirmed,
+        allow_force=allow_force,
+    )
+
+
+def _log_process_decision(
+    conn: sqlite3.Connection,
+    decision: process_policy.PolicyDecision,
+    *,
+    context: str,
+) -> dict[str, Any]:
+    """Persist one structured decision receipt in the append-only event chain."""
+    receipt = decision.receipt()
+    events.log_event(
+        conn,
+        "PROCESS_DECISION",
+        pid=receipt.get("observed_identity", {}).get("pid") if receipt.get("observed_identity") else None,
+        workstream="process_policy",
+        detail={"context": context, "receipt": receipt},
+    )
+    return receipt
+
+
+def _terminate_orphan(
+    pid: int,
+    grace_seconds: float = 1.5,
+    *,
+    candidate: dict[str, Any] | None = None,
+    disposable_registration: dict[str, Any] | None = None,
+    operator_confirmed: bool = False,
+    allow_force: bool = False,
+) -> bool:
+    """Signal only a freshly revalidated, explicitly disposable orphan."""
+    if disposable_registration is None:
+        try:
+            conn = registry.connect()
+            try:
+                disposable_registration = registry.get_disposable_registration(conn, pid)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - uncertainty is a denial
+            disposable_registration = None
+    decision = _decide_orphan(
+        pid,
+        candidate=candidate,
+        disposable_registration=disposable_registration,
+        operator_confirmed=operator_confirmed,
+        allow_force=allow_force,
+    )
+    if not decision.allowed:
         return False
-
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not registry._pid_exists(pid):
-            return True
-        time.sleep(0.1)
-
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not registry._pid_exists(pid):
-            return True
-        time.sleep(0.1)
-    return not registry._pid_exists(pid)
+    outcome = process_policy.revalidate_and_terminate(
+        decision,
+        candidate=candidate,
+        disposable_registration=disposable_registration,
+        grace_seconds=grace_seconds,
+        allow_force=allow_force,
+    )
+    return outcome.outcome == "exited"
 
 
 def _render_launchd_plist(executable: str, interval: int) -> str:
@@ -1020,6 +1193,9 @@ def _mcp_reap_candidates() -> list[dict[str, Any]]:
 def _mcp_surface_lines(mcp: Any) -> list[str]:
     """NS-17 B3: format the read-only MCP-orphan surfacing for `fleet discover`.
     Pure (no I/O, no kill) so it is unit-testable. Returns echo lines."""
+    error = getattr(mcp, "error", None)
+    if error:
+        return [f"MCP scan UNKNOWN: {error}"]
     if not getattr(mcp, "mcp_process_count", 0):
         return []
     if getattr(mcp, "orphans_detected", False):

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_watch import counters, discover, events, referee, registry, syshealth
+from fleet_watch.singleflight import SingleFlight
 from fleet_watch.discovery import ollama_runners, orphan_detector
 from fleet_watch.guards import memory_pressure
 
@@ -56,6 +57,7 @@ def build_state(
     *,
     runner_reports: list[ollama_runners.OllamaRunnerReport] | None = None,
     orphan_result: orphan_detector.OrphanDetectionResult | None = None,
+    bounded: bool = False,
 ) -> dict[str, Any]:
     """Build the full observability state. Includes system health (subprocess calls).
 
@@ -64,11 +66,69 @@ def build_state(
     triggering a second, unbounded scan here -- `fleet status --json` does
     this (see cli.py `status()`) because both probes fan out to per-process
     subprocess/socket calls with no aggregate cap, which measured an 8s
-    `fleet status` timeout in CURRENT_MACHINE_STATE. Callers that don't pass
-    either (every other `write_report()` call site) keep the prior
-    unbounded-but-individually-timed-out behavior unchanged.
+    `fleet status` timeout in CURRENT_MACHINE_STATE. ``bounded=True`` is the
+    strict status path: it skips the remaining per-PID observability fan-out
+    and reports those sections as UNKNOWN instead of turning a timeout into a
+    clean empty report. Callers that don't request bounded mode keep the prior
+    detailed-but-individually-timed-out behavior.
     """
     state = build_guard_state(conn)
+
+    if bounded:
+        # A status response has a wall-clock contract. Do not start a second
+        # unbounded per-PID fan-out after the caller already bounded its two
+        # headline probes. Unknown is safer than a fabricated empty section.
+        classifications: list[dict[str, Any]] = []
+        stale: list[dict[str, Any]] = []
+        recent = events.get_events(conn, hours=1, limit=20)
+        conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
+        decision_receipts = [
+            event.get("detail", {}).get("receipt", {})
+            for event in events.get_events(
+                conn, hours=24, event_type="PROCESS_DECISION", limit=50
+            )
+        ]
+        memory = syshealth.MemoryState(
+            0, 0, 0, 0, 0, 0, failure_reason="bounded_status"
+        )
+        sessions: list[Any] = []
+        idle: list[Any] = []
+        gpu_monitor = discover.load_gpu_monitor_state()
+        runner_reports = runner_reports or []
+        orphan_result = orphan_result or orphan_detector.OrphanDetectionResult(
+            error="bounded_status_not_probed"
+        )
+        gate_counters = counters.load_counters()
+        state.update(
+            {
+                "session_leases": registry.list_active_session_leases(conn),
+                "session_lease_counts": registry.get_session_lease_counts(conn),
+                "process_classifications": classifications,
+                "stale_processes": stale,
+                "recent_events": recent,
+                "conflicts_prevented_24h": len(conflicts_24h),
+                "system_memory": memory.to_dict(),
+                "sessions": [],
+                "idle_processes": [],
+                "gpu_memory_monitor": gpu_monitor,
+                "ollama_runners": [r.to_dict() for r in runner_reports],
+                "ollama_runner_entries": ollama_runners.runner_entries_for_status(
+                    runner_reports
+                ),
+                "actual_ollama_gpu_mb": ollama_runners.total_actual_gpu_mb(
+                    runner_reports
+                ),
+                "swap_pressure": {
+                    "available": False,
+                    "failure_reason": "bounded_status_not_probed",
+                },
+                "orphan_detection": orphan_result.to_dict(),
+                "gate_counters": gate_counters.to_dict(),
+            }
+        )
+        if decision_receipts:
+            state["decision_receipts"] = decision_receipts
+        return state
 
     classifications = registry.get_process_classifications(conn)
     stale = [
@@ -77,6 +137,12 @@ def build_state(
     ]
     recent = events.get_events(conn, hours=1, limit=20)
     conflicts_24h = events.get_events(conn, hours=24, event_type="CONFLICT")
+    decision_receipts = [
+        event.get("detail", {}).get("receipt", {})
+        for event in events.get_events(
+            conn, hours=24, event_type="PROCESS_DECISION", limit=50
+        )
+    ]
 
     config = discover.load_config()
     health_config = syshealth.load_health_config(config)
@@ -144,6 +210,8 @@ def build_state(
         "orphan_detection": orphan_result.to_dict(),
         "gate_counters": gate_counters.to_dict(),
     })
+    if decision_receipts:
+        state["decision_receipts"] = decision_receipts
     return state
 
 
@@ -611,11 +679,11 @@ def _diff_state(prev: dict[str, Any], curr: dict[str, Any]) -> dict[str, Any]:
 def _append_changelog(log_path: Path, entry: dict[str, Any]) -> None:
     """Append a changelog entry and decay old entries if needed."""
     line = json.dumps(entry, separators=(",", ":"), default=str) + "\n"
-    with log_path.open("a") as f:
-        f.write(line)
-
-    # Decay: if file is too large, keep the newest half
     try:
+        with log_path.open("a") as f:
+            f.write(line)
+
+        # Decay: if file is too large, keep the newest half
         all_lines = log_path.read_text().splitlines()
         if len(all_lines) > CHANGELOG_MAX_LINES:
             keep = all_lines[len(all_lines) - CHANGELOG_MAX_LINES // 2:]
@@ -647,12 +715,24 @@ def _atomic_write_text(path: Path, content: str) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def write_report(conn: sqlite3.Connection, output_dir: Path | None = None) -> tuple[Path, Path]:
-    """Publish one report generation, using JSON as the final commit marker."""
+def write_report(
+    conn: sqlite3.Connection,
+    output_dir: Path | None = None,
+    *,
+    bounded: bool = False,
+) -> tuple[Path, Path]:
+    """Publish one serialized report generation."""
     out = output_dir or registry.FLEET_DIR
     out.mkdir(parents=True, exist_ok=True)
+    with SingleFlight(out / ".report.lock", timeout_seconds=2.0):
+        return _write_report_unlocked(conn, out, bounded=bounded)
 
-    state = build_state(conn)
+
+def _write_report_unlocked(
+    conn: sqlite3.Connection, out: Path, *, bounded: bool = False
+) -> tuple[Path, Path]:
+    """Publish one report generation, using JSON as the final commit marker."""
+    state = build_state(conn, bounded=bounded)
     markdown_payload = generate_markdown(state)
     json_payload = generate_json(state)
 

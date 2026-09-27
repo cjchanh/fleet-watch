@@ -1033,19 +1033,21 @@ def test_reap_sessions_confirm_kills_member_pids(tmp_path, monkeypatch):
 
     terminated_pids: list[int] = []
 
-    def fake_terminate(pid, grace_seconds=1.5):
+    def fake_terminate(pid, grace_seconds=1.5, **kwargs):
         terminated_pids.append(pid)
-        return True
+        assert kwargs["candidate"]["inspection_complete"] is False
+        return False
 
     monkeypatch.setattr(_command_module("reap"), "_terminate_orphan", fake_terminate)
 
     runner = CliRunner()
     result = runner.invoke(cli_module.cli, ["reap-sessions", "--confirm", "--json"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     payload = json.loads(result.output)
     assert payload["confirmed"] is True
-    assert payload["killed"][0]["pid"] == 99901
+    assert payload["killed"] == []
+    assert payload["failed"][0]["pid"] == 99901
     assert sorted(terminated_pids) == [99901, 99902]
 
 
@@ -1776,6 +1778,18 @@ def test_status_json_degrades_when_orphan_probe_hangs(tmp_path, monkeypatch):
 
 def test_status_json_not_degraded_when_probes_are_fast(tmp_path, monkeypatch):
     _patch_paths(monkeypatch, tmp_path)
+    # Isolate this CLI invocation from a prior test's deliberately hanging
+    # probe worker; production still returns UNKNOWN/in_flight for that case.
+    monkeypatch.setattr(
+        cli_module.ollama_runners,
+        "discover_ollama_runners",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        cli_module.orphan_detector,
+        "detect_orphans",
+        lambda: cli_module.orphan_detector.OrphanDetectionResult(),
+    )
     runner = CliRunner()
 
     result = runner.invoke(cli_module.cli, ["status", "--json"])

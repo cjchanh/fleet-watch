@@ -16,6 +16,7 @@ from typing import Any, Sequence
 from xml.parsers.expat import ExpatError
 
 from fleet_watch.constants import LSOF_BIN, PS_BIN, SYSCTL_BIN
+from fleet_watch.probe_runner import run_isolated
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -75,26 +76,20 @@ def run_probe(argv: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> ProbeRes
     """Run a read-only command. Returns a ProbeResult; never raises."""
     command = " ".join(argv)
     try:
-        proc = subprocess.run(
+        proc = run_isolated(
             list(argv),
-            capture_output=True,
-            text=True,
-            # `ps` echoes raw argv, which is not guaranteed to be valid UTF-8.
-            # Strict decoding would raise UnicodeDecodeError — not an OSError,
-            # so it would escape this handler and break "probes never raise".
+            timeout_seconds=timeout,
             errors="replace",
-            timeout=timeout,
-            check=False,
         )
     except FileNotFoundError:
         return ProbeResult(command, False, error="executable not found")
     except PermissionError:
         return ProbeResult(command, False, error="permission denied")
-    except subprocess.TimeoutExpired:
-        return ProbeResult(command, False, error=f"timed out after {timeout:g}s")
     except OSError as exc:  # pragma: no cover - defensive
         return ProbeResult(command, False, error=f"os error: {exc}")
 
+    if proc.timed_out:
+        return ProbeResult(command, False, error=f"timed out after {timeout:g}s")
     if proc.returncode != 0 and not proc.stdout.strip():
         detail = (proc.stderr or "").strip().splitlines()
         reason = detail[0][:200] if detail else "no output"

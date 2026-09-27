@@ -15,6 +15,34 @@ from typing import Any
 
 from fleet_watch import events, gpu_estimator, referee, registry, syshealth
 from fleet_watch.constants import PS_BIN
+from fleet_watch.singleflight import SingleFlight, SingleFlightBusy
+
+
+DISCOVERY_DEADLINE_SECONDS = 8.0
+DISCOVERY_OUTPUT_LIMIT = 512
+_DISCOVERY_LOCK_NAME = ".discover.lock"
+
+
+class DiscoveryResult(list):
+    """List-compatible discovery payload with explicit collection status.
+
+    Existing callers can continue treating discovery as a list.  Sync and
+    status consumers use ``status`` to distinguish a real empty scan from a
+    failed, truncated, or contended collection.
+    """
+
+    def __init__(
+        self,
+        values: list[DiscoveredProcess] | tuple[DiscoveredProcess, ...] = (),
+        *,
+        status: str = "OK",
+        errors: list[dict[str, Any]] | None = None,
+        duration_seconds: float = 0.0,
+    ):
+        super().__init__(values)
+        self.status = status
+        self.errors = errors or []
+        self.duration_seconds = duration_seconds
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "gpu_total_mb": registry.DEFAULT_GPU_TOTAL_MB,
@@ -130,47 +158,72 @@ def preferred_ports(config: dict[str, Any] | None = None) -> list[int]:
     return [int(port) for port in ports]
 
 
-def _get_listeners() -> dict[int, int]:
-    """Return {pid: port} for all TCP listeners.
-
-    Reads the socket table through ``referee.socket_table_listeners`` — the
-    same enumeration the referee uses to VERIFY that a discovered PID really
-    owns the port it is about to be registered on. Sharing one reader is the
-    point: if the finder and the verifier read different tables, discovery
-    can register a listener the verifier will then refuse.
-
-    The dict keeps the historical shape (first port seen per PID) and is
-    lossy for a process listening on several ports; ownership verification
-    uses the full pair list instead, so nothing depends on this narrowing.
-    """
+def _get_listeners_with_status(
+    *, deadline: float | None = None
+) -> tuple[dict[int, int], str, list[dict[str, Any]]]:
+    """Read listeners and preserve ``UNKNOWN`` when the socket probe fails."""
+    timeout = None
+    if deadline is not None:
+        timeout = max(0.05, min(5.0, deadline - time.monotonic()))
+    try:
+        try:
+            pairs = referee.socket_table_listeners(timeout=timeout)
+        except TypeError:
+            # Compatibility with injected test doubles and older callers that
+            # expose the no-argument contract.
+            pairs = referee.socket_table_listeners()
+    except (OSError, subprocess.SubprocessError):
+        pairs = None
+    if pairs is None:
+        return {}, "UNKNOWN", [{"probe": "listeners", "error": "unavailable"}]
     result: dict[int, int] = {}
-    for pid, port in referee.socket_table_listeners() or ():
+    for pid, port in pairs:
         result.setdefault(pid, port)
+    return result, "OK", []
+
+
+def _get_listeners() -> dict[int, int]:
+    """Compatibility wrapper returning only the listener map."""
+    result, status, _errors = _get_listeners_with_status()
+    if status != "OK":
+        return {}
     return result
 
 
-def _get_process_commands() -> dict[int, str]:
-    """Return {pid: command} for all running processes."""
+def _get_process_commands_with_status(
+    *, deadline: float | None = None
+) -> tuple[dict[int, str], str, list[dict[str, Any]]]:
+    """Read process argv with a bounded aggregate deadline and honest status."""
     commands = (
         [PS_BIN, "axww", "-o", "pid=", "-o", "args="],
         [PS_BIN, "-eo", "pid,command"],
     )
     result: dict[int, str] = {}
+    errors: list[dict[str, Any]] = []
+    ran_any = False
 
-    for cmd in commands:
+    for index, cmd in enumerate(commands):
+        if deadline is not None and time.monotonic() >= deadline:
+            errors.append({"probe": "ps", "error": "aggregate_deadline"})
+            return result, "UNKNOWN", errors
+        timeout = 5.0
+        if deadline is not None:
+            timeout = max(0.05, min(timeout, deadline - time.monotonic()))
         try:
             out = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=timeout,
                 check=False,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError) as exc:
+            errors.append({"probe": "ps", "attempt": index, "error": type(exc).__name__})
             continue
         if out.returncode != 0:
+            errors.append({"probe": "ps", "attempt": index, "error": "nonzero_exit"})
             continue
-
+        ran_any = True
         for line in out.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -183,7 +236,15 @@ def _get_process_commands() -> dict[int, str]:
             except ValueError:
                 continue
         if result:
-            return result
+            return result, ("UNKNOWN" if errors else "OK"), errors
+    if not ran_any:
+        return result, "UNKNOWN", errors or [{"probe": "ps", "error": "unavailable"}]
+    return result, ("UNKNOWN" if errors else "OK"), errors
+
+
+def _get_process_commands() -> dict[int, str]:
+    """Compatibility wrapper returning only the process command map."""
+    result, _status, _errors = _get_process_commands_with_status()
     return result
 
 
@@ -524,32 +585,65 @@ def _prefer_listener_owned_processes(found: list[DiscoveredProcess]) -> list[Dis
     )
 
 
-def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
-    """Scan the system for processes matching known patterns."""
+def discover(
+    config: dict[str, Any] | None = None,
+    *,
+    deadline_seconds: float = DISCOVERY_DEADLINE_SECONDS,
+) -> DiscoveryResult:
+    """Scan known workloads with one aggregate deadline and explicit status."""
+    started = time.monotonic()
+    deadline = started + max(0.1, float(deadline_seconds))
     loaded = config or load_config()
-    listeners = _get_listeners()
-    commands = _get_process_commands()
+    listeners, listener_status, listener_errors = _get_listeners_with_status(
+        deadline=deadline
+    )
+    commands, command_status, command_errors = _get_process_commands_with_status(
+        deadline=deadline
+    )
+    errors = [*listener_errors, *command_errors]
+    if listener_status != "OK" or command_status != "OK":
+        return DiscoveryResult(
+            [],
+            status="UNKNOWN",
+            errors=errors or [{"probe": "discover", "error": "unavailable"}],
+            duration_seconds=time.monotonic() - started,
+        )
+
     found: list[DiscoveredProcess] = []
+    try:
+        patterns = loaded["patterns"]
+    except (KeyError, TypeError):
+        return DiscoveryResult(
+            [],
+            status="UNKNOWN",
+            errors=[{"probe": "config", "error": "patterns_missing"}],
+            duration_seconds=time.monotonic() - started,
+        )
 
     for pid, cmd in commands.items():
-        for pattern in loaded["patterns"]:
+        if time.monotonic() >= deadline:
+            return DiscoveryResult(
+                found,
+                status="UNKNOWN",
+                errors=[{"probe": "discover", "error": "aggregate_deadline"}],
+                duration_seconds=time.monotonic() - started,
+            )
+        for pattern in patterns:
             regex = pattern["process_match"]
             if re.search(regex, cmd):
                 listener_port = listeners.get(pid)
                 port = listener_port
-                # Some patterns have a default port (e.g., ollama always on 11434)
+                # Some patterns have a default port (e.g. Ollama on 11434).
                 if port is None:
                     port = pattern.get("port_default")
 
                 model = _extract_model(cmd)
                 gpu_mb = _estimate_gpu(pattern, model)
                 short = _model_short(model)
-
                 name = pattern["name_template"].format(
                     model_short=short,
                     model=model or "unknown",
                 )
-
                 found.append(
                     DiscoveredProcess(
                         pid=pid,
@@ -566,10 +660,79 @@ def discover(config: dict[str, Any] | None = None) -> list[DiscoveredProcess]:
                 )
                 break  # First match wins
 
-    return _prefer_listener_owned_processes(found)
+    found = _prefer_listener_owned_processes(found)
+    if len(found) > DISCOVERY_OUTPUT_LIMIT:
+        return DiscoveryResult(
+            found[:DISCOVERY_OUTPUT_LIMIT],
+            status="UNKNOWN",
+            errors=[{"probe": "discover", "error": "output_limit"}],
+            duration_seconds=time.monotonic() - started,
+        )
+    return DiscoveryResult(
+        found,
+        status="OK",
+        errors=[],
+        duration_seconds=time.monotonic() - started,
+    )
 
 
-def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def _empty_sync_result(
+    *, status: str, reason: str, errors: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Return a non-empty, explicit UNKNOWN cycle result.
+
+    An empty list is a valid observation only when ``status == "OK"``.  Keeping
+    the stable keys means existing consumers can render the refusal without
+    mistaking it for a clean scan.
+    """
+    return {
+        "status": status,
+        "reason": reason,
+        "errors": errors or [],
+        "added": [],
+        "cleaned": [],
+        "skipped": [],
+        "thunder_synced": 0,
+        "session_leases_cleaned": 0,
+        "gpu_memory_monitor": None,
+    }
+
+
+def sync(
+    conn: sqlite3.Connection | None = None,
+    config: dict[str, Any] | None = None,
+    *,
+    lock_timeout_seconds: float = 0.25,
+) -> dict[str, Any]:
+    """Run one bounded, single-flight discovery/mutation cycle.
+
+    A contended or failed collection is explicit ``UNKNOWN`` and performs no
+    registry cleanup or registration.  This keeps launchd, manual invocations,
+    and watch ticks from turning a slow probe into an empty success.
+    """
+    close_conn = conn is None
+    if conn is None:
+        conn = registry.connect()
+    try:
+        flight = SingleFlight(
+            registry.FLEET_DIR / _DISCOVERY_LOCK_NAME,
+            timeout_seconds=max(0.0, float(lock_timeout_seconds)),
+        )
+        try:
+            with flight:
+                return _sync_unlocked(conn=conn, config=config)
+        except SingleFlightBusy:
+            return _empty_sync_result(
+                status="UNKNOWN", reason="discovery_in_progress"
+            )
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def _sync_unlocked(
+    conn: sqlite3.Connection, config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Discover processes and sync with registry. Returns summary."""
     close_conn = False
     if conn is None:
@@ -577,7 +740,35 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
         close_conn = True
 
     config = config or load_config()
-    discovered = discover(config=config)
+    try:
+        discovered_result = discover(config=config)
+    except Exception as exc:  # noqa: BLE001 - failed collection is explicit UNKNOWN
+        return _empty_sync_result(
+            status="UNKNOWN",
+            reason="probe_failure",
+            errors=[{"probe": "discover", "error": type(exc).__name__}],
+        )
+    discovery_status = getattr(discovered_result, "status", "OK")
+    discovery_errors = list(getattr(discovered_result, "errors", []) or [])
+    if discovery_status != "OK":
+        return _empty_sync_result(
+            status="UNKNOWN",
+            reason="probe_failure",
+            errors=discovery_errors,
+        )
+    discovered = list(discovered_result)
+    if len(discovered) > DISCOVERY_OUTPUT_LIMIT:
+        return _empty_sync_result(
+            status="UNKNOWN",
+            reason="output_limit",
+            errors=[
+                {
+                    "probe": "discover",
+                    "count": len(discovered),
+                    "limit": DISCOVERY_OUTPUT_LIMIT,
+                }
+            ],
+        )
     discovered_pids = {proc.pid for proc in discovered}
     registered = registry.get_all_processes(conn)
     replacement_keys = {
@@ -719,6 +910,9 @@ def sync(conn: sqlite3.Connection | None = None, config: dict[str, Any] | None =
         conn.close()
 
     return {
+        "status": "OK",
+        "reason": "",
+        "errors": [],
         "added": added,
         "cleaned": cleaned,
         "skipped": skipped,

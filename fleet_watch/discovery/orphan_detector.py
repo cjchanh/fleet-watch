@@ -50,8 +50,10 @@ class OrphanDetectionResult:
 _RUNNER_RE = re.compile(r"ollama[ _-]runner")
 
 
-def _get_known_models(port: int = 11434) -> list[str]:
-    """Query Ollama /api/ps for known-loaded model names."""
+def _get_known_models_with_status(
+    port: int = 11434,
+) -> tuple[list[str], str | None]:
+    """Query Ollama /api/ps and preserve probe failure as UNKNOWN."""
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/ps",
@@ -59,13 +61,30 @@ def _get_known_models(port: int = 11434) -> list[str]:
         )
         with urllib.request.urlopen(req, timeout=3) as resp:  # nosec B310 - loopback-only probe; tests/test_no_external_egress.py enforces the host set
             data = json.loads(resp.read())
-            return [m.get("name", "unknown") for m in data.get("models", [])]
-    except (OSError, TimeoutError, http.client.HTTPException, ValueError, TypeError, AttributeError, KeyError):
-        return []
+            models = data.get("models", [])
+            if not isinstance(models, list):
+                return [], "known_models_malformed"
+            return [m.get("name", "unknown") for m in models], None
+    except (
+        OSError,
+        TimeoutError,
+        http.client.HTTPException,
+        ValueError,
+        TypeError,
+        AttributeError,
+        KeyError,
+    ) as exc:
+        return [], f"known_models_{type(exc).__name__}"
 
 
-def _get_runner_processes() -> list[dict[str, Any]]:
-    """Find ollama runner processes via ps aux."""
+def _get_known_models(port: int = 11434) -> list[str]:
+    """Compatibility wrapper returning only model names."""
+    models, _error = _get_known_models_with_status(port)
+    return models
+
+
+def _get_runner_processes_with_status() -> tuple[list[dict[str, Any]], str | None]:
+    """Find runner processes and preserve a failed ps probe as UNKNOWN."""
     try:
         out = subprocess.run(
             [PS_BIN, "aux"],
@@ -74,10 +93,10 @@ def _get_runner_processes() -> list[dict[str, Any]]:
             timeout=5,
             check=False,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return []
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError) as exc:
+        return [], f"ps_{type(exc).__name__}"
     if out.returncode != 0:
-        return []
+        return [], "ps_nonzero_exit"
 
     runners: list[dict[str, Any]] = []
     for line in out.stdout.splitlines():
@@ -98,6 +117,12 @@ def _get_runner_processes() -> list[dict[str, Any]]:
                 "cmdline": parts[10] if len(parts) > 10 else "",
             }
         )
+    return runners, None
+
+
+def _get_runner_processes() -> list[dict[str, Any]]:
+    """Compatibility wrapper returning only runner rows."""
+    runners, _error = _get_runner_processes_with_status()
     return runners
 
 
@@ -109,16 +134,25 @@ def detect_orphans(
 
     Parameters are injectable for deterministic unit testing.
     """
+    errors: list[str] = []
     if known_models is None:
-        known_models = _get_known_models()
+        known_models, error = _get_known_models_with_status()
+        if error:
+            errors.append(error)
     if runners is None:
-        runners = _get_runner_processes()
+        runners, error = _get_runner_processes_with_status()
+        if error:
+            errors.append(error)
 
     result = OrphanDetectionResult(
         known_model_count=len(known_models),
         runner_process_count=len(runners),
         known_model_names=list(known_models),
+        error=";".join(errors) if errors else None,
     )
+    if errors:
+        # A failed input is not evidence that the other side has orphans.
+        return result
 
     if result.runner_process_count <= result.known_model_count:
         return result

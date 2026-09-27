@@ -19,9 +19,46 @@ from fleet_watch.cli_support import (
     _notify_attention,
     _notify_conflict,
     _publish_report_after_ack,
+    _run_bounded_result,
+    STATUS_DISCOVERY_TIMEOUT_SECONDS,
     _run_runaway_tick,
 )
 from fleet_watch.discovery import mcp_orphan_detector
+
+
+def _report_write_job():
+    conn = _get_conn()
+    try:
+        try:
+            return reporter.write_report(conn, bounded=True)
+        except TypeError as exc:
+            if "bounded" not in str(exc):
+                raise
+            return reporter.write_report(conn)
+    finally:
+        conn.close()
+
+
+def _attention_job(config):
+    health_config = syshealth.load_health_config(config)
+    return [
+        session
+        for session in syshealth.get_session_processes(
+            patterns=health_config["session_patterns"],
+        )
+        if session.attention
+    ]
+
+
+def _write_report_bounded(conn) -> tuple[bool, str | None]:
+    """Publish a report without allowing a slow probe to hold the cycle."""
+    _value, reason = _run_bounded_result(
+        _report_write_job,
+        timeout_seconds=STATUS_DISCOVERY_TIMEOUT_SECONDS,
+        default=None,
+    )
+    return reason is None, reason
+
 
 @click.command()
 @click.option("--pid", type=int, required=True, help="Process ID")
@@ -36,10 +73,15 @@ from fleet_watch.discovery import mcp_orphan_detector
 @click.option("--restart-policy", type=click.Choice(sorted(registry.RESTART_POLICIES)), default="ALERT_ONLY", help="Restart policy for the process")
 @click.option("--start-cmd", default=None, help="Command to restart the process")
 @click.option("--expected-duration", type=int, default=None, help="Expected duration in minutes")
+@click.option("--disposable", is_flag=True, help="Explicitly register this live process as disposable cleanup-eligible")
+@click.option("--owner-id", default=None, help="Stable owner/creator identifier required with --disposable")
+@click.option("--executable", default=None, help="Executable identity required with --disposable")
+@click.option("--disposable-ttl", type=int, default=3600, help="Disposable registration lifetime in seconds")
 def register(pid: int, name: str, workstream: str, session_id: str | None,
              port: int | None, gpu_mb: int, repo_dir: str | None, model: str | None,
              priority: int, restart_policy: str, start_cmd: str | None,
-             expected_duration: int | None):
+             expected_duration: int | None, disposable: bool, owner_id: str | None,
+             executable: str | None, disposable_ttl: int):
     """Register a process with Fleet Watch."""
     conn = _get_conn()
 
@@ -75,6 +117,39 @@ def register(pid: int, name: str, workstream: str, session_id: str | None,
         click.echo(f"ERROR: {type(e).__name__}: {e}", err=True)
         conn.close()
         sys.exit(1)
+
+    if disposable:
+        if not owner_id or not executable:
+            click.echo(
+                "DENY: --disposable requires --owner-id and --executable",
+                err=True,
+            )
+            conn.close()
+            sys.exit(1)
+        try:
+            disposable_row = registry.register_disposable_workload(
+                conn,
+                pid=pid,
+                executable=executable,
+                owner_id=owner_id,
+                service_class="disposable",
+                ttl_seconds=disposable_ttl,
+            )
+        except ValueError as exc:
+            click.echo(f"DENY: disposable registration: {exc}", err=True)
+            conn.close()
+            sys.exit(1)
+        events.log_event(
+            conn,
+            "DISPOSABLE_REGISTERED",
+            pid=pid,
+            workstream=workstream,
+            detail={
+                "owner_id": owner_id,
+                "executable": disposable_row["executable"],
+                "expires_at": disposable_row["expires_at"],
+            },
+        )
 
     events.log_event(conn, "REGISTER", pid=pid, workstream=workstream,
                      detail={"name": name, "port": port, "gpu_mb": gpu_mb,
@@ -206,54 +281,83 @@ def discover(auto_kill: bool):
     """Auto-discover running processes and sync registry + state.json."""
     config = discover_mod.load_config()
     conn = _get_conn()
-    result = discover_mod.sync(conn, config=config)
-    reporter.write_report(conn)
-
-    for a in result["added"]:
-        click.echo(f"+ PID {a['pid']} ({a['name']})")
-    for c in result["cleaned"]:
-        click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
-    skipped_list = result.get("skipped", [])
-    for skipped in skipped_list:
-        click.echo(f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}")
-    thunder_count = result.get("thunder_synced", 0)
-    if thunder_count:
-        click.echo(f"Thunder: {thunder_count} instance(s) synced")
-    leases_cleaned = result.get("session_leases_cleaned", 0)
-    if leases_cleaned:
-        click.echo(f"Cleaned {leases_cleaned} stale session lease(s)")
-    if not result["added"] and not result["cleaned"] and not skipped_list and not thunder_count and not leases_cleaned:
-        click.echo("No changes. Registry is current.")
-    # Alert on conflicts via macOS notification
-    if skipped_list:
-        _notify_conflict(skipped_list)
-    # Alert on detached hot sessions
-    health_config = syshealth.load_health_config(config)
-    flagged = [
-        s for s in syshealth.get_session_processes(
-            patterns=health_config["session_patterns"],
-        )
-        if s.attention
-    ]
-    if flagged:
-        _notify_attention(flagged)
-
-    # Runaway detection: persistent tracker across discover invocations
-    tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
-    tracker = runaway.DaemonRunawayTracker.load(tracker_path)
-    _run_runaway_tick(conn, tracker, tracker_path=tracker_path,
-                      auto_kill=auto_kill)
-
-    # NS-17 B3: read-only MCP-orphan surfacing (never kills here). Fail-soft —
-    # a detector error must not break discover. The opt-in kill path
-    # (fleet reap --include-mcp) is the governed remainder, spec 2616440.
     try:
-        for _line in _mcp_surface_lines(mcp_orphan_detector.detect()):
-            click.echo(_line)
-    except Exception as exc:  # noqa: BLE001 — surfacing must never break discover
-        click.echo(f"! MCP orphan scan skipped: {type(exc).__name__}", err=True)
+        result = discover_mod.sync(conn, config=config)
+        if result.get("status", "OK") != "OK":
+            click.echo(
+                f"! DISCOVERY UNKNOWN: {result.get('reason', 'unspecified')}; "
+                "registry was not mutated",
+                err=True,
+            )
+            return
 
-    conn.close()
+        report_ok, report_reason = _write_report_bounded(conn)
+        if not report_ok:
+            click.echo(
+                f"! REPORT UNKNOWN: {report_reason}; prior generation retained",
+                err=True,
+            )
+
+        for a in result["added"]:
+            click.echo(f"+ PID {a['pid']} ({a['name']})")
+        for c in result["cleaned"]:
+            click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
+        skipped_list = result.get("skipped", [])
+        for skipped in skipped_list:
+            click.echo(
+                f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
+            )
+        thunder_count = result.get("thunder_synced", 0)
+        if thunder_count:
+            click.echo(f"Thunder: {thunder_count} instance(s) synced")
+        leases_cleaned = result.get("session_leases_cleaned", 0)
+        if leases_cleaned:
+            click.echo(f"Cleaned {leases_cleaned} stale session lease(s)")
+        if (
+            report_ok
+            and not result["added"]
+            and not result["cleaned"]
+            and not skipped_list
+            and not thunder_count
+            and not leases_cleaned
+        ):
+            click.echo("No changes. Registry is current.")
+        if skipped_list:
+            _notify_conflict(skipped_list)
+
+        flagged, attention_reason = _run_bounded_result(
+            _attention_job,
+            config,
+            timeout_seconds=STATUS_DISCOVERY_TIMEOUT_SECONDS,
+            default=[],
+        )
+        if attention_reason is not None:
+            click.echo(
+                f"! SESSION ATTENTION UNKNOWN: {attention_reason}",
+                err=True,
+            )
+        elif flagged:
+            _notify_attention(flagged)
+
+        # Runaway detection is advisory unless an explicitly eligible disposable
+        # registration passes the shared identity gate inside the policy layer.
+        tracker_path = registry.FLEET_DIR / "runaway_tracker.json"
+        tracker = runaway.DaemonRunawayTracker.load(tracker_path)
+        _run_runaway_tick(
+            conn,
+            tracker,
+            tracker_path=tracker_path,
+            auto_kill=auto_kill,
+        )
+
+        try:
+            mcp_result = mcp_orphan_detector.detect()
+            for line in _mcp_surface_lines(mcp_result):
+                click.echo(line)
+        except Exception as exc:  # noqa: BLE001 — surfacing must never break discover
+            click.echo(f"! MCP orphan scan UNKNOWN: {type(exc).__name__}", err=True)
+    finally:
+        conn.close()
 
 
 @click.command()
@@ -299,26 +403,42 @@ def watch(interval: int, auto_kill: bool, autonomous: bool, once: bool,
     signal.signal(signal.SIGTERM, _stop)
 
     while running:
+        conn = None
         try:
             conn = _get_conn()
             result = discover_mod.sync(conn)
-            reporter.write_report(conn)
-
-            for a in result["added"]:
-                click.echo(f"+ PID {a['pid']} ({a['name']})")
-            for c in result["cleaned"]:
-                click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
-            for skipped in result.get("skipped", []):
+            if result.get("status", "OK") != "OK":
                 click.echo(
-                    f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
+                    f"! DISCOVERY UNKNOWN: {result.get('reason', 'unspecified')}; "
+                    "registry was not mutated",
+                    err=True,
                 )
-
-            # CPU/runtime heuristics are advisory unless this invocation opts in.
-            _run_runaway_tick(conn, tracker, auto_kill=auto_kill)
-
-            conn.close()
+            else:
+                report_ok, report_reason = _write_report_bounded(conn)
+                if not report_ok:
+                    click.echo(
+                        f"! REPORT UNKNOWN: {report_reason}; prior generation retained",
+                        err=True,
+                    )
+                for a in result["added"]:
+                    click.echo(f"+ PID {a['pid']} ({a['name']})")
+                for c in result["cleaned"]:
+                    click.echo(f"- PID {c['pid']} ({c['name']}) [dead]")
+                for skipped in result.get("skipped", []):
+                    click.echo(
+                        f"! PID {skipped['pid']} ({skipped['name']}) skipped: {skipped['reason']}"
+                    )
+                # CPU/runtime heuristics are advisory unless an eligible
+                # disposable registration passes the identity gate.
+                _run_runaway_tick(conn, tracker, auto_kill=auto_kill)
         except Exception as e:  # noqa: BLE001 — watch loop must not traceback
             click.echo(f"Error: {type(e).__name__}: {e}", err=True)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Interruptible sleep
         for _ in range(interval):

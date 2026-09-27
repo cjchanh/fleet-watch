@@ -9,13 +9,11 @@ Never invokable from other Fleet Watch code paths — always operator-typed.
 
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_watch import process_policy, registry
 from fleet_watch.constants import PGREP_BIN, PS_BIN
 
 
@@ -225,37 +223,45 @@ def _add_child_targets(
 
 
 def _terminate_process(pid: int, grace_seconds: float = 1.5) -> bool:
-    """Send SIGTERM then SIGKILL to a process. Returns True on success."""
+    """Compatibility wrapper that refuses heuristic pattern kills.
+
+    Pattern matching is not ownership or identity evidence.  Callers that have
+    a complete disposable policy decision must use ``process_policy`` (or the
+    governed ``fleet reap`` path) instead of this legacy helper.
+    """
+    identity = process_policy.snapshot_process(pid)
+    registration = None
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
+        conn = registry.connect()
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.1)
-
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
+            registration = registry.get_disposable_registration(conn, pid)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - uncertainty is a denial
+        registration = None
+    decision = process_policy.evaluate(
+        identity,
+        candidate={
+            "classification": None,
+            "owner_dead": False,
+            "inspection_complete": False,
+        },
+        disposable_registration=registration,
+        operator_confirmed=True,
+    )
+    if not decision.allowed:
         return False
-
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.1)
-    return False
+    outcome = process_policy.revalidate_and_terminate(
+        decision,
+        candidate={
+            "classification": None,
+            "owner_dead": False,
+            "inspection_complete": False,
+        },
+        disposable_registration=registration,
+        grace_seconds=grace_seconds,
+    )
+    return outcome.outcome == "exited"
 
 
 def execute_pkill(
