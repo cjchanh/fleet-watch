@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/Users/cj/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.cds.mcp-ttl-reaper</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/cj/Workspace/active/fleet-watch/.venv/bin/python3</string>
+		<string>-m</string>
+		<string>fleet_watch.ttl_reaper</string>
+		<string>--json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/cj/Library/Logs/fleet-watch/mcp-ttl-reaper.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/cj/Library/Logs/fleet-watch/mcp-ttl-reaper.log</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+</dict>
+</plist>

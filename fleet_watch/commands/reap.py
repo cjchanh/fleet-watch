@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from collections.abc import Iterable
 from typing import Any
 
 import click
@@ -133,6 +134,7 @@ def verified_reclaim_pass(
     probes: process_policy.Probes | None = None,
     reclaim: process_policy.ReclaimProbes | None = None,
     sender: Any = None,
+    pids: Iterable[int] | None = None,
 ) -> tuple[dict[str, Any], list[process_policy.ProcessDecision]]:
     """Run one verified reclaim pass and return ``(payload, plans)``.
 
@@ -149,6 +151,14 @@ def verified_reclaim_pass(
 
     The ``probes``/``reclaim``/``sender`` parameters default to the same seams
     the CLI uses; they exist so a caller can inject a test world.
+
+    ``pids`` narrows WHICH captured candidates this pass is asked about, and
+    nothing else (spec 2627003, the TTL reaper's cadence). It is an
+    observation-side filter applied after capture and BEFORE any decision, so
+    every surviving candidate still runs the identical gate, receipt and phase
+    order below — a filter can never authorize, deny or signal anything, and it
+    can never bypass a check. ``None`` (the CLI's behaviour) asks about all of
+    them.
     """
     payload: dict[str, Any] = {
         "mode": VERIFIED_MCP_MODE,
@@ -173,6 +183,11 @@ def verified_reclaim_pass(
         payload["scan_error"] = scan_error
         payload["candidate_count"] = 0
         return payload, []
+
+    if pids is not None:
+        asked_about = {int(pid) for pid in pids}
+        payload["pids_filter"] = sorted(asked_about)
+        candidates = [c for c in candidates if c.pid in asked_about]
 
     if probes is None:
         probes = _mcp_identity_probes()
