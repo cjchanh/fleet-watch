@@ -27,6 +27,18 @@ def _seconds_ago(iso_ts: str) -> int:
     return int((datetime.now(timezone.utc) - ts).total_seconds())
 
 
+def _load_config_degraded() -> tuple[dict[str, Any], bool]:
+    """Config read for read-only status surfaces: degrade, never die.
+
+    An unreadable or malformed config must not hard-crash `fleet status` —
+    the surface reports `config_degraded: true` and serves built-in defaults.
+    """
+    try:
+        return discover.load_config(), True
+    except Exception:  # noqa: BLE001 - a status surface must degrade, not crash
+        return dict(discover.DEFAULT_CONFIG), False
+
+
 def build_guard_state(conn: sqlite3.Connection) -> dict[str, Any]:
     """Build the minimal state needed for guard decisions. Fast path — no subprocess calls."""
     processes = registry.get_all_processes(conn)
@@ -34,12 +46,13 @@ def build_guard_state(conn: sqlite3.Connection) -> dict[str, Any]:
     budget = registry.get_gpu_budget(conn)
     ports = registry.get_claimed_ports(conn)
     repos = registry.get_effective_locked_repos(conn)
-    config = discover.load_config()
+    config, config_ok = _load_config_degraded()
     preferred = discover.preferred_ports(config)
     safe_ports = referee.suggest_ports(conn, preferred_ports=preferred)
 
     return {
         "agent_interface": "fleet guard --json",
+        "config_degraded": not config_ok,
         "generated_utc": _now_iso(),
         "processes": processes,
         "external_resources": external_resources,
@@ -144,7 +157,7 @@ def build_state(
         )
     ]
 
-    config = discover.load_config()
+    config, config_ok = _load_config_degraded()
     health_config = syshealth.load_health_config(config)
     memory = syshealth.get_memory_state()
     sessions = syshealth.get_session_processes(
@@ -173,6 +186,7 @@ def build_state(
     gate_counters = counters.load_counters()
 
     state.update({
+        "config_degraded": not config_ok,
         "session_leases": registry.list_active_session_leases(conn),
         "session_lease_counts": registry.get_session_lease_counts(conn),
         "process_classifications": classifications,

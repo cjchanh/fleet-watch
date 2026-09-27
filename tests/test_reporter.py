@@ -309,3 +309,28 @@ def test_changelog_decays_old_entries(tmp_path):
     assert len(lines) <= reporter.CHANGELOG_MAX_LINES
     # Most recent entry is preserved
     assert "T-final" in lines[-1]
+
+
+def test_build_guard_state_degrades_on_unreadable_config(monkeypatch):
+    """A read-only surface degrades on an unreadable config instead of dying."""
+    conn = _fresh_conn()
+
+    def boom():
+        raise OSError("unreadable config")
+
+    monkeypatch.setattr("fleet_watch.discover.load_config", boom)
+    state = reporter.build_guard_state(conn)
+    assert state["config_degraded"] is True
+    assert state["safe_ports"]
+
+
+def test_build_state_degrades_on_unreadable_config(monkeypatch):
+    conn = _fresh_conn()
+
+    def boom():
+        raise OSError("unreadable config")
+
+    monkeypatch.setattr("fleet_watch.discover.load_config", boom)
+    state = reporter.build_state(conn)
+    assert state["config_degraded"] is True
+    assert state["process_count"] == 0
