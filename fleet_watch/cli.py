@@ -24,6 +24,7 @@ from fleet_watch.commands.guard import check, claim, context, guard
 from fleet_watch.commands.launchd import install_launchd
 from fleet_watch.commands.pkill import pkill, preempt
 from fleet_watch.commands.reap import reap, reap_sessions
+from fleet_watch.commands.reflex import reflex_group
 from fleet_watch.commands.runaway import runaway_scan
 from fleet_watch.commands.session import (
     session,
@@ -135,6 +136,7 @@ def cli():
 
 
 register_all(cli)
+cli.add_command(reflex_group)
 
 
 # Helpers live in cli_support; command modules import them by name.
