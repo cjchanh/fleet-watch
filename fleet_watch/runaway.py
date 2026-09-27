@@ -10,7 +10,9 @@ import json
 import os
 import subprocess
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,12 @@ DEFAULT_SUSTAINED_SECONDS = 60
 # Daemon uses stricter thresholds: 95% CPU for 3 consecutive ticks (3 min at 60s)
 DAEMON_CPU_THRESHOLD = 95.0
 DAEMON_CONSECUTIVE_TICKS = 3
+
+# ps reports 100% for one fully occupied logical CPU. Aggregate pressure is
+# advisory and is expressed relative to the host's full logical CPU capacity.
+AGGREGATE_CAPACITY_THRESHOLD_PCT = 25.0
+AGGREGATE_CONTRIBUTOR_CPU_FLOOR_PCT = 5.0
+AGGREGATE_MIN_CONTRIBUTOR_FRACTION = 0.5
 
 
 @dataclass
@@ -41,6 +49,48 @@ class RunawayProcess:
             "runtime_seconds": self.runtime_seconds,
             "command": self.command,
         }
+
+
+@dataclass(frozen=True)
+class AggregatePressureGroup:
+    """One executable identity consuming material host capacity in aggregate.
+
+    This is load evidence only. Parent PID, runtime, and process count do not
+    prove orphanhood or ownership, so aggregate groups are never signal eligible.
+    """
+
+    identity: str
+    aggregate_cpu_pct: float
+    capacity_pct: float
+    contributor_count: int
+    logical_cpu_count: int
+    parent_one_count: int
+    pids: list[int]
+    orphan_status: str = "UNKNOWN"
+    signal_eligible: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "classification": "aggregate_process_pressure",
+            "identity": self.identity,
+            "aggregate_cpu_pct": self.aggregate_cpu_pct,
+            "capacity_pct": self.capacity_pct,
+            "contributor_count": self.contributor_count,
+            "logical_cpu_count": self.logical_cpu_count,
+            "parent_one_count": self.parent_one_count,
+            "pids": self.pids,
+            "orphan_status": self.orphan_status,
+            "signal_eligible": self.signal_eligible,
+        }
+
+
+@dataclass(frozen=True)
+class AggregatePressureScan:
+    """Aggregate collection result with explicit uncertainty."""
+
+    status: str
+    groups: list[AggregatePressureGroup]
+    reason: str | None = None
 
 
 def _parse_etime(etime_str: str) -> int:
@@ -141,6 +191,144 @@ def scan_runaways(
     return runaways
 
 
+def scan_aggregate_pressure(
+    logical_cpu_count: int | None = None,
+    capacity_threshold_pct: float = AGGREGATE_CAPACITY_THRESHOLD_PCT,
+    contributor_cpu_floor_pct: float = AGGREGATE_CONTRIBUTOR_CPU_FLOOR_PCT,
+    sustained_seconds: int = DEFAULT_SUSTAINED_SECONDS,
+) -> AggregatePressureScan:
+    """Detect distributed process pressure that per-process thresholds miss.
+
+    Parent-1 processes are grouped by executable basename after one bounded ps
+    snapshot. Parent 1 narrows the candidate shape but does not prove orphanhood.
+    A group must have at least half as many contributors as logical CPUs and
+    consume at least ``capacity_threshold_pct`` of total CPU capacity.
+    """
+    cpu_count = logical_cpu_count if logical_cpu_count is not None else os.cpu_count()
+    valid_parameters = (
+        isinstance(cpu_count, int)
+        and not isinstance(cpu_count, bool)
+        and cpu_count > 0
+        and isfinite(capacity_threshold_pct)
+        and capacity_threshold_pct >= 0
+        and isfinite(contributor_cpu_floor_pct)
+        and contributor_cpu_floor_pct >= 0
+        and isinstance(sustained_seconds, int)
+        and sustained_seconds >= 0
+    )
+    if not valid_parameters:
+        return AggregatePressureScan(
+            status="UNKNOWN",
+            groups=[],
+            reason="invalid_scan_parameters",
+        )
+
+    try:
+        result = subprocess.run(
+            [PS_BIN, "-ww", "-eo", "pid=,ppid=,pcpu=,etime=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return AggregatePressureScan(status="UNKNOWN", groups=[], reason="ps_timeout")
+    except FileNotFoundError:
+        return AggregatePressureScan(
+            status="UNKNOWN", groups=[], reason="ps_unavailable"
+        )
+    except PermissionError:
+        return AggregatePressureScan(
+            status="UNKNOWN", groups=[], reason="ps_permission_denied"
+        )
+    except OSError:
+        return AggregatePressureScan(status="UNKNOWN", groups=[], reason="ps_os_error")
+
+    if result.returncode != 0:
+        return AggregatePressureScan(
+            status="UNKNOWN",
+            groups=[],
+            reason=f"ps_exit_{result.returncode}",
+        )
+
+    contributors: dict[str, list[tuple[int, int, float]]] = defaultdict(list)
+    seen_pids: set[int] = set()
+    valid_sample_count = 0
+    for line in (result.stdout or "").splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid = int(parts[0])
+            parent_pid = int(parts[1])
+            cpu_pct = float(parts[2])
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or parent_pid < 0 or not isfinite(cpu_pct) or cpu_pct < 0:
+            continue
+        runtime_seconds = _parse_etime(parts[3])
+        if runtime_seconds == 0 and parts[3].strip() not in {
+            "0",
+            "00",
+            "0:00",
+            "00:00",
+            "0:00:00",
+            "00:00:00",
+        }:
+            continue
+        comm = parts[4].strip()
+        if not comm:
+            continue
+        valid_sample_count += 1
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        if parent_pid != 1:
+            continue
+        if cpu_pct < contributor_cpu_floor_pct:
+            continue
+        if runtime_seconds < sustained_seconds:
+            continue
+        identity = Path(comm.rstrip("/")).name[:40]
+        if not identity:
+            continue
+        contributors[identity].append((pid, parent_pid, cpu_pct))
+
+    if valid_sample_count == 0:
+        return AggregatePressureScan(
+            status="UNKNOWN",
+            groups=[],
+            reason="ps_no_valid_samples",
+        )
+
+    minimum_contributors = max(
+        4,
+        ceil(cpu_count * AGGREGATE_MIN_CONTRIBUTOR_FRACTION),
+    )
+    groups: list[AggregatePressureGroup] = []
+    for identity, samples in contributors.items():
+        if len(samples) < minimum_contributors:
+            continue
+        aggregate_cpu_pct = round(sum(sample[2] for sample in samples), 1)
+        capacity_pct = round(aggregate_cpu_pct / cpu_count, 1)
+        if capacity_pct < capacity_threshold_pct:
+            continue
+        groups.append(
+            AggregatePressureGroup(
+                identity=identity,
+                aggregate_cpu_pct=aggregate_cpu_pct,
+                capacity_pct=capacity_pct,
+                contributor_count=len(samples),
+                logical_cpu_count=cpu_count,
+                parent_one_count=sum(1 for _, ppid, _ in samples if ppid == 1),
+                pids=sorted(sample[0] for sample in samples),
+            )
+        )
+
+    groups.sort(key=lambda group: (-group.capacity_pct, group.identity))
+    return AggregatePressureScan(status="OK", groups=groups)
+
+
 MIN_SAFE_PID = 100  # Never kill kernel threads or core system daemons
 
 
@@ -192,6 +380,8 @@ class DaemonRunawayTracker:
     last_cpu: dict[int, float] = field(default_factory=dict)
     # {pid: last_runtime_seconds} for reporting
     last_runtime: dict[int, int] = field(default_factory=dict)
+    # Executable identities currently above aggregate pressure threshold.
+    aggregate_active_keys: set[str] = field(default_factory=set)
 
     def tick(self) -> list[RunawayProcess]:
         """Run one daemon tick. Returns newly-flagged runaways (those hitting the threshold)."""
@@ -246,12 +436,25 @@ class DaemonRunawayTracker:
                 })
         return warnings
 
+    def observe_aggregate_pressure(
+        self,
+        groups: list[AggregatePressureGroup],
+    ) -> list[AggregatePressureGroup]:
+        """Return groups entering pressure and reset eligibility after recovery."""
+        current = {group.identity for group in groups}
+        entered = [
+            group for group in groups if group.identity not in self.aggregate_active_keys
+        ]
+        self.aggregate_active_keys = current
+        return entered
+
     def save(self, path: Path) -> None:
         """Persist tracker state to disk for cross-invocation continuity."""
         data = {
             "tick_counts": {str(k): v for k, v in self.tick_counts.items()},
             "last_cpu": {str(k): v for k, v in self.last_cpu.items()},
             "last_runtime": {str(k): v for k, v in self.last_runtime.items()},
+            "aggregate_active_keys": sorted(self.aggregate_active_keys),
         }
         try:
             path.write_text(json.dumps(data, separators=(",", ":")) + "\n")
@@ -267,6 +470,12 @@ class DaemonRunawayTracker:
             tracker.tick_counts = {int(k): v for k, v in data.get("tick_counts", {}).items()}
             tracker.last_cpu = {int(k): v for k, v in data.get("last_cpu", {}).items()}
             tracker.last_runtime = {int(k): v for k, v in data.get("last_runtime", {}).items()}
+            active_keys = data.get("aggregate_active_keys", [])
+            if not isinstance(active_keys, list) or not all(
+                isinstance(key, str) for key in active_keys
+            ):
+                return cls()
+            tracker.aggregate_active_keys = set(active_keys)
         except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
             return cls()
         return tracker

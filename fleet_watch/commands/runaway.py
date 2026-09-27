@@ -25,6 +25,16 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
         cpu_threshold=cpu_threshold,
         sustained_seconds=sustained_seconds,
     )
+    try:
+        aggregate_scan = runaway.scan_aggregate_pressure(
+            sustained_seconds=sustained_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 — report advisory uncertainty in-band
+        aggregate_scan = runaway.AggregatePressureScan(
+            status="UNKNOWN",
+            groups=[],
+            reason=f"scan_error:{type(exc).__name__}",
+        )
 
     killed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -74,6 +84,11 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
         "sustained_seconds": sustained_seconds,
         "flagged_count": len(flagged),
         "flagged": [p.to_dict() for p in flagged],
+        "aggregate_pressure_scan": {
+            "status": aggregate_scan.status,
+            "reason": aggregate_scan.reason,
+        },
+        "aggregate_pressure": [group.to_dict() for group in aggregate_scan.groups],
         "killed": killed,
         "failed": failed,
     }
@@ -82,6 +97,21 @@ def runaway_scan(do_kill: bool, cpu_threshold: float, sustained_seconds: int, as
         click.echo(json.dumps(payload, indent=2, default=str))
         sys.exit(1 if failed else 0)
         return
+
+    if aggregate_scan.status != "OK":
+        click.echo(
+            f"Aggregate pressure scan UNKNOWN: {aggregate_scan.reason or 'unspecified'}",
+            err=True,
+        )
+    elif aggregate_scan.groups:
+        click.echo("Aggregate CPU pressure detected (advisory only; no signal path):")
+        for group in aggregate_scan.groups:
+            click.echo(
+                f"  {group.identity}: {group.contributor_count} contributors, "
+                f"{group.aggregate_cpu_pct:.1f}% aggregate CPU "
+                f"({group.capacity_pct:.1f}% of {group.logical_cpu_count} logical CPUs), "
+                "orphan status UNKNOWN"
+            )
 
     if not flagged:
         click.echo("No runaway processes detected.")

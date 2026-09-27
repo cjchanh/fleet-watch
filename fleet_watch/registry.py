@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS events (
     hash        TEXT NOT NULL
 );
 
+-- Status filters by event type and orders by id; avoid scanning event history.
+CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(event_type, id DESC);
+
 CREATE TABLE IF NOT EXISTS gpu_budget (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     total_mb        INTEGER NOT NULL DEFAULT 131072,

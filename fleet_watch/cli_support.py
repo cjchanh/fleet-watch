@@ -442,45 +442,345 @@ def _resolved_session_id(session_id: str | None) -> str | None:
     return None
 
 
-def _notify_conflict(skipped: list[dict[str, Any]]) -> None:
+NOTIFICATION_TIMEOUT_SECONDS = 3.0
+NOTIFICATION_REAP_GRACE_SECONDS = 0.25
+NOTIFICATION_POLL_SECONDS = 0.05
+NOTIFICATION_STATE_SCHEMA = "fleet_watch_notification_helper_v1"
+NOTIFICATION_ACTIVE_STATES = frozenset(
+    {
+        "RESERVED",
+        "RUNNING",
+        "POLL_UNKNOWN",
+        "TIMEOUT_REAP_UNKNOWN",
+        "TIMEOUT_UNREAPED",
+    }
+)
+_notification_process: Any = None
+
+
+def _start_notification_process(command: list[str]):
+    """Start an isolated notification helper without creating output pipes."""
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _notification_result(
+    status: str,
+    *,
+    pid: int | None,
+    reaped: bool,
+    returncode: int | None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "pid": pid,
+        "reaped": reaped,
+        "returncode": returncode,
+    }
+
+
+def _notification_state_path() -> Path:
+    return registry.FLEET_DIR / "notification_helper.json"
+
+
+def _write_notification_state(status: str, helper_pid: int | None) -> bool:
+    path = _notification_state_path()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "schema_version": NOTIFICATION_STATE_SCHEMA,
+        "status": status,
+        "owner_pid": os.getpid(),
+        "helper_pid": helper_pid,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _read_notification_state() -> tuple[dict[str, Any] | None, bool]:
+    try:
+        payload = json.loads(_notification_state_path().read_text())
+    except FileNotFoundError:
+        return None, True
+    except (OSError, json.JSONDecodeError):
+        return None, False
+    if not isinstance(payload, dict):
+        return None, False
+    if payload.get("schema_version") != NOTIFICATION_STATE_SCHEMA:
+        return None, False
+    if payload.get("status") not in NOTIFICATION_ACTIVE_STATES | {
+        "SENT",
+        "FAILED_EXIT",
+        "SPAWN_FAILED",
+        "TIMEOUT_REAPED",
+    }:
+        return None, False
+    return payload, True
+
+
+def _notification_pid_alive(pid: int) -> bool | None:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _durable_notification_block() -> dict[str, Any] | None:
+    state, readable = _read_notification_state()
+    if not readable:
+        return _notification_result(
+            "SUPPRESSED_STATE_UNKNOWN",
+            pid=None,
+            reaped=False,
+            returncode=None,
+        )
+    if state is None or state["status"] not in NOTIFICATION_ACTIVE_STATES:
+        return None
+    pid = state.get("helper_pid") or state.get("owner_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return _notification_result(
+            "SUPPRESSED_STATE_UNKNOWN",
+            pid=None,
+            reaped=False,
+            returncode=None,
+        )
+    alive = _notification_pid_alive(pid)
+    if alive is False:
+        return None
+    return _notification_result(
+        "SUPPRESSED_IN_FLIGHT" if alive else "SUPPRESSED_REAP_UNKNOWN",
+        pid=pid,
+        reaped=False,
+        returncode=None,
+    )
+
+
+def _finish_notification(
+    status: str,
+    *,
+    process: Any,
+    reaped: bool,
+    returncode: int | None,
+) -> dict[str, Any]:
+    global _notification_process
+    pid = getattr(process, "pid", None)
+    _write_notification_state(status, pid)
+    if reaped:
+        _notification_process = None
+    return _notification_result(
+        status,
+        pid=pid,
+        reaped=reaped,
+        returncode=returncode,
+    )
+
+
+def _send_notification(title: str, body: str) -> dict[str, Any]:
+    """Send a notification without any unbounded wait after timeout.
+
+    One unresolved helper is retained in memory and recorded in Fleet state.
+    Further attempts are suppressed until its PID is gone, preventing stuck
+    osascript accumulation across both watch ticks and launchd invocations.
+    """
+    global _notification_process
+
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return _notification_result(
+            "SUPPRESSED_TEST", pid=None, reaped=True, returncode=None
+        )
+
+    if _notification_process is not None:
+        try:
+            returncode = _notification_process.poll()
+        except (OSError, subprocess.SubprocessError):
+            return _notification_result(
+                "SUPPRESSED_REAP_UNKNOWN",
+                pid=getattr(_notification_process, "pid", None),
+                reaped=False,
+                returncode=None,
+            )
+        if returncode is None:
+            return _notification_result(
+                "SUPPRESSED_IN_FLIGHT",
+                pid=getattr(_notification_process, "pid", None),
+                reaped=False,
+                returncode=None,
+            )
+        _notification_process = None
+
+    durable_block = _durable_notification_block()
+    if durable_block is not None:
+        return durable_block
+
+    if not _write_notification_state("RESERVED", None):
+        return _notification_result(
+            "STATE_RESERVATION_FAILED",
+            pid=None,
+            reaped=False,
+            returncode=None,
+        )
+
+    escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    escaped_body = body.replace("\\", "\\\\").replace('"', '\\"')
+    command = [
+        "osascript",
+        "-e",
+        f'display notification "{escaped_body}" with title "{escaped_title}"',
+    ]
+    try:
+        process = _start_notification_process(command)
+    except (OSError, subprocess.SubprocessError):
+        _write_notification_state("SPAWN_FAILED", None)
+        return _notification_result(
+            "SPAWN_FAILED", pid=None, reaped=True, returncode=None
+        )
+
+    _notification_process = process
+    if not _write_notification_state("RUNNING", getattr(process, "pid", None)):
+        try:
+            process.kill()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return _notification_result(
+            "STATE_TRACKING_FAILED",
+            pid=getattr(process, "pid", None),
+            reaped=False,
+            returncode=None,
+        )
+    deadline = time.monotonic() + NOTIFICATION_TIMEOUT_SECONDS
+    while True:
+        try:
+            returncode = process.poll()
+        except (OSError, subprocess.SubprocessError):
+            return _finish_notification(
+                "POLL_UNKNOWN",
+                process=process,
+                reaped=False,
+                returncode=None,
+            )
+        if returncode is not None:
+            return _finish_notification(
+                "SENT" if returncode == 0 else "FAILED_EXIT",
+                process=process,
+                reaped=True,
+                returncode=returncode,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(NOTIFICATION_POLL_SECONDS, remaining))
+
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    reap_deadline = time.monotonic() + NOTIFICATION_REAP_GRACE_SECONDS
+    while True:
+        try:
+            returncode = process.poll()
+        except (OSError, subprocess.SubprocessError):
+            return _finish_notification(
+                "TIMEOUT_REAP_UNKNOWN",
+                process=process,
+                reaped=False,
+                returncode=None,
+            )
+        if returncode is not None:
+            return _finish_notification(
+                "TIMEOUT_REAPED",
+                process=process,
+                reaped=True,
+                returncode=returncode,
+            )
+        remaining = reap_deadline - time.monotonic()
+        if remaining <= 0:
+            return _finish_notification(
+                "TIMEOUT_UNREAPED",
+                process=process,
+                reaped=False,
+                returncode=None,
+            )
+        time.sleep(min(NOTIFICATION_POLL_SECONDS, remaining))
+
+
+def _report_notification_result(
+    context: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if result["status"] not in {"SENT", "SUPPRESSED_TEST"}:
+        pid = result["pid"] if result["pid"] is not None else "UNKNOWN"
+        click.echo(
+            f"! {context} notification {result['status']}: "
+            f"pid {pid}; reaped={str(result['reaped']).lower()}",
+            err=True,
+        )
+    return result
+
+
+def _notify_conflict(skipped: list[dict[str, Any]]) -> dict[str, Any]:
     """Send macOS notification for resource conflicts found during discovery."""
     count = len(skipped)
     names = ", ".join(s["name"] for s in skipped[:3])
-    title = "Fleet Watch: Resource Conflict"
-    body = f"{count} conflict(s): {names}"
-    try:
-        subprocess.run(
-            [
-                "osascript", "-e",
-                f'display notification "{body}" with title "{title}"',
-            ],
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return
+    return _report_notification_result(
+        "resource conflict",
+        _send_notification(
+            "Fleet Watch: Resource Conflict",
+            f"{count} conflict(s): {names}",
+        ),
+    )
 
 
-def _notify_attention(sessions: list[syshealth.SessionProcess]) -> None:
+def _notify_attention(
+    sessions: list[syshealth.SessionProcess],
+) -> dict[str, Any]:
     """Send macOS notification when detached hot sessions require attention."""
     if not sessions:
-        return
-    total_cpu = sum(s.cpu_pct for s in sessions)
-    title = "Fleet Watch: Attention Required"
-    body = f"{len(sessions)} detached hot session(s) — {total_cpu:.0f}% total CPU"
-    try:
-        subprocess.run(
-            [
-                "osascript", "-e",
-                f'display notification "{body}" with title "{title}"',
-            ],
-            capture_output=True,
-            timeout=3,
-            check=False,
+        return _notification_result(
+            "SKIPPED_EMPTY", pid=None, reaped=True, returncode=None
         )
-    except (OSError, subprocess.SubprocessError):
-        return
+    total_cpu = sum(s.cpu_pct for s in sessions)
+    return _report_notification_result(
+        "attention",
+        _send_notification(
+            "Fleet Watch: Attention Required",
+            f"{len(sessions)} detached hot session(s) — {total_cpu:.0f}% total CPU",
+        ),
+    )
+
+
+def _notify_aggregate_pressure(
+    group: runaway.AggregatePressureGroup,
+) -> dict[str, Any]:
+    """Send one bounded notification for an aggregate pressure episode."""
+    return _report_notification_result(
+        "aggregate pressure",
+        _send_notification(
+            "Fleet Watch: Aggregate CPU Pressure",
+            f"{group.contributor_count} {group.identity} processes: "
+            f"{group.aggregate_cpu_pct:.0f}% aggregate CPU "
+            f"({group.capacity_pct:.0f}% of "
+            f"{group.logical_cpu_count} logical CPUs)",
+        ),
+    )
 
 
 def _is_fleet_owned(conn: sqlite3.Connection, proc: runaway.RunawayProcess) -> bool:
@@ -592,6 +892,32 @@ def _run_runaway_tick(
                     "auto_kill_requested": auto_kill,
                 },
             )
+    try:
+        aggregate_scan = runaway.scan_aggregate_pressure()
+    except Exception as exc:  # noqa: BLE001 — preserve explicit uncertainty
+        aggregate_scan = runaway.AggregatePressureScan(
+            status="UNKNOWN",
+            groups=[],
+            reason=f"scan_error:{type(exc).__name__}",
+        )
+
+    if aggregate_scan.status == "OK":
+        entered = tracker.observe_aggregate_pressure(aggregate_scan.groups)
+        for group in aggregate_scan.groups:
+            click.echo(
+                f"PRESSURE: {group.contributor_count} {group.identity} processes — "
+                f"{group.aggregate_cpu_pct:.1f}% aggregate CPU "
+                f"({group.capacity_pct:.1f}% of {group.logical_cpu_count} logical CPUs); "
+                "orphan status UNKNOWN; advisory only"
+            )
+        for group in entered:
+            _notify_aggregate_pressure(group)
+    else:
+        click.echo(
+            f"! aggregate pressure scan UNKNOWN: {aggregate_scan.reason or 'unspecified'}",
+            err=True,
+        )
+
     if tracker_path is not None:
         tracker.save(tracker_path)
     return newly_flagged
