@@ -9,7 +9,8 @@ the governed policy paths (``fleet_watch.process_policy``, ``commands/reap.py``)
 Shape of the loop:
 
 1. ``emit``  — screen findings, write one spec per open finding, one receipt
-   per finding. Dry-run by default: nothing on disk changes without ``write``.
+   per finding, rate-capped at ``DEFAULT_DAY_SPEC_LIMIT`` specs per UTC day.
+   Dry-run by default: nothing on disk changes without ``write``.
 2. ``verify`` — re-test every open receipt. Cleared -> ``verified=True``.
    Persisting past the TTL -> re-queue a new spec carrying an escalation note.
 3. ``status`` — open findings, their queued spec ids, receipt freshness.
@@ -42,6 +43,17 @@ DEFAULT_REPO = "/Users/cj/Workspace/active/fleet-watch"
 DEFAULT_MIN_TICKS = 3
 DEFAULT_TTL_SECONDS = 3600
 DEFAULT_DENIAL_LOOKBACK_HOURS = 24
+
+# Rate cap (the 2026-09-30 flood class: the scheduled emitter drafted ~23
+# specs/day — 67 runaway specs in 4 days, peak day 33 — because a runaway's
+# identity is its pid and every fresh pid is a fresh finding). The filer may
+# queue at most this many specs per UTC day, counted from the receipts ledger
+# it already writes: every emission is an ``emissions`` entry with an epoch, so
+# the budget needs no second state file. Beyond the budget a finding is
+# rejected with a named reason, never silently dropped. 10 covers the slow
+# classes (~6/day observed heartbeat-stale + dead-session-orphan) with
+# headroom while clipping the runaway flood. ``day_limit <= 0`` disables it.
+DEFAULT_DAY_SPEC_LIMIT = 10
 
 FINDING_KINDS = (
     "heartbeat_stale",
@@ -142,6 +154,7 @@ class EmitReport:
     min_ticks: int
     queue_dir: Path
     receipts_dir: Path
+    day_limit: int = DEFAULT_DAY_SPEC_LIMIT
     emitted: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
 
@@ -150,6 +163,7 @@ class EmitReport:
             "schema_version": SCHEMA_VERSION,
             "mode": self.mode,
             "min_ticks": self.min_ticks,
+            "day_limit": self.day_limit,
             "queue_dir": str(self.queue_dir),
             "receipts_dir": str(self.receipts_dir),
             "counts": {
@@ -256,6 +270,24 @@ def next_spec_id(receipt_key: str, index: int) -> str:
     Deterministic, so a re-queue never clobbers the spec it supersedes.
     """
     return receipt_key if index <= 1 else f"{receipt_key}-{index}"
+
+
+def emissions_on_day(receipts: Mapping[str, Mapping[str, Any]], day: str) -> int:
+    """Count spec emissions whose UTC day is ``day`` — the rate-cap budget.
+
+    The receipts ledger is the whole source: every emission this loop ever
+    wrote is an ``emissions`` entry with an epoch, so the budget needs no
+    second state file. An entry without a readable epoch does not count.
+    """
+    count = 0
+    for receipt in receipts.values():
+        for emission in receipt.get("emissions") or []:
+            try:
+                if _day(float(emission.get("emitted_at_epoch"))) == day:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+    return count
 
 
 def _identity_token(row: Mapping[str, Any]) -> str:
@@ -585,6 +617,7 @@ def emit(
     receipts_dir: Path = RECEIPT_DIR,
     write: bool = False,
     min_ticks: int = DEFAULT_MIN_TICKS,
+    day_limit: int = DEFAULT_DAY_SPEC_LIMIT,
     clock: Clock = time.time,
     repo: str = DEFAULT_REPO,
     goal_id: str | None = None,
@@ -595,14 +628,22 @@ def emit(
     what each emission would have produced. Receipts are written with the spec,
     never ahead of it — an open receipt suppresses re-emission, so a dry run
     that left one behind would silently block the real emission.
+
+    Rate-capped: at most ``day_limit`` specs are queued per UTC day, the budget
+    counted from the receipts ledger. A finding past the budget is rejected
+    with a ``rate_capped`` reason — visible in the report, never silently
+    dropped, and independent of the dedupe rejection, which keeps priority.
+    ``day_limit <= 0`` disables the cap.
     """
     report = EmitReport(
         mode="write" if write else "dry-run",
         min_ticks=max(1, int(min_ticks)),
+        day_limit=int(day_limit),
         queue_dir=Path(queue_dir),
         receipts_dir=Path(receipts_dir),
     )
     open_receipts = load_receipts(Path(receipts_dir))
+    spent: dict[str, int] = {}  # UTC day -> emissions counted so far this pass
 
     for raw in findings:
         finding = raw if isinstance(raw, Finding) else finding_from_row(raw)
@@ -620,6 +661,21 @@ def emit(
             continue
 
         now = clock()
+        today = _day(now)
+        if today not in spent:
+            spent[today] = emissions_on_day(open_receipts, today)
+        if report.day_limit > 0 and spent[today] >= report.day_limit:
+            report.rejected.append(
+                {
+                    "finding_id": finding.finding_id,
+                    "kind": finding.kind,
+                    "summary": finding.summary,
+                    "ticks": finding.ticks,
+                    "emit": False,
+                    "reason": f"rate_capped:day_limit:{report.day_limit}",
+                }
+            )
+            continue
         key = finding_key(finding)
         prior = open_receipts.get(key)
         index = len((prior or {}).get("emissions") or []) + 1
@@ -671,6 +727,7 @@ def emit(
                 "wrote": bool(write),
             }
         )
+        spent[today] += 1
     return report
 
 

@@ -74,6 +74,8 @@ def reflex_group():
 @click.option("--findings-file", default=None, help="JSON file of raw finding rows (injectable source)")
 @click.option("--ticks", "min_ticks", type=int, default=reflex.DEFAULT_MIN_TICKS,
               help=f"Ticks an event-shaped denial must survive (default {reflex.DEFAULT_MIN_TICKS})")
+@click.option("--day-limit", "day_limit", type=int, default=reflex.DEFAULT_DAY_SPEC_LIMIT,
+              help=f"Rate cap: max specs queued per UTC day, 0 disables (default {reflex.DEFAULT_DAY_SPEC_LIMIT})")
 @click.option("--queue-dir", default=None, help="Spec queue directory")
 @click.option("--receipts-dir", default=None, help="Receipt directory")
 @click.option("--repo", default=reflex.DEFAULT_REPO, help="Repo path recorded in each spec")
@@ -83,6 +85,7 @@ def emit_command(
     as_json: bool,
     findings_file: str | None,
     min_ticks: int,
+    day_limit: int,
     queue_dir: str | None,
     receipts_dir: str | None,
     repo: str,
@@ -97,6 +100,7 @@ def emit_command(
         receipts_dir=receipts,
         write=do_write,
         min_ticks=min_ticks,
+        day_limit=day_limit,
         repo=repo,
         goal_id=goal_id,
     )
@@ -108,7 +112,7 @@ def emit_command(
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
-    click.echo(f"Reflex emit — mode={payload['mode']} min_ticks={payload['min_ticks']}")
+    click.echo(f"Reflex emit — mode={payload['mode']} min_ticks={payload['min_ticks']} day_limit={payload['day_limit']}")
     for row in payload["emitted"]:
         verb = "queued" if row["wrote"] else "would queue"
         click.echo(f"  {verb} {row['spec_id']}  <- {row['finding_id']} [{row['kind']}]")

@@ -596,3 +596,175 @@ def test_goal_id_absent_by_default(tmp_path):
     assert "goal_id:" not in spec_text
     receipt = json.loads(next(receipts.glob("*.json")).read_text())
     assert receipt["goal_id"] is None
+
+
+# ── per-day emission rate cap ───────────────────────────────────────────────
+#
+# The 2026-09-30 flood class: the scheduled emitter drafted ~23 specs/day (67
+# runaway specs in 4 days, peak day 33) because a runaway finding's identity
+# is its pid and every fresh pid is a fresh finding. The cap bounds the filer
+# per UTC day, counted from the receipts ledger it already writes.
+
+
+def test_default_day_spec_limit_pins_the_budget():
+    """The default budget: covers the slow classes (~6/day observed) with
+    headroom, clips the flood class (17/day avg, 33 peak)."""
+    assert reflex.DEFAULT_DAY_SPEC_LIMIT == 10
+
+
+def test_emit_rejects_findings_beyond_the_day_cap(tmp_path):
+    """At N emissions today, the N+1st eligible finding is rejected with a
+    named reason — never silently dropped, never drafted."""
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    clock = FakeClock()
+    first = reflex.emit(
+        [stale_finding(pid=101)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    assert len(first.emitted) == 1
+
+    second = reflex.emit(
+        [runaway_finding(pid=202)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    assert second.emitted == []
+    assert second.rejected[0]["reason"] == "rate_capped:day_limit:1"
+    assert len(list(queue.glob("*.md"))) == 1
+    assert len(list(receipts.glob("*.json"))) == 1
+
+
+def test_day_cap_resets_at_the_utc_day_boundary(tmp_path):
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    clock = FakeClock()
+    reflex.emit(
+        [stale_finding(pid=101)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    clock.advance(86_400)  # next UTC day: fresh budget
+
+    report = reflex.emit(
+        [runaway_finding(pid=202)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    assert len(report.emitted) == 1
+    assert report.rejected == []
+    assert len(list(queue.glob("*.md"))) == 2
+
+
+def test_day_cap_limits_one_large_batch(tmp_path):
+    """A single pass bigger than the budget drafts only the budget; the rest
+    are rejected, visible in the report."""
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    findings = [runaway_finding(pid=1000 + i) for i in range(12)]
+    report = reflex.emit(
+        findings, queue_dir=queue, receipts_dir=receipts, write=True, day_limit=10
+    )
+    assert len(report.emitted) == 10
+    assert [row["reason"] for row in report.rejected] == [
+        "rate_capped:day_limit:10"
+    ] * 2
+    assert len(list(queue.glob("*.md"))) == 10
+
+
+def test_day_limit_zero_disables_the_cap(tmp_path):
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    findings = [runaway_finding(pid=1000 + i) for i in range(12)]
+    report = reflex.emit(
+        findings, queue_dir=queue, receipts_dir=receipts, write=True, day_limit=0
+    )
+    assert len(report.emitted) == 12
+    assert report.rejected == []
+
+
+def test_day_cap_rejection_is_reported_in_dry_run(tmp_path):
+    """Dry run and write run report the same cap decision for the same day."""
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    clock = FakeClock()
+    reflex.emit(
+        [stale_finding(pid=101)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    report = reflex.emit(
+        [runaway_finding(pid=202)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=False,
+        clock=clock,
+        day_limit=1,
+    )
+    assert report.mode == "dry-run"
+    assert report.emitted == []
+    assert report.rejected[0]["reason"] == "rate_capped:day_limit:1"
+    assert len(list(queue.glob("*.md"))) == 1  # nothing new on disk
+
+
+def test_cap_does_not_mask_the_dedupe_rejection(tmp_path):
+    """An already-open finding over budget stays an already-open rejection:
+    the cap never widens, it only bounds."""
+    queue = tmp_path / "queue"
+    receipts = tmp_path / "receipts"
+    clock = FakeClock()
+    reflex.emit(
+        [stale_finding(pid=101)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    report = reflex.emit(
+        [stale_finding(pid=101)],
+        queue_dir=queue,
+        receipts_dir=receipts,
+        write=True,
+        clock=clock,
+        day_limit=1,
+    )
+    assert report.emitted == []
+    assert report.rejected[0]["reason"].startswith("already_open:")
+
+
+def test_cli_emit_day_limit_threads_to_the_cap(tmp_path):
+    rows = write_rows(
+        tmp_path / "rows.json", [stale_finding(pid=101), runaway_finding(pid=202)]
+    )
+    result = run_cli([
+        "emit",
+        "--write",
+        "--findings-file", str(rows),
+        "--queue-dir", str(tmp_path / "queue"),
+        "--receipts-dir", str(tmp_path / "receipts"),
+        "--day-limit", "1",
+        "--json",
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["day_limit"] == 1
+    assert payload["counts"]["emitted"] == 1
+    assert payload["rejected"][0]["reason"] == "rate_capped:day_limit:1"
+    assert len(list((tmp_path / "queue").glob("*.md"))) == 1
